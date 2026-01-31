@@ -1,0 +1,52 @@
+openapi: 3.0.3
+info:
+  title: ragbot API
+  version: 0.1.0
+servers:
+  - url: http://localhost:8000
+paths:
+  /chat:
+    post:
+      summary: Chat with the agent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                query: { type: string }
+                tenant_id: { type: string }
+                user_id: { type: string }
+              required: [query, tenant_id, user_id]
+      responses:
+        "200":
+          description: Agent response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  answer: { type: string }
+                  citations: { type: array, items: { type: string } }
+                  confidence: { type: string }
+  /ingest:
+    post:
+      summary: Submit ingestion job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                source_type: { type: string }
+                source_config: { type: object }
+              required: [source_type, source_config]
+      responses:
+        "202": { description: Accepted }
+  /admin/health:
+    get:
+      summary: Health check
+      responses:
+        "200": { description: OK }

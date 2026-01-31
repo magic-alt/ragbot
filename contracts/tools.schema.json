@@ -1,0 +1,86 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RAG Tool Schemas",
+  "type": "object",
+  "properties": {
+    "retrieve": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string"},
+        "top_k": {"type": "integer", "minimum": 1, "default": 20},
+        "filters": {
+          "type": "object",
+          "properties": {
+            "tenant_id": {"type": "string"},
+            "source_types": {
+              "type": "array",
+              "items": {"enum": ["pdf", "web", "repo", "db_doc"]}
+            },
+            "doc_ids": {"type": "array", "items": {"type": "string"}},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "path_prefix": {"type": "string"},
+            "url_prefix": {"type": "string"},
+            "time_range": {
+              "type": "object",
+              "properties": {
+                "start": {"type": "string"},
+                "end": {"type": "string"}
+              }
+            },
+            "security_scope": {"type": "string"}
+          },
+          "required": ["tenant_id", "security_scope"]
+        }
+      },
+      "required": ["query", "filters"]
+    },
+    "sql_query": {
+      "type": "object",
+      "properties": {
+        "dialect": {"const": "postgres"},
+        "query": {"type": "string"},
+        "params": {"type": "object"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+        "timeout_ms": {"type": "integer", "minimum": 100}
+      },
+      "required": ["dialect", "query"]
+    },
+    "code_search": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string"},
+        "repo": {"type": "string"},
+        "ref": {"type": "string"},
+        "path_glob": {"type": "string"},
+        "max_hits": {"type": "integer", "minimum": 1}
+      },
+      "required": ["query", "repo"]
+    },
+    "web_search": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string"},
+        "recency_days": {"type": "integer", "minimum": 1},
+        "domains": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["query"]
+    },
+    "web_fetch": {
+      "type": "object",
+      "properties": {
+        "url": {"type": "string"}
+      },
+      "required": ["url"]
+    },
+    "respond": {
+      "type": "object",
+      "properties": {
+        "answer": {"type": "string"},
+        "citations": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"enum": ["high", "medium", "low"]},
+        "followups": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["answer", "citations", "confidence"]
+    }
+  }
+}
