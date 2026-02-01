@@ -11,13 +11,15 @@ from services.worker.jobs.embed_and_upsert import embed_and_upsert
 
 class AgentRouteTests(unittest.TestCase):
     def test_route_sql(self):
+        services = build_default_services()
         state = build_initial_state("select * from sales", "t1", "u1")
-        state = route_node(state)
+        state = route_node(state, services)
         self.assertEqual(state.route, "sql")
 
     def test_route_code(self):
+        services = build_default_services()
         state = build_initial_state("函数报错怎么修", "t1", "u1")
-        state = route_node(state)
+        state = route_node(state, services)
         self.assertEqual(state.route, "code")
 
 
@@ -63,11 +65,11 @@ class RetrievalAclTests(unittest.TestCase):
 
     def test_retrieval_allows_user(self):
         state = run_agent("Postgres 做什么", "tenant-a", "u1", self.services)
-        self.assertIn("Postgres", state.final)
+        self.assertIn("Postgres", state.final.answer)
 
     def test_retrieval_blocks_user(self):
         state = run_agent("Postgres 做什么", "tenant-a", "u2", self.services)
-        self.assertIn("证据不足", state.final)
+        self.assertIn("证据不足", state.final.answer)
 
 
 class SqlEngineTests(unittest.TestCase):
@@ -83,7 +85,7 @@ class SqlEngineTests(unittest.TestCase):
         )
         services.repo.register_table(table)
         state = run_agent("select region from sales where region = 'cn'", "t1", "u1", services)
-        self.assertIn("SQL 返回 1 行", state.final)
+        self.assertIn("SQL 返回 1 行", state.final.answer)
 
 
 class RrfTests(unittest.TestCase):

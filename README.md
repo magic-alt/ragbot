@@ -2,12 +2,12 @@
 
 这是基于 `PROJECT.md` 的 **最小可运行 Agentic RAG** 实现，重点覆盖：
 
-- Postgres/Qdrant 的接口与过滤字段设计（以 in-memory 适配器实现）
+- Postgres/Qdrant 的接口与过滤字段设计（含真实适配器 + in-memory 回退）
 - Agent 状态机（route → retrieve/sql/code → synthesize → verify → finalize）
 - 跨语言工具契约（`contracts/tools.schema.json`）
 - 单元测试覆盖路由、检索、SQL、安全过滤、融合排序
 
-> 说明：本仓库实现的是 **可运行的参考骨架**。默认使用内存适配器，不依赖真实 Postgres/Qdrant。
+> 说明：本仓库实现的是 **可运行的参考骨架**。默认使用内存适配器，可通过环境变量启用真实 Postgres/Qdrant。
 
 ## 目录结构
 
@@ -23,6 +23,22 @@
 
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
+```
+
+启动 FastAPI（默认走内存适配器）：
+
+```bash
+uvicorn services.api.app.api:app --reload --host 0.0.0.0 --port 8000
+```
+
+启用真实 Postgres/Qdrant：
+
+```bash
+set POSTGRES_DSN=postgresql://user:pass@localhost:5432/dbname
+set POSTGRES_ALLOWED_SCHEMAS=public
+set QDRANT_URL=http://localhost:6333
+set QDRANT_COLLECTION=rag_chunks
+set QDRANT_DIM=1536
 ```
 
 运行示例聊天（Python）：
@@ -85,8 +101,6 @@ print(response)
 
 ## 后续扩展建议
 
-- 替换 `InMemoryQdrant` 为真实 Qdrant SDK
-- 替换 `SqlEngine` 为真实 Postgres 只读连接
 - 增强 `web_node` 外部检索
 - 增加 Rerank Cross-Encoder 模块
 

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from contracts.types import AgentState, SqlResult
+from ..state import AgentState, Citation, EvidenceItem, ToolCallRecord, now_ms
+from contracts.types import SqlResult
 from ...storage.repo import InMemoryRepo
 
 
@@ -39,21 +40,179 @@ class SqlEngine:
         )
 
 
+class PostgresSqlEngine:
+    def __init__(
+        self,
+        dsn: str,
+        allowed_schemas: Optional[Sequence[str]] = None,
+        limit: int = 200,
+        timeout_ms: int = 3000,
+        pool_min_size: int = 1,
+        pool_max_size: int = 5,
+    ) -> None:
+        try:
+            from psycopg_pool import ConnectionPool
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("psycopg_pool is required for PostgresSqlEngine") from exc
+
+        self._pool = ConnectionPool(dsn, min_size=pool_min_size, max_size=pool_max_size, open=True)
+        self._limit = limit
+        self._timeout_ms = timeout_ms
+        self._allowed_schemas = set(allowed_schemas) if allowed_schemas else None
+
+    def close(self) -> None:
+        self._pool.close()
+
+    def query(self, query: str, params: Optional[Dict[str, Any]] = None, limit: Optional[int] = None) -> SqlResult:
+        start = time.perf_counter()
+        cleaned = _clean_query(query)
+        _validate_read_only_query(cleaned, self._allowed_schemas)
+        limited = _ensure_limit(cleaned, min(limit or self._limit, self._limit))
+
+        with self._pool.connection() as conn:
+            with conn.transaction():
+                conn.execute("SET LOCAL statement_timeout = %s", (self._timeout_ms,))
+                conn.execute("SET LOCAL TRANSACTION READ ONLY")
+                cursor = conn.execute(limited, params or {})
+                rows = cursor.fetchall()
+                columns_meta = _columns_meta(cursor.description)
+
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        dict_rows = _rows_to_dicts(rows, columns_meta)
+        return SqlResult(
+            rows=dict_rows,
+            columns=columns_meta,
+            stats={"row_count": len(dict_rows), "elapsed_ms": elapsed_ms},
+        )
+
+
 def sql_node(state: AgentState, services: Any) -> AgentState:
-    params = {"dialect": "postgres", "query": state.query}
-    state.add_tool_call("sql_query", params)
+    params = {"dialect": "postgres", "query": state.query, "timeout_ms": 3000, "limit": 200}
+    start_ms = now_ms()
     try:
         result = services.sql_engine.query(state.query)
-    except ValueError as exc:
-        state.add_evidence(
-            "sql_error",
-            {"error": str(exc)},
-            ["sql:validation"],
+        citations = _rows_to_citations(result.rows)
+        text = _format_sql_result(result.rows, max_rows=5)
+        state.evidence.append(
+            EvidenceItem(
+                kind="sql_rows",
+                score=1.0,
+                text=text,
+                citations=citations,
+                metadata=result.stats,
+            )
         )
-        return state
-    payload = {"rows": result.rows, "columns": result.columns, "stats": result.stats}
-    state.add_evidence("rows", payload, ["sql:result"])
+        record = ToolCallRecord(
+            name="sql_query",
+            args=params,
+            ok=True,
+            started_at_ms=start_ms,
+            ended_at_ms=now_ms(),
+            result_preview={"row_count": result.stats.get("row_count")},
+        )
+    except Exception as exc:
+        record = ToolCallRecord(
+            name="sql_query",
+            args=params,
+            ok=False,
+            started_at_ms=start_ms,
+            ended_at_ms=now_ms(),
+            error=str(exc),
+        )
+    state.tool_calls.append(record)
     return state
+
+
+def _rows_to_citations(rows: List[Dict[str, Any]]) -> List[Citation]:
+    citations: List[Citation] = []
+    for idx, _row in enumerate(rows[:30], start=1):
+        citations.append(Citation(kind="row", row_ref=f"row:{idx}"))
+    return citations
+
+
+def _format_sql_result(rows: List[Dict[str, Any]], max_rows: int = 5) -> str:
+    if not rows:
+        return "SQL 返回 0 行。"
+    preview = rows[:max_rows]
+    lines = ["SQL 返回 {} 行，示例如下：".format(len(rows))]
+    for row in preview:
+        pairs = ", ".join(f"{key}={value}" for key, value in row.items())
+        lines.append(pairs)
+    return " ".join(lines)
+
+
+def _clean_query(query: str) -> str:
+    cleaned = query.strip()
+    if cleaned.endswith(";"):
+        cleaned = cleaned[:-1]
+    if ";" in cleaned:
+        raise ValueError("Multiple statements are not allowed")
+    return cleaned
+
+
+def _validate_read_only_query(query: str, allowed_schemas: Optional[Iterable[str]]) -> None:
+    if not re.match(r"^select\b", query, flags=re.IGNORECASE):
+        raise ValueError("Only SELECT queries are allowed")
+    disallowed = (
+        "insert",
+        "update",
+        "delete",
+        "drop",
+        "alter",
+        "create",
+        "truncate",
+        "grant",
+        "revoke",
+        "comment",
+        "vacuum",
+        "call",
+        "execute",
+        "copy",
+        "commit",
+        "rollback",
+    )
+    if re.search(r"\b(" + "|".join(disallowed) + r")\b", query, flags=re.IGNORECASE):
+        raise ValueError("Read-only queries only")
+    if allowed_schemas is None:
+        return
+    for table in _extract_tables(query):
+        if "." in table:
+            schema = table.split(".")[0]
+            if schema not in allowed_schemas:
+                raise ValueError(f"Schema not allowed: {schema}")
+
+
+def _extract_tables(query: str) -> List[str]:
+    tables: List[str] = []
+    for match in re.finditer(r"\b(from|join)\s+([\w\.]+)", query, flags=re.IGNORECASE):
+        tables.append(match.group(2))
+    return tables
+
+
+def _ensure_limit(query: str, limit: int) -> str:
+    match = re.search(r"\blimit\s+(\d+)\b", query, flags=re.IGNORECASE)
+    if match:
+        existing = int(match.group(1))
+        if existing > limit:
+            return re.sub(r"\blimit\s+\d+\b", f"LIMIT {limit}", query, flags=re.IGNORECASE)
+        return query
+    return f"{query} LIMIT {limit}"
+
+
+def _columns_meta(description: Any) -> List[Dict[str, str]]:
+    columns: List[Dict[str, str]] = []
+    if not description:
+        return columns
+    for col in description:
+        columns.append({"name": col.name, "type": str(col.type_code)})
+    return columns
+
+
+def _rows_to_dicts(rows: List[Any], columns: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    if not rows:
+        return []
+    col_names = [col["name"] for col in columns]
+    return [dict(zip(col_names, row)) for row in rows]
 
 
 def _parse_select(query: str):

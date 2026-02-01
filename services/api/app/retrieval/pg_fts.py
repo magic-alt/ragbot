@@ -49,6 +49,11 @@ def _match_filters(chunk: Chunk, filters: Dict[str, Any]) -> bool:
     doc_ids = filters.get("doc_ids")
     if doc_ids and chunk.doc_id not in doc_ids:
         return False
+    tags = filters.get("tags")
+    if tags:
+        chunk_tags = (chunk.metadata or {}).get("tags") or []
+        if not any(tag in chunk_tags for tag in tags):
+            return False
     path_prefix = filters.get("path_prefix")
     if path_prefix:
         path = chunk.path or ""

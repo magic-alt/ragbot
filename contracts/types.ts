@@ -21,26 +21,92 @@ export interface CodeSnippet {
   content: string;
 }
 
-export interface Evidence {
-  kind: string;
-  payload: Record<string, unknown>;
-  citations: string[];
+export type SourceType = "pdf" | "web" | "repo" | "db_doc";
+export type RouteType = "doc_rag" | "sql" | "code" | "mixed" | "web_fallback";
+export type Confidence = "high" | "medium" | "low";
+export type ToolName = "retrieve" | "sql_query" | "code_search" | "web_search" | "web_fetch";
+
+export interface Citation {
+  kind: "chunk" | "row" | "code" | "web";
+  chunk_id?: string;
+  doc_id?: string;
+  page?: number;
+  section?: string;
+  url?: string;
+  path?: string;
+  ref?: string;
+  line_start?: number;
+  line_end?: number;
+  row_ref?: string;
+  title?: string;
 }
 
-export interface AgentVerdict {
+export interface EvidenceItem {
+  kind: "doc_chunk" | "sql_rows" | "code_snippets" | "web_snippets";
+  score?: number;
+  text?: string;
+  citations: Citation[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface ToolCallRecord {
+  name: ToolName;
+  args: Record<string, unknown>;
+  ok: boolean;
+  started_at_ms: number;
+  ended_at_ms: number;
+  error?: string;
+  result_preview?: Record<string, unknown>;
+}
+
+export interface Constraints {
+  source_types?: SourceType[];
+  doc_ids?: string[];
+  tags?: string[];
+  repo?: string;
+  ref?: string;
+  path_prefix?: string;
+  url_prefix?: string;
+  time_from?: string;
+  time_to?: string;
+  security_scope?: Record<string, unknown>;
+}
+
+export interface Verification {
   enough_evidence: boolean;
-  missing_what?: string;
+  missing: string[];
+  next_query?: string;
+  next_action?: "retrieve" | "sql_query" | "code_search" | "web_search";
+}
+
+export interface Draft {
+  answer_outline: string[];
+  answer_text: string;
+  used_citations: Citation[];
+}
+
+export interface FinalAnswer {
+  answer: string;
+  citations: Citation[];
+  confidence: Confidence;
+  followups: string[];
 }
 
 export interface AgentState {
-  query: string;
+  request_id: string;
   tenant_id: string;
   user_id: string;
-  constraints: Record<string, unknown>;
-  route?: string;
-  tool_calls: Record<string, unknown>[];
-  evidence: Evidence[];
-  draft?: string;
-  verdict?: AgentVerdict;
-  final?: string;
+  session_id?: string;
+  query: string;
+  constraints: Constraints;
+  route?: RouteType;
+  plan: string[];
+  tool_calls: ToolCallRecord[];
+  evidence: EvidenceItem[];
+  draft?: Draft;
+  verification?: Verification;
+  iteration: number;
+  max_iterations: number;
+  hard_fail: boolean;
+  final?: FinalAnswer;
 }

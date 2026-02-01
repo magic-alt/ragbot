@@ -1,34 +1,40 @@
 from __future__ import annotations
 
-from contracts.types import AgentState, AgentVerdict
+from typing import List
+
+from ..state import AgentState, Verification, ROUTE_CODE, ROUTE_DOC_RAG, ROUTE_MIXED, ROUTE_SQL
 
 
 def verify_node(state: AgentState, services: object) -> AgentState:
-    if not state.evidence:
-        state.verdict = AgentVerdict(enough_evidence=False, missing_what="no evidence")
-        return state
-
-    if state.route == "sql":
-        rows_evidence = [ev for ev in state.evidence if ev.kind == "rows"]
-        if not rows_evidence:
-            state.verdict = AgentVerdict(enough_evidence=False, missing_what="sql rows")
-            return state
-        if rows_evidence and not rows_evidence[0].payload.get("rows"):
-            state.verdict = AgentVerdict(enough_evidence=False, missing_what="sql rows")
-            return state
-
-    if state.route == "code":
-        code_evidence = [ev for ev in state.evidence if ev.kind == "code"]
+    missing: List[str] = []
+    if state.route == ROUTE_SQL:
+        rows_evidence = [ev for ev in state.evidence if ev.kind == "sql_rows"]
+        if not rows_evidence or rows_evidence[0].metadata.get("row_count", 0) == 0:
+            missing.append("sql_rows")
+    elif state.route == ROUTE_CODE:
+        code_evidence = [ev for ev in state.evidence if ev.kind == "code_snippets"]
         if not code_evidence:
-            state.verdict = AgentVerdict(enough_evidence=False, missing_what="code snippets")
-            return state
-
-    if state.route in ("doc_rag", "mixed"):
-        chunk_evidence = [ev for ev in state.evidence if ev.kind == "chunk"]
+            missing.append("code_snippets")
+    elif state.route in (ROUTE_DOC_RAG, ROUTE_MIXED):
+        chunk_evidence = [ev for ev in state.evidence if ev.kind == "doc_chunk"]
         if not chunk_evidence:
-            state.verdict = AgentVerdict(enough_evidence=False, missing_what="document chunks")
-            return state
+            missing.append("doc_chunks")
 
-    state.verdict = AgentVerdict(enough_evidence=True)
+    enough = len(missing) == 0
+    next_action = None
+    if not enough:
+        if "doc_chunks" in missing:
+            next_action = "retrieve"
+        elif "sql_rows" in missing:
+            next_action = "sql_query"
+        elif "code_snippets" in missing:
+            next_action = "code_search"
+
+    state.verification = Verification(
+        enough_evidence=enough,
+        missing=missing,
+        next_query=state.query,
+        next_action=next_action,
+    )
     return state
 

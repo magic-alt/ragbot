@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from .pg_fts import fts_search
-from .qdrant import InMemoryQdrant, embed_text
+from .qdrant import embed_text
 from .rerank import rrf_fuse
 from ..storage.models import Chunk
 from ..storage.repo import InMemoryRepo
@@ -19,7 +19,7 @@ def build_citation(chunk: Chunk) -> str:
 
 
 class Retriever:
-    def __init__(self, repo: InMemoryRepo, qdrant: InMemoryQdrant) -> None:
+    def __init__(self, repo: InMemoryRepo, qdrant: Any) -> None:
         self._repo = repo
         self._qdrant = qdrant
 

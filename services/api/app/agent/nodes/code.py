@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import fnmatch
-import os
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from contracts.types import AgentState, CodeSnippet
+from ..state import AgentState, Citation, EvidenceItem, ToolCallRecord, now_ms
+from contracts.types import CodeSnippet
 
 
 class CodeSearch:
@@ -59,21 +59,59 @@ class CodeSearch:
 
 
 def code_node(state: AgentState, services: Any) -> AgentState:
-    repo = state.constraints.get("repo") or "default"
-    params = {"query": state.query, "repo": repo}
-    state.add_tool_call("code_search", params)
-    snippets = services.code_search.search(state.query, repo=repo, max_hits=5)
-    for snippet in snippets:
-        payload = {
-            "path": snippet.path,
-            "ref": snippet.ref,
-            "line_start": snippet.line_start,
-            "line_end": snippet.line_end,
-            "content": snippet.content,
-        }
-        citation = f"{snippet.path}:{snippet.line_start}-{snippet.line_end}"
-        state.add_evidence("code", payload, [citation])
+    repo = state.constraints.repo or "default"
+    params = {"query": state.query, "repo": repo, "ref": state.constraints.ref or "main"}
+    start_ms = now_ms()
+    try:
+        snippets = services.code_search.search(state.query, repo=repo, max_hits=8)
+        citations = [
+            Citation(
+                kind="code",
+                path=snippet.path,
+                ref=snippet.ref,
+                line_start=snippet.line_start,
+                line_end=snippet.line_end,
+            )
+            for snippet in snippets
+        ]
+        text = _format_snippets(snippets, limit=8)
+        state.evidence.append(
+            EvidenceItem(
+                kind="code_snippets",
+                score=1.0,
+                text=text,
+                citations=citations,
+                metadata={"count": len(snippets)},
+            )
+        )
+        record = ToolCallRecord(
+            name="code_search",
+            args=params,
+            ok=True,
+            started_at_ms=start_ms,
+            ended_at_ms=now_ms(),
+            result_preview={"count": len(snippets)},
+        )
+    except Exception as exc:
+        record = ToolCallRecord(
+            name="code_search",
+            args=params,
+            ok=False,
+            started_at_ms=start_ms,
+            ended_at_ms=now_ms(),
+            error=str(exc),
+        )
+    state.tool_calls.append(record)
     return state
+
+
+def _format_snippets(snippets: List[CodeSnippet], limit: int = 8) -> str:
+    parts: List[str] = []
+    for snippet in snippets[:limit]:
+        header = f"{snippet.path}:{snippet.line_start}-{snippet.line_end}"
+        body = snippet.content.strip().replace("\n", " ")
+        parts.append(f"{header} {body}")
+    return " ".join(parts)
 
 
 def _extract_snippet(content: str, start: int, end: int, context: int = 2) -> tuple[int, int, str]:
