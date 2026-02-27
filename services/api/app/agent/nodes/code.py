@@ -1,12 +1,36 @@
 from __future__ import annotations
 
 import fnmatch
+import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from ..state import AgentState, Citation, EvidenceItem, ToolCallRecord, now_ms
 from contracts.types import CodeSnippet
+
+logger = logging.getLogger(__name__)
+
+_ALLOWED_EXTENSIONS = frozenset({
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".c", ".cpp",
+    ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".scala", ".sh",
+    ".bash", ".sql", ".html", ".css", ".scss", ".yaml", ".yml", ".toml",
+    ".json", ".xml", ".md", ".txt", ".cfg", ".ini", ".conf", ".r", ".R",
+    ".lua", ".pl", ".pm", ".ex", ".exs", ".erl", ".hs", ".ml", ".vue",
+    ".svelte",
+})
+
+_EXCLUDED_DIRS = frozenset({
+    ".git", ".svn", ".hg", "node_modules", "__pycache__", ".mypy_cache",
+    ".pytest_cache", ".tox", ".venv", "venv", ".env", "dist", "build",
+    ".idea", ".vscode",
+})
+
+_EXCLUDED_FILES = frozenset({
+    ".env", ".env.local", ".env.production", ".env.staging",
+    "credentials.json", "secrets.json", "id_rsa", "id_ed25519",
+    ".htpasswd", ".netrc",
+})
 
 
 class CodeSearch:
@@ -15,7 +39,11 @@ class CodeSearch:
         self._in_memory_files = in_memory_files or {}
 
     def search(self, query: str, repo: str, ref: str = "main", path_glob: Optional[str] = None, max_hits: int = 5) -> List[CodeSnippet]:
-        pattern = re.compile(query)
+        try:
+            pattern = re.compile(re.escape(query), re.IGNORECASE)
+        except re.error:
+            logger.warning("Invalid regex pattern after escaping: %s", query)
+            return []
         files = self._collect_files(repo, path_glob)
         hits: List[CodeSnippet] = []
         for path, content in files:
@@ -44,9 +72,18 @@ class CodeSearch:
         root = self._repo_roots.get(repo)
         if not root:
             return []
-        root_path = Path(root)
+        root_path = Path(root).resolve()
         for file_path in root_path.rglob("*"):
             if not file_path.is_file():
+                continue
+            resolved = file_path.resolve()
+            if not str(resolved).startswith(str(root_path)):
+                continue
+            if any(part in _EXCLUDED_DIRS for part in resolved.parts):
+                continue
+            if resolved.name in _EXCLUDED_FILES:
+                continue
+            if resolved.suffix not in _ALLOWED_EXTENSIONS:
                 continue
             rel_path = str(file_path.relative_to(root_path))
             if path_glob and not fnmatch.fnmatch(rel_path, path_glob):

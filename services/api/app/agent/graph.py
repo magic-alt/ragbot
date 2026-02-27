@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from ..llm.client import OpenAIClient
 from ..retrieval.qdrant import InMemoryQdrant
 from ..retrieval.service import Retriever
 from ..storage.repo import InMemoryRepo
@@ -33,6 +34,7 @@ class AgentServices:
     retriever: Retriever
     sql_engine: Any
     code_search: CodeSearch
+    llm: OpenAIClient
 
 
 def build_default_services(repo: Optional[InMemoryRepo] = None) -> AgentServices:
@@ -41,12 +43,14 @@ def build_default_services(repo: Optional[InMemoryRepo] = None) -> AgentServices
     retriever = Retriever(repo, qdrant)
     sql_engine = SqlEngine(repo)
     code_search = CodeSearch(repo_roots={"default": "."})
+    llm = OpenAIClient()
     return AgentServices(
         repo=repo,
         qdrant=qdrant,
         retriever=retriever,
         sql_engine=sql_engine,
         code_search=code_search,
+        llm=llm,
     )
 
 
@@ -116,6 +120,8 @@ def _should_continue(state: AgentState) -> bool:
 
 
 def _next_step(state: AgentState) -> str:
+    if state.verification and state.verification.next_query:
+        state.query = state.verification.next_query
     if state.verification and state.verification.next_action:
         return state.verification.next_action
     return "retrieve"

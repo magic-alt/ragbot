@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -7,6 +8,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from ..state import AgentState, Citation, EvidenceItem, ToolCallRecord, now_ms
 from contracts.types import SqlResult
 from ...storage.repo import InMemoryRepo
+
+logger = logging.getLogger(__name__)
 
 
 class SqlEngine:
@@ -87,10 +90,11 @@ class PostgresSqlEngine:
 
 
 def sql_node(state: AgentState, services: Any) -> AgentState:
-    params = {"dialect": "postgres", "query": state.query, "timeout_ms": 3000, "limit": 200}
+    sql_query = _resolve_sql(state.query, services)
+    params = {"dialect": "postgres", "query": sql_query, "timeout_ms": 3000, "limit": 200}
     start_ms = now_ms()
     try:
-        result = services.sql_engine.query(state.query)
+        result = services.sql_engine.query(sql_query)
         citations = _rows_to_citations(result.rows)
         text = _format_sql_result(result.rows, max_rows=5)
         state.evidence.append(
@@ -121,6 +125,71 @@ def sql_node(state: AgentState, services: Any) -> AgentState:
         )
     state.tool_calls.append(record)
     return state
+
+
+def _resolve_sql(query: str, services: Any) -> str:
+    if _looks_like_sql(query):
+        return query
+    llm = getattr(services, "llm", None)
+    if not llm or not getattr(llm, "enabled", False):
+        return query
+    tables_desc = _describe_tables(services)
+    if not tables_desc:
+        return query
+    try:
+        return _llm_nl2sql(llm, query, tables_desc)
+    except Exception as exc:
+        logger.warning("NL2SQL failed, using raw query: %s", exc)
+        return query
+
+
+def _looks_like_sql(query: str) -> bool:
+    return bool(re.match(r"^\s*select\b", query, flags=re.IGNORECASE))
+
+
+_NL2SQL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sql": {"type": "string"},
+        "explanation": {"type": "string"},
+    },
+    "required": ["sql", "explanation"],
+    "additionalProperties": False,
+}
+
+
+def _llm_nl2sql(llm: Any, question: str, tables_desc: str) -> str:
+    system = (
+        "You are a SQL expert. Convert the user's natural language question into a valid "
+        "SELECT SQL query. Only output read-only SELECT queries. Return JSON with "
+        "fields: sql (the SQL string), explanation (brief explanation)."
+    )
+    user = f"Tables:\n{tables_desc}\n\nQuestion: {question}"
+    result = llm.chat_json(system=system, user=user, schema=_NL2SQL_SCHEMA)
+    sql = result.get("sql", "").strip()
+    if not sql:
+        raise ValueError("LLM returned empty SQL")
+    return sql
+
+
+def _describe_tables(services: Any) -> str:
+    repo = getattr(services, "repo", None)
+    if not repo:
+        return ""
+    state = getattr(repo, "export_state", None)
+    if not state:
+        return ""
+    exported = state()
+    tables = exported.get("tables", [])
+    if not tables:
+        return ""
+    lines = []
+    for table in tables:
+        name = table.get("name", "?")
+        cols = table.get("columns", [])
+        col_desc = ", ".join(f"{c.get('name', '?')} {c.get('type', '?')}" for c in cols)
+        lines.append(f"  {name}({col_desc})")
+    return "\n".join(lines)
 
 
 def _rows_to_citations(rows: List[Dict[str, Any]]) -> List[Citation]:
