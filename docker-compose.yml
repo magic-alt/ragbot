@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+      - RAGBOT_API_KEYS=
+      - OPENAI_API_KEY=
+      - OPENAI_MODEL=gpt-4o-mini
+      - EMBEDDING_MODEL=
+      - EMBEDDING_API_KEY=
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_COLLECTION=rag_chunks
+      - QDRANT_DIM=1536
+      - POSTGRES_DSN=
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:

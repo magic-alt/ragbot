@@ -36,7 +36,7 @@ Confidence = Literal["high", "medium", "low"]
 ToolName = Literal["retrieve", "sql_query", "code_search", "web_search", "web_fetch"]
 
 
-@dataclass
+@dataclass(eq=False)
 class Citation:
     kind: Literal["chunk", "row", "code", "web"]
     chunk_id: Optional[str] = None
@@ -50,6 +50,21 @@ class Citation:
     line_end: Optional[int] = None
     row_ref: Optional[str] = None
     title: Optional[str] = None
+
+    def _key(self) -> tuple:
+        return (
+            self.kind, self.chunk_id, self.doc_id, self.page,
+            self.section, self.url, self.path, self.ref,
+            self.line_start, self.line_end, self.row_ref, self.title,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Citation):
+            return NotImplemented
+        return self._key() == other._key()
+
+    def __hash__(self) -> int:
+        return hash(self._key())
 
 
 @dataclass

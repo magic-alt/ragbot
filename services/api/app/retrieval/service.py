@@ -32,11 +32,15 @@ class Retriever:
         fts_ranked = [(chunk.chunk_id, score) for chunk, score in fts_hits]
         fused = rrf_fuse(qdrant_ranked, fts_ranked)
 
+        payload_map: Dict[str, Dict[str, Any]] = {
+            point_id: payload for point_id, _score, payload in qdrant_hits
+        }
+
         results: List[RetrievalChunk] = []
         for chunk_id, fused_score in fused[:top_k]:
             chunk = self._repo.get_chunk(chunk_id)
             if not chunk:
-                payload = _payload_by_id(qdrant_hits, chunk_id)
+                payload = payload_map.get(chunk_id, {})
                 if not payload:
                     continue
                 text = payload.get("text", "")
@@ -76,11 +80,4 @@ class Retriever:
                 )
             )
         return results
-
-
-def _payload_by_id(qdrant_hits: List[tuple], chunk_id: str) -> Dict[str, Any]:
-    for point_id, _score, payload in qdrant_hits:
-        if point_id == chunk_id:
-            return payload
-    return {}
 

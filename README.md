@@ -41,6 +41,18 @@ set QDRANT_COLLECTION=rag_chunks
 set QDRANT_DIM=1536
 ```
 
+启用 LLM 与 Web Search（OpenAI）：
+
+```bash
+set OPENAI_API_KEY=sk-...
+set OPENAI_MODEL=gpt-4o-mini
+    set OPENAI_WEB_MODEL=gpt-5
+```
+
+说明：
+- LLM 结构化输出使用 Chat Completions 的 `json_schema`。
+- Web Search 使用 Responses API 的 `web_search` 工具，请选择支持该工具的模型。
+
 运行示例聊天（Python）：
 
 ```python

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ragbot"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.100",
+    "uvicorn>=0.22",
+    "requests>=2.28",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.1", "psycopg_pool>=3.1"]
+qdrant = ["qdrant-client>=1.7"]
+worker = ["PyPDF2>=3.0", "beautifulsoup4>=4.12", "gitpython>=3.1"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[tool.setuptools.packages.find]
+include = ["contracts*", "services*"]

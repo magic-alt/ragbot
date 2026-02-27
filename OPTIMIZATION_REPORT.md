@@ -715,3 +715,35 @@ def next_version(version: str) -> str:
 | 13 | web_node 空结果误报成功 | 添加 `executed` 标志位，LLM 不可用时 `ok=False` + `error="LLM not available"`，且不创建空 EvidenceItem | `web.py` |
 | 14 | LLM 异常静默吞掉 | 在 synthesize_node 和 verify_node 的 except 块中添加 `logger.warning()`，记录异常类型和消息 | `synthesize.py`, `verify.py` |
 | 15 | contracts/types.py 与 state.py 重复 | `state.py` 改为从 `contracts.types` 导入所有共享类型（包括 AgentState、Citation 等 12 个类/类型别名），仅保留 ROUTE_* 常量和 `now_ms()`、`build_initial_state()` 工具函数 | `state.py` |
+
+---
+
+## 附录 C：P2/P3 修复状态
+
+> 修复日期：2026-02-28
+> 修复验证：27 项测试全部通过（原有 6 项 + 新增 21 项）
+
+### P2 修复（6/6 完成，P2-20/P2-21 已在 P1-8 中修复）
+
+| # | 问题 | 修复内容 | 修改文件 |
+|---|------|----------|---------|
+| 16 | AgentServices 类型过宽 | 定义 `QdrantInterface` 和 `SqlEngineInterface` Protocol 接口，`AgentServices` 的 `qdrant` 和 `sql_engine` 字段使用 Protocol 类型替代 `Any` | `graph.py` |
+| 17 | Citation 去重逻辑重复 | 为 `Citation` 添加 `_key()`、`__hash__`、`__eq__` 方法，使其可哈希；简化 `synthesize.py` 中的 `_collect_citations`、`_merge_citations`、`_dedupe_citations` 为直接使用 `set` 去重 | `contracts/types.py`, `synthesize.py` |
+| 18 | _payload_by_id 线性搜索 | 在 `retrieve` 方法中预构建 `payload_map: Dict[str, Dict]` 字典映射，用 O(1) 的 `dict.get()` 替换 O(N) 的线性扫描；删除旧的 `_payload_by_id` 函数 | `service.py` |
+| 19 | 导入路径不一致 | 添加 `pyproject.toml` 正式定义包结构（`contracts*`, `services*`）；将 worker 的跨服务三层相对导入（`from ...api.app.`）改为绝对导入（`from services.api.app.`） | `pyproject.toml`, `embed_and_upsert.py` |
+| 22 | InMemoryRepo 无并发保护 | 添加 `threading.Lock`，所有读写方法均使用 `with self._lock:` 保护；`iter_chunks()` 改为返回快照 `list()` 避免迭代时修改 | `repo.py` |
+| 23 | embed_and_upsert 无批量处理 | 实现分批 upsert（默认 `batch_size=100`），每积累一批即提交至 Qdrant；提取 `_build_payload()` 复用 payload 构建逻辑 | `embed_and_upsert.py` |
+
+### P3 修复（9/9 完成）
+
+| # | 问题 | 修复内容 | 修改/新增文件 |
+|---|------|----------|-------------|
+| 24 | Worker 全部为空壳 | 实现真实连接器：`fetch_pdf` 使用 PyPDF2 提取文本（支持 URL 下载）；`fetch_web` 使用 requests + BeautifulSoup 抓取文本；`fetch_git` 使用 GitPython 克隆/检出仓库。所有依赖均为可选，缺失时graceful fallback。Ingest jobs 实现真实的分块（chunking）逻辑，生成 `Chunk` 对象 | `connectors/pdf.py`, `connectors/web.py`, `connectors/git.py`, `jobs/ingest_pdf.py`, `jobs/ingest_repo.py`, `jobs/ingest_web.py` |
+| 25 | 缺少任务队列 | 实现 `TaskQueue` Protocol 和 `InProcessQueue`（同步执行，dev/test 用）；提供 `create_queue()` 工厂函数，预留 Celery backend 扩展口 | `services/worker/queue.py`（新增） |
+| 26 | 缺少会话记忆 | 实现 `SessionStore` Protocol、`InMemorySessionStore`（线程安全，支持 max_turns 截断）、`Session`/`SessionTurn` 数据结构 | `services/api/app/agent/session.py`（新增） |
+| 27 | Node 客户端无 SSE 支持 | 添加 `chatStream()` 函数，使用 `ReadableStream` 解析 SSE 事件流；定义完整 SSE 事件类型（`SSEToolCallEvent`, `SSETokenEvent`, `SSEFinalEvent` 等）；`chat()` 支持 `apiKey` 参数；`ChatResponse.citations` 使用具体 `Citation` 类型替代 `Record<string, unknown>` | `packages/node-client/src/client.ts`, `index.ts` |
+| 28 | 测试覆盖严重不足 | 新增 21 项测试：路由（doc/mixed）、code_node（匹配/无匹配）、web_node（无 LLM）、synthesize_node（无证据/有证据）、verify_node（够/不够）、finalize_node（正常/降级）、Citation 哈希（等值/不等/set去重）、Session store（增加/max_turns）、versioning（正常/异常）、content_hash（确定性/差异）、embed_and_upsert 批量 | `tests/test_agent.py` |
+| 29 | 缺少日志框架 | 实现 `setup_logging()` 配置函数：支持 JSON 结构化日志（依赖 `python-json-logger`）和普通文本格式，通过 `LOG_LEVEL`/`LOG_FORMAT` 环境变量控制 | `services/api/app/logging_config.py`（新增） |
+| 30 | 缺少 infra 配置 | 添加 `Dockerfile`（基于 python:3.12-slim，单阶段构建，uvicorn 启动）和 `docker-compose.yml`（api + qdrant 服务，volume 持久化） | `Dockerfile`（新增）, `docker-compose.yml`（新增） |
+| 31 | 缺少 eval 评测 | 实现 RAGAS 风格评测框架：`evaluate.py` 提供 `EvalSample`/`EvalResult` 数据结构、`load_dataset()`（JSONL 格式）、`evaluate_sample()`（关键词重叠启发式评分）、`evaluate_dataset()`（批量评测+聚合）。附带 `sample.jsonl` 示例数据集 | `eval/ragas/evaluate.py`（新增）, `eval/datasets/sample.jsonl`（新增） |
+| 32 | dedup/versioning 不健壮 | `next_version()` 重写：使用正则提取最右侧数字段递增，支持 `v1.2` 等前缀格式；空/无数字输入抛 `ValueError`。新增 `parse_version()` 和 `is_newer()` 版本比较工具函数 | `dedup/versioning.py` |

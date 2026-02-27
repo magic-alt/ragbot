@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple, runtime_checkable
+
+from typing import Protocol
 
 from ..llm.client import OpenAIClient
 from ..retrieval.qdrant import InMemoryQdrant
@@ -25,14 +27,30 @@ from .state import (
     ROUTE_WEB,
     build_initial_state,
 )
+from contracts.types import SqlResult
+
+
+@runtime_checkable
+class QdrantInterface(Protocol):
+    @property
+    def dim(self) -> int: ...
+
+    def upsert(self, points: Iterable[Tuple[str, List[float], Dict[str, Any]]]) -> None: ...
+
+    def search(self, query_vector: List[float], filters: Dict[str, Any], top_k: int) -> List[Tuple[str, float, Dict[str, Any]]]: ...
+
+
+@runtime_checkable
+class SqlEngineInterface(Protocol):
+    def query(self, query: str, params: Optional[Dict[str, Any]] = None, limit: Optional[int] = None) -> SqlResult: ...
 
 
 @dataclass
 class AgentServices:
     repo: InMemoryRepo
-    qdrant: Any
+    qdrant: QdrantInterface
     retriever: Retriever
-    sql_engine: Any
+    sql_engine: SqlEngineInterface
     code_search: CodeSearch
     llm: OpenAIClient
 

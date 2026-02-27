@@ -114,30 +114,14 @@ def _render_claim_lines(claims: Sequence[dict]) -> List[str]:
 
 
 def _collect_citations(claims: Sequence[dict], citation_map: dict) -> List[Citation]:
+    seen: set[Citation] = set()
     used: List[Citation] = []
-    seen = set()
     for claim in claims:
         for cid in claim.get("citation_ids", []) or []:
             cite = citation_map.get(cid)
-            if not cite:
+            if not cite or cite in seen:
                 continue
-            key = (
-                cite.kind,
-                cite.chunk_id,
-                cite.doc_id,
-                cite.page,
-                cite.section,
-                cite.url,
-                cite.path,
-                cite.ref,
-                cite.line_start,
-                cite.line_end,
-                cite.row_ref,
-                cite.title,
-            )
-            if key in seen:
-                continue
-            seen.add(key)
+            seen.add(cite)
             used.append(cite)
     return used
 
@@ -215,31 +199,24 @@ def _sentence_score(sentence: str, keywords: Iterable[str]) -> int:
 
 
 def _merge_citations(evidence: Sequence[EvidenceItem]) -> List[Citation]:
-    seen = set()
+    seen: set[Citation] = set()
     ordered: List[Citation] = []
     for ev in evidence:
         for cite in ev.citations:
-            key = (
-                cite.kind,
-                cite.chunk_id,
-                cite.doc_id,
-                cite.page,
-                cite.section,
-                cite.url,
-                cite.path,
-                cite.ref,
-                cite.line_start,
-                cite.line_end,
-                cite.row_ref,
-                cite.title,
-            )
-            if key in seen:
+            if cite in seen:
                 continue
-            seen.add(key)
+            seen.add(cite)
             ordered.append(cite)
     return ordered
 
 
 def _dedupe_citations(citations: List[Citation]) -> List[Citation]:
-    return _merge_citations([EvidenceItem(kind="doc_chunk", citations=citations)])
+    seen: set[Citation] = set()
+    result: List[Citation] = []
+    for cite in citations:
+        if cite in seen:
+            continue
+        seen.add(cite)
+        result.append(cite)
+    return result
 
