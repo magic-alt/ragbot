@@ -19,7 +19,9 @@ from .factory import build_services_from_env
 from .main import chat
 from .middleware import setup_middleware
 from .routes.openai_compat import create_openai_compat_endpoint
+from .routes.ingest import create_ingest_router
 from .routes.search import create_search_endpoint
+from .routes.sources import create_sources_router
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +65,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         engine.close()
 
 
-app = FastAPI(title="ragbot API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="ragbot API", version="0.3.0", lifespan=lifespan)
 
 # Register middleware (CORS + request logging)
 setup_middleware(app)
@@ -71,6 +73,8 @@ setup_middleware(app)
 # Register routers
 app.include_router(create_search_endpoint(_get_services, verify_api_key))
 app.include_router(create_openai_compat_endpoint(_get_services, verify_api_key))
+app.include_router(create_sources_router(_get_services, verify_api_key))
+app.include_router(create_ingest_router(_get_services, verify_api_key))
 
 
 class ConstraintsModel(BaseModel):
@@ -96,11 +100,6 @@ class ChatRequest(BaseModel):
     client_context: Optional[dict] = None
 
 
-class IngestRequest(BaseModel):
-    source_type: str
-    source_config: dict
-
-
 @app.post("/chat")
 async def chat_endpoint(payload: ChatRequest, _key: str = Depends(verify_api_key)):
     services = _get_services()
@@ -122,12 +121,6 @@ async def chat_endpoint(payload: ChatRequest, _key: str = Depends(verify_api_key
     return result
 
 
-@app.post("/ingest", status_code=202)
-async def ingest_endpoint(payload: IngestRequest, _key: str = Depends(verify_api_key)) -> dict:
-    job_id = payload.source_config.get("job_id", "demo")
-    return {"status": "accepted", "job_id": job_id}
-
-
 @app.get("/admin/health")
 async def health_endpoint() -> dict:
     return {"status": "ok"}
@@ -136,7 +129,7 @@ async def health_endpoint() -> dict:
 def _constraints_from_model(model: Optional[ConstraintsModel]) -> Optional[Constraints]:
     if not model:
         return None
-    return Constraints(**model.dict())
+    return Constraints(**model.model_dump())
 
 
 async def _chat_stream_realtime(payload: ChatRequest) -> AsyncIterator[str]:

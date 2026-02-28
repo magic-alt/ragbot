@@ -43,6 +43,19 @@ class SqlEngine:
             stats={"row_count": len(rows), "elapsed_ms": elapsed_ms},
         )
 
+    def introspect_schema(self) -> List[Dict[str, Any]]:
+        """Return schema info for all registered in-memory tables."""
+        state = self._repo.export_state()
+        tables = state.get("tables", [])
+        result = []
+        for table in tables:
+            result.append({
+                "table_name": table.get("name", "?"),
+                "columns": table.get("columns", []),
+                "row_count": len(table.get("rows", [])),
+            })
+        return result
+
 
 class PostgresSqlEngine:
     def __init__(
@@ -88,6 +101,37 @@ class PostgresSqlEngine:
             columns=columns_meta,
             stats={"row_count": len(dict_rows), "elapsed_ms": elapsed_ms},
         )
+
+    def introspect_schema(self) -> List[Dict[str, Any]]:
+        """Query information_schema for table/column metadata."""
+        schema_filter = tuple(self._allowed_schemas) if self._allowed_schemas else ("public",)
+        sql = """
+            SELECT table_schema, table_name, column_name, data_type, is_nullable,
+                   column_default, ordinal_position
+            FROM information_schema.columns
+            WHERE table_schema = ANY(%s)
+            ORDER BY table_schema, table_name, ordinal_position
+        """
+        with self._pool.connection() as conn:
+            with conn.transaction():
+                conn.execute("SET LOCAL TRANSACTION READ ONLY")
+                cursor = conn.execute(sql, (list(schema_filter),))
+                rows = cursor.fetchall()
+
+        tables: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            schema, table, col_name, dtype, nullable, default, pos = row
+            key = f"{schema}.{table}"
+            if key not in tables:
+                tables[key] = {"table_name": key, "columns": [], "schema": schema}
+            tables[key]["columns"].append({
+                "name": col_name,
+                "type": dtype,
+                "nullable": nullable == "YES",
+                "default": default,
+                "position": pos,
+            })
+        return list(tables.values())
 
 
 def sql_node(state: AgentState, services: Any) -> AgentState:
@@ -174,6 +218,24 @@ def _llm_nl2sql(llm: Any, question: str, tables_desc: str) -> str:
 
 
 def _describe_tables(services: Any) -> str:
+    sql_engine = getattr(services, "sql_engine", None)
+
+    # Try introspection first (works for both in-memory and Postgres)
+    if sql_engine and hasattr(sql_engine, "introspect_schema"):
+        try:
+            tables = sql_engine.introspect_schema()
+            if tables:
+                lines = []
+                for table in tables:
+                    name = table.get("table_name", "?")
+                    cols = table.get("columns", [])
+                    col_desc = ", ".join(f"{c.get('name', '?')} {c.get('type', '?')}" for c in cols)
+                    lines.append(f"  {name}({col_desc})")
+                return "\n".join(lines)
+        except Exception as exc:
+            logger.debug("introspect_schema failed, falling back: %s", exc)
+
+    # Fall back to in-memory repo tables
     repo = getattr(services, "repo", None)
     if not repo:
         return ""

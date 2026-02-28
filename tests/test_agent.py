@@ -1,3 +1,5 @@
+import os
+import tempfile
 import time
 import threading
 import unittest
@@ -6,6 +8,7 @@ from services.api.app.agent.graph import build_default_services, run_agent
 from services.api.app.agent.nodes.code import CodeSearch, code_node
 from services.api.app.agent.nodes.finalize import finalize_node
 from services.api.app.agent.nodes.route import route_node
+from services.api.app.agent.nodes.sql import SqlEngine
 from services.api.app.agent.nodes.synthesize import synthesize_node
 from services.api.app.agent.nodes.verify import verify_node
 from services.api.app.agent.nodes.web import web_node
@@ -16,12 +19,13 @@ from services.api.app.agent.reliability import (
     CircuitBreaker, CircuitOpenError, ToolTimeoutError,
     with_timeout, with_retry, safe_tool_call, RetryConfig,
 )
-from services.api.app.auth.acl import build_policy
+from services.api.app.auth.acl import build_policy, compute_security_scope, UserContext, compute_security_scope_from_context
 from services.api.app.llm.client import OpenAIClient
 from services.api.app.llm.ollama import OllamaAdapter
 from services.api.app.llm.provider import ModelProvider
 from services.api.app.retrieval.rerank import rrf_fuse
-from services.api.app.storage.models import Chunk, Document, TableData
+from services.api.app.storage.models import Chunk, Document, Source, IngestionJob, TableData
+from services.api.app.storage.repo import InMemoryRepo
 from services.worker.dedup.hashing import content_hash
 from services.worker.dedup.versioning import next_version
 from services.worker.jobs.embed_and_upsert import embed_and_upsert
@@ -585,6 +589,371 @@ class FastAPIEndpointTests(unittest.TestCase):
         request_id = response.headers.get("X-Request-ID")
         self.assertIsNotNone(request_id)
         self.assertTrue(len(request_id) > 0)
+
+
+# ── Milestone B: Source/Repo CRUD Tests ───────────────────────────────
+
+
+class SourceRepoTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = InMemoryRepo()
+
+    def test_add_and_get_source(self):
+        source = Source(
+            source_id="s1", tenant_id="t1", source_type="pdf",
+            name="My PDF", config={"path": "/tmp/test.pdf"},
+        )
+        self.repo.add_source(source)
+        result = self.repo.get_source("s1")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "My PDF")
+        self.assertEqual(result.source_type, "pdf")
+
+    def test_list_sources_by_tenant(self):
+        self.repo.add_source(Source(source_id="s1", tenant_id="t1", source_type="pdf", name="PDF1"))
+        self.repo.add_source(Source(source_id="s2", tenant_id="t2", source_type="web", name="Web1"))
+        self.repo.add_source(Source(source_id="s3", tenant_id="t1", source_type="local_fs", name="FS1"))
+        t1_sources = self.repo.list_sources(tenant_id="t1")
+        self.assertEqual(len(t1_sources), 2)
+
+    def test_update_source(self):
+        self.repo.add_source(Source(source_id="s1", tenant_id="t1", source_type="pdf", name="Original"))
+        updated = self.repo.update_source("s1", name="Updated", status="paused")
+        self.assertEqual(updated.name, "Updated")
+        self.assertEqual(updated.status, "paused")
+
+    def test_delete_source(self):
+        self.repo.add_source(Source(source_id="s1", tenant_id="t1", source_type="pdf", name="ToDelete"))
+        result = self.repo.delete_source("s1")
+        self.assertTrue(result)
+        source = self.repo.get_source("s1")
+        self.assertEqual(source.status, "deleted")
+
+    def test_delete_nonexistent(self):
+        result = self.repo.delete_source("nonexistent")
+        self.assertFalse(result)
+
+
+class JobRepoTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = InMemoryRepo()
+
+    def test_add_and_get_job(self):
+        job = IngestionJob(
+            job_id="j1", tenant_id="t1", source_id="s1",
+            source_type="pdf", source_config={"path": "/tmp/test.pdf"},
+        )
+        self.repo.add_job(job)
+        result = self.repo.get_job("j1")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.status, "pending")
+
+    def test_list_jobs_by_source(self):
+        self.repo.add_job(IngestionJob(job_id="j1", tenant_id="t1", source_id="s1", source_type="pdf", source_config={}))
+        self.repo.add_job(IngestionJob(job_id="j2", tenant_id="t1", source_id="s2", source_type="web", source_config={}))
+        self.repo.add_job(IngestionJob(job_id="j3", tenant_id="t1", source_id="s1", source_type="pdf", source_config={}))
+        s1_jobs = self.repo.list_jobs(source_id="s1")
+        self.assertEqual(len(s1_jobs), 2)
+
+    def test_update_job(self):
+        self.repo.add_job(IngestionJob(job_id="j1", tenant_id="t1", source_id="s1", source_type="pdf", source_config={}))
+        updated = self.repo.update_job("j1", status="completed", chunk_count=10)
+        self.assertEqual(updated.status, "completed")
+        self.assertEqual(updated.chunk_count, 10)
+
+
+# ── Milestone B: ACL Enhanced Tests ───────────────────────────────────
+
+
+class ACLGroupRoleTests(unittest.TestCase):
+    def test_group_access(self):
+        policy = build_policy("p1", "t1", {"allow_groups": ["engineering"]})
+        scope = compute_security_scope("u1", [policy], groups=["engineering"])
+        self.assertIn(policy.policy_hash, scope)
+
+    def test_group_denied(self):
+        policy = build_policy("p1", "t1", {"allow_groups": ["engineering"]})
+        scope = compute_security_scope("u1", [policy], groups=["marketing"])
+        self.assertNotIn(policy.policy_hash, scope)
+
+    def test_role_access(self):
+        policy = build_policy("p1", "t1", {"allow_roles": ["admin"]})
+        scope = compute_security_scope("u1", [policy], roles=["admin"])
+        self.assertIn(policy.policy_hash, scope)
+
+    def test_role_denied(self):
+        policy = build_policy("p1", "t1", {"allow_roles": ["admin"]})
+        scope = compute_security_scope("u1", [policy], roles=["viewer"])
+        self.assertNotIn(policy.policy_hash, scope)
+
+    def test_user_context(self):
+        ctx = UserContext("u1", groups=["eng"], roles=["admin"])
+        self.assertEqual(ctx.user_id, "u1")
+        self.assertIn("eng", ctx.groups)
+        self.assertIn("admin", ctx.roles)
+
+    def test_compute_scope_from_context(self):
+        policy = build_policy("p1", "t1", {"allow_roles": ["admin"]})
+        ctx = UserContext("u1", roles=["admin"])
+        scope = compute_security_scope_from_context(ctx, [policy])
+        self.assertIn(policy.policy_hash, scope)
+
+    def test_backward_compat_user_access(self):
+        policy = build_policy("p1", "t1", {"allow_users": ["u1"]})
+        scope = compute_security_scope("u1", [policy])
+        self.assertIn(policy.policy_hash, scope)
+
+    def test_allow_all_still_works(self):
+        policy = build_policy("p1", "t1", {"allow_all": True})
+        scope = compute_security_scope("anyone", [policy])
+        self.assertIn(policy.policy_hash, scope)
+
+
+# ── Milestone B: Schema Introspection Tests ───────────────────────────
+
+
+class SchemaIntrospectionTests(unittest.TestCase):
+    def test_inmemory_introspect(self):
+        repo = InMemoryRepo()
+        table = TableData(
+            name="orders",
+            columns=[{"name": "id", "type": "int"}, {"name": "total", "type": "float"}],
+            rows=[{"id": 1, "total": 99.99}],
+        )
+        repo.register_table(table)
+        engine = SqlEngine(repo)
+        schema = engine.introspect_schema()
+        self.assertEqual(len(schema), 1)
+        self.assertEqual(schema[0]["table_name"], "orders")
+        self.assertEqual(len(schema[0]["columns"]), 2)
+        self.assertEqual(schema[0]["row_count"], 1)
+
+    def test_introspect_empty(self):
+        repo = InMemoryRepo()
+        engine = SqlEngine(repo)
+        schema = engine.introspect_schema()
+        self.assertEqual(len(schema), 0)
+
+
+# ── Milestone B: Local FS Connector Tests ─────────────────────────────
+
+
+class LocalFSConnectorTests(unittest.TestCase):
+    def test_list_files(self):
+        from services.worker.connectors.local_fs import list_files
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create test files
+            open(os.path.join(tmpdir, "readme.md"), "w").write("# Hello")
+            open(os.path.join(tmpdir, "notes.txt"), "w").write("Some notes")
+            open(os.path.join(tmpdir, "image.png"), "w").write("fake image")
+            files = list_files(tmpdir)
+            self.assertEqual(len(files), 2)  # only .md and .txt
+
+    def test_list_files_custom_ext(self):
+        from services.worker.connectors.local_fs import list_files
+        with tempfile.TemporaryDirectory() as tmpdir:
+            open(os.path.join(tmpdir, "data.csv"), "w").write("a,b,c")
+            open(os.path.join(tmpdir, "readme.md"), "w").write("# H")
+            files = list_files(tmpdir, extensions={".csv"})
+            self.assertEqual(len(files), 1)
+            self.assertTrue(files[0].endswith(".csv"))
+
+    def test_read_file(self):
+        from services.worker.connectors.local_fs import read_file
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("hello world")
+            f.flush()
+            content = read_file(f.name)
+            self.assertEqual(content, "hello world")
+        os.unlink(f.name)
+
+
+class IngestTextTests(unittest.TestCase):
+    def test_ingest_text_file(self):
+        from services.worker.jobs.ingest_text import ingest_text_file
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("A" * 2000)
+            f.flush()
+            chunks = list(ingest_text_file(f.name, doc_id="d1", tenant_id="t1", chunk_size=800))
+            self.assertTrue(len(chunks) >= 2)
+            self.assertEqual(chunks[0].tenant_id, "t1")
+            self.assertIsNotNone(chunks[0].checksum)
+        os.unlink(f.name)
+
+    def test_ingest_markdown_section(self):
+        from services.worker.jobs.ingest_text import ingest_text_file
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write("# Introduction\n\nSome content here about the topic.\n")
+            f.flush()
+            chunks = list(ingest_text_file(f.name, doc_id="d1", tenant_id="t1"))
+            self.assertTrue(len(chunks) >= 1)
+            self.assertEqual(chunks[0].section, "Introduction")
+            self.assertEqual(chunks[0].metadata["source_type"], "markdown")
+        os.unlink(f.name)
+
+    def test_ingest_local_fs(self):
+        from services.worker.jobs.ingest_text import ingest_local_fs
+        with tempfile.TemporaryDirectory() as tmpdir:
+            open(os.path.join(tmpdir, "a.txt"), "w").write("Content of file A")
+            open(os.path.join(tmpdir, "b.md"), "w").write("# Title\n\nContent of file B")
+            chunks = list(ingest_local_fs(
+                directory=tmpdir, doc_id="d1", tenant_id="t1",
+            ))
+            self.assertTrue(len(chunks) >= 2)
+            doc_ids = {c.doc_id for c in chunks}
+            self.assertTrue(len(doc_ids) >= 2)  # Different doc_id per file
+
+
+# ── Milestone B: Pipeline Tests ───────────────────────────────────────
+
+
+class PipelineTests(unittest.TestCase):
+    def test_pipeline_text_ingest(self):
+        from services.worker.pipeline import run_ingest_pipeline
+        services = build_default_services()
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("This is test content for the pipeline. " * 30)
+            f.flush()
+
+            source = Source(
+                source_id="src-test", tenant_id="t1", source_type="local_fs",
+                name="Test FS", config={"path": os.path.dirname(f.name)},
+            )
+            services.repo.add_source(source)
+            job = run_ingest_pipeline(source, services.repo, services.qdrant)
+            self.assertEqual(job.status, "completed")
+            self.assertTrue(job.chunk_count > 0)
+        os.unlink(f.name)
+
+    def test_pipeline_dedup(self):
+        from services.worker.pipeline import run_ingest_pipeline
+        services = build_default_services()
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("Unique test content for dedup testing.")
+            f.flush()
+
+            source = Source(
+                source_id="src-dedup", tenant_id="t1", source_type="local_fs",
+                name="Test Dedup", config={"path": os.path.dirname(f.name)},
+            )
+            services.repo.add_source(source)
+
+            job1 = run_ingest_pipeline(source, services.repo, services.qdrant, job_id="j1")
+            first_count = job1.chunk_count
+
+            job2 = run_ingest_pipeline(source, services.repo, services.qdrant, job_id="j2")
+            # Second run should have 0 new chunks due to dedup
+            self.assertEqual(job2.chunk_count, 0)
+        os.unlink(f.name)
+
+    def test_pipeline_error_handling(self):
+        from services.worker.pipeline import run_ingest_pipeline
+        services = build_default_services()
+        source = Source(
+            source_id="src-bad", tenant_id="t1", source_type="local_fs",
+            name="Bad Source", config={"path": "/nonexistent/path/that/does/not/exist"},
+        )
+        services.repo.add_source(source)
+        job = run_ingest_pipeline(source, services.repo, services.qdrant)
+        self.assertEqual(job.status, "failed")
+        self.assertIsNotNone(job.error)
+
+
+# ── Milestone B: FastAPI Source/Ingest Endpoint Tests ─────────────────
+
+
+class FastAPISourceEndpointTests(unittest.TestCase):
+    """Test /sources and /ingest/jobs endpoints."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            raise unittest.SkipTest("fastapi TestClient not available")
+
+        from services.api.app.api import app
+        import services.api.app.api as api_mod
+        api_mod._services = build_default_services()
+        cls.client = TestClient(app)
+
+    def test_create_source(self):
+        response = self.client.post("/sources", json={
+            "tenant_id": "t1",
+            "source_type": "pdf",
+            "name": "Test PDF Source",
+            "config": {"path": "/tmp/test.pdf"},
+        })
+        self.assertEqual(response.status_code, 201)
+        data = response.json()
+        self.assertIn("source_id", data)
+        self.assertEqual(data["source_type"], "pdf")
+        self.assertEqual(data["status"], "active")
+
+    def test_create_source_invalid_type(self):
+        response = self.client.post("/sources", json={
+            "tenant_id": "t1",
+            "source_type": "invalid_type",
+            "name": "Bad Source",
+        })
+        self.assertEqual(response.status_code, 400)
+
+    def test_list_sources(self):
+        response = self.client.get("/sources")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("sources", data)
+        self.assertIsInstance(data["sources"], list)
+
+    def test_get_source_not_found(self):
+        response = self.client.get("/sources/nonexistent")
+        self.assertEqual(response.status_code, 404)
+
+    def test_ingest_jobs_list(self):
+        response = self.client.get("/ingest/jobs")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("jobs", data)
+
+    def test_ingest_job_not_found(self):
+        response = self.client.get("/ingest/jobs/nonexistent")
+        self.assertEqual(response.status_code, 404)
+
+    def test_trigger_job_source_not_found(self):
+        response = self.client.post("/ingest/jobs", json={
+            "source_id": "nonexistent",
+            "tenant_id": "t1",
+        })
+        self.assertEqual(response.status_code, 404)
+
+    def test_source_crud_lifecycle(self):
+        # Create
+        resp = self.client.post("/sources", json={
+            "tenant_id": "t1", "source_type": "web", "name": "Lifecycle Test",
+            "config": {"url": "https://example.com"},
+        })
+        self.assertEqual(resp.status_code, 201)
+        source_id = resp.json()["source_id"]
+
+        # Read
+        resp = self.client.get(f"/sources/{source_id}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["name"], "Lifecycle Test")
+
+        # Update
+        resp = self.client.put(f"/sources/{source_id}", json={"name": "Updated Name"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["name"], "Updated Name")
+
+        # Delete
+        resp = self.client.delete(f"/sources/{source_id}")
+        self.assertEqual(resp.status_code, 204)
+
+        # Verify deleted
+        resp = self.client.get(f"/sources/{source_id}")
+        self.assertEqual(resp.status_code, 404)
 
 
 if __name__ == "__main__":

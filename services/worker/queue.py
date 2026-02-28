@@ -77,10 +77,13 @@ def _register_default_tasks(queue: InProcessQueue) -> None:
     from services.worker.jobs.ingest_pdf import ingest_pdf
     from services.worker.jobs.ingest_repo import ingest_repo
     from services.worker.jobs.ingest_web import ingest_web
+    from services.worker.jobs.ingest_text import ingest_text_file, ingest_local_fs
 
     queue.register("ingest_pdf", ingest_pdf)
     queue.register("ingest_repo", ingest_repo)
     queue.register("ingest_web", ingest_web)
+    queue.register("ingest_text", ingest_text_file)
+    queue.register("ingest_local_fs", ingest_local_fs)
 
 
 def _create_celery_queue() -> Any:

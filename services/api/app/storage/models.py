@@ -45,12 +45,33 @@ class ACLPolicy:
 
 
 @dataclass
+class Source:
+    source_id: str
+    tenant_id: str
+    source_type: str  # local_fs, pdf, web, repo, email, database
+    name: str
+    config: Dict[str, Any] = field(default_factory=dict)
+    status: str = "active"  # active, paused, deleted
+    acl_policy_id: Optional[str] = None
+    tags: List[str] = field(default_factory=list)
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+@dataclass
 class IngestionJob:
     job_id: str
     tenant_id: str
+    source_id: str
     source_type: str
     source_config: Dict[str, Any]
-    status: str
+    status: str = "pending"  # pending, running, completed, failed
+    doc_count: int = 0
+    chunk_count: int = 0
+    error: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    created_at: Optional[str] = None
     stats: Dict[str, Any] = field(default_factory=dict)
 
 

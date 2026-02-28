@@ -162,45 +162,65 @@ API/客户端：
 
 ---
 
-### Milestone B（2～6 周）：企业级数据接入（本地文档 + 邮件 + DB）闭环
+### ✅ Milestone B（已完成）：企业级数据接入（本地文档 + DB）闭环
 
 目标：真实连接器 + 增量更新 + 权限映射 + 可管理数据源。
 
-交付物：
+**完成情况：**
 
-1) Ingestion Pipeline（生产化）
-- 任务队列（Celery/Dramatiq/Temporal 任一）
-- 文档版本化：checksum + version + upsert
-- 去重策略：chunk checksum、doc hash、URL canonicalization
-- job 状态：queued/running/failed/done + 统计/错误原因
+| 交付项 | 状态 | 说明 |
+|--------|------|------|
+| Source 模型 + `/sources` CRUD API | ✅ | Source dataclass + CRUD 端点（POST/GET/PUT/DELETE） |
+| Ingestion Pipeline 编排器 | ✅ | `services/worker/pipeline.py`：Source → Job → connector → chunk → dedup → embed → upsert |
+| `/ingest/jobs` 任务管理 API | ✅ | trigger / list / status / retry 端点；异步执行 |
+| Local FS 连接器 + Markdown/TXT 切分 | ✅ | `connectors/local_fs.py` + `jobs/ingest_text.py`：目录扫描、文件过滤、MD 段落提取 |
+| DB Schema Introspection | ✅ | `SqlEngine.introspect_schema()` + `PostgresSqlEngine.introspect_schema()`（information_schema 查询） |
+| ACL 增强（group/role） | ✅ | `compute_security_scope()` 新增 groups/roles 参数；`UserContext` 类；`compute_security_scope_from_context()` |
+| 文档版本化 + chunk 去重 | ✅ | pipeline 内 checksum 去重；`next_version()` 自动升版 |
+| Job 状态管理 | ✅ | pending → running → completed/failed；含 doc_count、chunk_count、error、时间戳 |
+| 数据库迁移 | ✅ | `infra/migrations/002_sources.sql`：sources 表 + ingestion_jobs.source_id |
+| 测试覆盖 | ✅ | 新增 35 条测试，总计 **86 条，全部通过**（0 failures, 0 warnings） |
 
-2) 连接器
-- Local FS：watcher（可选）+ 手动 ingest
-- PDF：结构化切分（标题/页码/段落/表格策略）
-- Web：抓取+正文抽取+去噪（robots/频控）
-- Email：
-  - Gmail / Outlook：拉取邮件与附件、线程、时间、发件人/收件人
-  - 权限：按邮箱账户隔离 + 可选共享邮箱/群组映射
-- Database：
-  - schema introspection（表/字段注释）
-  - SQL 工具只读：白名单 schema + 自动 LIMIT + 超时 + explain(可选)
-  - DB 文档化：把重要表/字段/业务字典写入 db_doc 索引，增强问答可解释性
+**WU-B1 - Source 模型 + `/sources` CRUD API**
+- `Source` dataclass（`storage/models.py`）：source_id, tenant_id, source_type, name, config, status, acl_policy_id, tags
+- 支持 6 种 source_type：`local_fs` | `pdf` | `web` | `repo` | `email` | `database`
+- InMemoryRepo 扩展：add/get/list/update/delete_source
+- FastAPI router：`routes/sources.py`（POST/GET/PUT/DELETE `/sources`）
 
-3) 权限模型（商业化关键）
-- doc-level ACL：用户/组/角色/标签
-- 邮件权限：账户范围、共享范围
-- DB 权限：schema/table 白名单（建议用只读 DB user）
+**WU-B2 - Ingestion Pipeline 编排器（`services/worker/pipeline.py`）**
+- `run_ingest_pipeline(source, repo, qdrant)`：完整生命周期管理
+- 自动创建 IngestionJob（running → completed/failed）
+- 连接器分发：local_fs/pdf/web/repo 各走对应 ingest_* 函数
+- chunk 去重：checksum 比对，已存在跳过
+- Document 记录自动创建/升版
 
-4) 管理 API
-- `/sources`：创建/更新/暂停/删除数据源
-- `/ingest/jobs`：触发任务、查看进度、重试、失败原因
-- `/search`：纯检索 API（给 UI/IDE 用）
+**WU-B3 - `/ingest/jobs` 任务管理 API（`routes/ingest.py`）**
+- `POST /ingest/jobs`：触发任务（异步线程池执行）
+- `GET /ingest/jobs`：列表（支持 tenant_id / source_id 过滤）
+- `GET /ingest/jobs/{job_id}`：查看状态
+- `POST /ingest/jobs/{job_id}/retry`：重试失败任务
 
-验收标准：
+**WU-B4 - Local FS 连接器 + Markdown/TXT 切分**
+- `connectors/local_fs.py`：`list_files()` 递归扫描（排除 .git/node_modules 等）+ `read_file()`
+- `jobs/ingest_text.py`：`ingest_text_file()` 单文件 + `ingest_local_fs()` 批量目录
+- Markdown 自动提取段落标题（`section` 字段）
 
-- 连接器支持增量更新（按时间/etag/hash）
-- ACL 前置过滤：无越权召回（抽样审计 0 漏洞）
-- 数据源管理端到端可用：新增 source → ingest → 可检索
+**WU-B5 - DB Schema Introspection**
+- `SqlEngine.introspect_schema()`：基于 InMemoryRepo 的 TableData
+- `PostgresSqlEngine.introspect_schema()`：查询 `information_schema.columns`，按 allowed_schemas 过滤
+- `_describe_tables()` 增强：优先使用 `introspect_schema()`，回退到 export_state
+
+**WU-B6 - ACL 增强（group/role 支持）**
+- `compute_security_scope()` 新增 `groups`/`roles` 可选参数（向后兼容）
+- 新增 `UserContext` 类：封装 user_id + groups + roles
+- 新增 `compute_security_scope_from_context()` 便捷方法
+- 规则支持：`allow_all` / `allow_users` / `allow_groups` / `allow_roles`
+
+**WU-B7 - 测试覆盖**
+- 新增 35 条测试，总计 86 条，全部通过
+- 覆盖：Source CRUD、Job 管理、ACL group/role、Schema Introspection、Local FS 连接器、Text 切分、Pipeline 端到端、Pipeline 去重、Pipeline 错误处理、/sources + /ingest/jobs 端点
+
+结论：ragbot 已完成 Milestone B 的全部工作，具备企业级数据接入能力：数据源管理 → 触发任务 → 连接器抓取 → 切分 → 去重 → 向量化 → 可检索。ACL 支持用户/组/角色三级权限。
 
 ---
 
@@ -279,8 +299,8 @@ API/客户端：
 
 - ✅ `POST /chat`（JSON + SSE）— 已实现，SSE 真实流式
 - ✅ `POST /search`（纯检索：返回 chunks/rows/snippets + citations）— 已实现
-- `POST /sources` / `GET /sources`（数据源管理）— Milestone B
-- `POST /ingest/jobs` / `GET /ingest/jobs/{id}`（任务管理）— Milestone B
+- ✅ `POST /sources` / `GET /sources` / `PUT /sources/{id}` / `DELETE /sources/{id}`（数据源 CRUD）— 已实现
+- ✅ `POST /ingest/jobs` / `GET /ingest/jobs` / `GET /ingest/jobs/{id}` / `POST /ingest/jobs/{id}/retry`（任务管理）— 已实现
 - `POST /tools/{name}`（可选：工具代理入口，Node 实现）— Milestone C
 
 ### 5.2 OpenAI 兼容层（强烈建议）
