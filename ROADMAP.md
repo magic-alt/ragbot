@@ -1,411 +1,500 @@
-# ROADMAP - 商业级 Agentic RAG / Cursor-like
+# Ragbot — 商业级 Agentic RAG 平台
 
-> 目标：实现一个商业级可用的 Agentic RAG 平台，支持多种 API 接口，提供类似 Cursor 的编程/问答体验：对本地文档、邮件、数据库、代码仓库进行检索、总结、引用与多步工具调用；LLM 同时支持云端模型与本地大模型（可插拔）。
-
----
-
-## 0. Product Vision
-
-### 0.1 用户价值
-
-- Knowledge Worker：跨文档/邮件/数据库的可追溯总结 + 行动建议，减少检索成本
-- Developer（Cursor-like）：对代码仓库 + 本地文档 + 工单/邮件的上下文编程助手
-- Enterprise/Team：多租户、权限隔离、审计、可观测、可评测、可运维
-
-### 0.2 核心原则
-
-- Evidence-first：回答必须能引用证据（chunk/row/code/url）并可追溯
-- Secure-by-default：ACL 前置过滤、密钥脱敏、最小权限、只读 SQL
-- Composable：工具/模型/连接器可插拔（Python 主实现 + Node 工具代理）
-- Observable & Evaluable：每次回答可追踪、可回放、可评测、可回归
+> 版本 0.5.0 | Milestone A–D 已完成 | 167 项测试全部通过
 
 ---
 
-## 1. 当前现状（已实现基线）
+## 1. Product Vision
 
-### 1.1 基础骨架（首次实现）
+### 1.1 定位
 
-已实现（可运行骨架）包括：
+Ragbot 是一个商业级 Agentic RAG 平台，支持多种 API 接口，提供类似 Cursor 的编程/问答体验：对本地文档、数据库、代码仓库进行检索、总结、引用与多步工具调用；LLM 同时支持云端模型与本地大模型（可插拔）。
 
-- Agent 状态机（route → retrieve/sql/code/web → synthesize → verify → finalize）
-- 多租户 + ACL 预过滤（tenant_id + acl_hashes）
-- 混合检索（Qdrant-style 向量 + Postgres FTS-style 关键词 + RRF 融合）
-- FastAPI `/chat` 支持 JSON + SSE（token/tool_event）
-- OpenAPI/Schema 契约与单元测试骨架
-- 默认 in-memory 适配器 + env 开关启用真实 Postgres/Qdrant
+### 1.2 用户价值
 
-### 1.2 Milestone A 已完成（当前版本）
+- **Knowledge Worker**：跨文档/数据库的可追溯总结 + 行动建议
+- **Developer（Cursor-like）**：代码仓库 + 本地文档 + 上下文编程助手
+- **Enterprise/Team**：多租户、权限隔离、审计、可观测、可评测、可运维
 
-在骨架基础上补齐了以下能力，ragbot 已升级为可用内测版：
+### 1.3 核心原则
 
-**WU1 - 模型适配器抽象（`RAGBOT_LLM_PROVIDER` 环境变量）**
-- `ModelProvider` Protocol（PEP 544），OpenAIClient 零改动即满足接口
-- `OllamaAdapter`：复用 Ollama OpenAI 兼容 API（`/v1/chat/completions`），json 模式降级兼容
-- `build_model_provider()` 工厂：`openai`（默认）| `ollama` 可运行时切换
-- `AgentServices.llm` 类型从 `OpenAIClient` 改为 `ModelProvider`（可插拔）
-
-**WU2 - 工具可靠性（`services/api/app/agent/reliability.py`）**
-- `with_timeout()`：`concurrent.futures` 线程池超时隔离，默认：retrieve=10s、sql=5s、code=8s、web=15s
-- `with_retry()`：指数退避重试，仅对可恢复异常（ConnectionError/TimeoutError/OSError）触发
-- `CircuitBreaker`：连续失败 N 次后熔断 M 秒（默认 3 次 / 30 秒），冷却后自动复位
-- `safe_tool_call()`：统一入口组合三者，已应用到 retrieve/sql/code/web/synthesize/verify 全部 6 个 node
-
-**WU3 - 真实时 SSE 流式（`services/api/app/agent/callbacks.py`）**
-- `AgentEvent` / `EventCallback` Protocol / `QueueCallback` / `NullCallback`
-- `QueueCallback`：线程安全队列，agent 同步线程 emit → async SSE 生成器实时 yield
-- `run_agent()` 新增 `callback` 参数；非流式模式使用 `NullCallback`（零开销）
-- `tool_call` / `tool_result` 在工具运行时即时推送，不再事后汇总
-
-**WU4 - OpenAI 兼容层（`services/api/app/routes/openai_compat.py`）**
-- `POST /v1/chat/completions`：从 `messages[-1]` 提 query，租户信息从 header 读取
-- 非流式返回标准 OpenAI 格式 `{id, object, choices, usage}`，附加 `citations` 字段
-- 流式：复用 QueueCallback 机制，以 OpenAI chunk 格式推送，结尾 `data: [DONE]`
-
-**WU5 - 纯检索端点（`services/api/app/routes/search.py`）**
-- `POST /search`：query + tenant_id + user_id + top_k + filters
-- ACL 过滤与 agent 路径一致（`compute_security_scope()`）
-- 不触发 agent 循环，直接返回 `{request_id, chunks[], total}`
-
-**WU6 - CORS + 请求日志中间件（`services/api/app/middleware.py`）**
-- `RAGBOT_CORS_ORIGINS` 环境变量配置（逗号分隔），空值不启用
-- `RequestLoggingMiddleware`：记录 request_id、method、path、status、latency_ms、client_ip
-- Request ID：优先从 `X-Request-ID` header 读取，否则生成 UUID，回写响应 header
-
-**WU7 - infra/ 目录补齐**
-- `infra/docker/Dockerfile`：生产镜像，含 healthcheck
-- `infra/docker/docker-compose.yml`：API + Postgres + Qdrant + Ollama（可选 profile）
-- `infra/migrations/001_init.sql`：documents / chunks / acl_policies / ingestion_jobs 表 + GIN FTS 索引
-- `infra/qdrant/init_collection.sh`：创建 collection + tenant_id/doc_id/acl_hash/tags payload 索引
-
-**WU8 - 测试覆盖**
-- 新增 24 条测试，总计 **51 条，全部通过**（0 failures）
-- 覆盖：ModelProvider 协议满足性、Timeout/Retry/CircuitBreaker、QueueCallback 事件收发、run_agent+callback 集成、/chat /search /v1/chat/completions 端点格式、Request-ID 传播
-
-结论：ragbot 已完成 Milestone A 的全部工作单元，具备可用内测版特征：工具有保护、流式真实时、接口兼容 OpenAI 生态、基础设施文件齐全。
+- **Evidence-first**：回答必须能引用证据（chunk/row/code/url）并可追溯
+- **Secure-by-default**：ACL 前置过滤、密钥脱敏、最小权限、只读 SQL
+- **Composable**：工具/模型/连接器可插拔（Python 主实现 + Node 工具代理）
+- **Observable & Evaluable**：每次回答可追踪、可回放、可评测、可回归
 
 ---
 
-## 2. 范围定义（Scope）
+## 2. 当前架构
 
-### 2.1 必做（MVP + 商业可用）
+### 2.1 系统总览
 
-数据源：
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Client Layer                         │
+│   CLI (rag ask/search/patch/ingest)  ·  Node SDK  ·  IDE   │
+└────────────────┬────────────────────────────────────────────┘
+                 │  REST + SSE / OpenAI compat
+┌────────────────▼────────────────────────────────────────────┐
+│                   API Gateway (FastAPI)                      │
+│  /chat  /search  /v1/chat/completions  /sources  /ingest    │
+│  /admin/health  /admin/metrics  /admin/feedback  /admin/cost│
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │              Agent Pipeline (graph.py)               │    │
+│  │  route → retrieve/sql/code/web → synthesize         │    │
+│  │       → verify → [loop or finalize]                 │    │
+│  └─────────────────────────────────────────────────────┘    │
+│  Middleware: CORS · RequestLogging · API Key Auth            │
+│  Observability: RequestTracer · MetricsCollector             │
+│  Cache: LRU(TTL) · RetrievalCache · EmbeddingCache          │
+└──────┬──────────┬──────────┬───────────┬────────────────────┘
+       │          │          │           │
+┌──────▼───┐ ┌───▼────┐ ┌──▼────┐ ┌────▼─────┐
+│ Qdrant   │ │Postgres│ │ LLM   │ │ Worker   │
+│ (vector) │ │(FTS+   │ │OpenAI │ │connectors│
+│          │ │ meta)  │ │Ollama │ │PDF/Git/  │
+│          │ │        │ │       │ │Web/FS    │
+└──────────┘ └────────┘ └───────┘ └──────────┘
+```
 
-- 本地文件：PDF / Markdown / TXT / Office（Docx/PPTX/XLSX 可后置）
-- 邮件：Gmail / Outlook（IMAP/Graph）
-- 数据库：Postgres（优先）、MySQL（次优先）、通用 JDBC/SQLAlchemy
-- 代码仓库：Git（本地路径 & GitHub/GitLab）
+### 2.2 工程目录
 
-能力：
+```
+ragbot/
+├── contracts/                    # 跨语言共享契约
+│   ├── types.py                  #   Python 类型（Citation, EvidenceItem, AgentState...）
+│   ├── types.ts                  #   TypeScript 镜像
+│   ├── openapi.yaml              #   OpenAPI 3.1 规范（含 SSE 示例）
+│   └── tools.schema.json         #   工具 JSON Schema
+├── services/
+│   ├── api/app/                  # API 网关
+│   │   ├── agent/                #   Agent 状态机
+│   │   │   ├── graph.py          #     迭代循环 + 工具调度
+│   │   │   ├── state.py          #     状态定义 + build_initial_state()
+│   │   │   ├── callbacks.py      #     SSE 事件回调（QueueCallback）
+│   │   │   ├── context.py        #     IDE 上下文注入 + 证据去重/压缩
+│   │   │   ├── reliability.py    #     timeout / retry / circuit breaker
+│   │   │   ├── session.py        #     会话存储
+│   │   │   └── nodes/            #     Agent 节点
+│   │   │       ├── route.py      #       LLM/关键词路由
+│   │   │       ├── retrieve.py   #       文档检索
+│   │   │       ├── sql.py        #       SQL 查询（NL2SQL）
+│   │   │       ├── code.py       #       代码搜索 + open_file + apply_patch + explain_error
+│   │   │       ├── web.py        #       Web 搜索
+│   │   │       ├── synthesize.py #       证据合成草稿
+│   │   │       ├── verify.py     #       证据充分性验证
+│   │   │       └── finalize.py   #       最终回答输出
+│   │   ├── routes/               #   FastAPI 路由
+│   │   │   ├── chat.py           #     /chat 端点
+│   │   │   ├── search.py         #     /search 纯检索
+│   │   │   ├── sources.py        #     /sources CRUD
+│   │   │   ├── ingest.py         #     /ingest/jobs 任务管理
+│   │   │   ├── admin.py          #     /admin/* 运维端点
+│   │   │   └── openai_compat.py  #     /v1/chat/completions
+│   │   ├── retrieval/            #   混合检索
+│   │   │   ├── qdrant.py         #     向量检索（InMemory + QdrantClient）
+│   │   │   ├── pg_fts.py         #     全文检索（倒排索引 + PG tsvector）
+│   │   │   ├── service.py        #     Retriever 编排 + RRF 融合
+│   │   │   └── rerank.py         #     RRF 排序
+│   │   ├── storage/              #   数据存储
+│   │   │   ├── models.py         #     Document, Chunk, Source, Policy, Job, TableData
+│   │   │   └── repo.py           #     InMemoryRepo（线程安全）
+│   │   ├── llm/                  #   LLM 后端
+│   │   │   ├── provider.py       #     ModelProvider Protocol
+│   │   │   ├── client.py         #     OpenAI 客户端
+│   │   │   ├── ollama.py         #     Ollama 适配器
+│   │   │   └── router.py         #     ModelRouter(fast/strong) + CostTracker
+│   │   ├── auth/                 #   访问控制
+│   │   │   ├── acl.py            #     ACL 计算（user/group/role）
+│   │   │   └── policy.py         #     策略哈希
+│   │   ├── observability/        #   可观测性
+│   │   │   ├── tracing.py        #     RequestTracer + Span
+│   │   │   └── metrics.py        #     MetricsCollector + AggregateMetrics
+│   │   ├── cache/                #   缓存
+│   │   │   └── cache.py          #     LRUCache + RetrievalCache + EmbeddingCache
+│   │   ├── api.py                #   FastAPI 应用入口
+│   │   ├── main.py               #   chat() 编排函数
+│   │   ├── factory.py            #   环境构建工厂
+│   │   ├── middleware.py         #   CORS + 请求日志
+│   │   └── logging_config.py    #   结构化日志配置
+│   └── worker/                   # 摄取 Worker
+│       ├── pipeline.py           #   Source → Job → connector → chunk → dedup → embed
+│       ├── queue.py              #   任务队列（InProcess / Celery 预留）
+│       ├── connectors/           #   数据源连接器
+│       │   ├── local_fs.py       #     目录遍历
+│       │   ├── pdf.py            #     PDF 提取（PyPDF2）
+│       │   ├── web.py            #     网页抓取（requests + BeautifulSoup）
+│       │   └── git.py            #     Git 仓库（GitPython）
+│       ├── jobs/                 #   摄取任务
+│       │   ├── ingest_text.py    #     TXT/MD 切分
+│       │   ├── ingest_pdf.py     #     PDF 切分（滑动窗口 800/100）
+│       │   ├── ingest_repo.py    #     代码切分（Python AST / regex / 行回退）
+│       │   ├── ingest_web.py     #     网页切分
+│       │   └── embed_and_upsert.py #   批量嵌入 + Qdrant upsert
+│       └── dedup/                #   去重
+│           ├── hashing.py        #     内容哈希
+│           └── versioning.py     #     版本管理
+├── cli/                          # CLI 客户端
+│   └── rag.py                    #   rag ask / search / patch / ingest
+├── eval/                         # 评测框架
+│   ├── datasets.py               #   EvalCase + 数据集管理
+│   ├── runner.py                 #   自动回归 + 失败分析
+│   └── ragas/evaluate.py         #   RAGAS 评测
+├── packages/node-client/         # Node SDK
+│   └── src/
+│       ├── client.ts             #   chat() + chatStream() SSE
+│       ├── tools.ts              #   工具类型定义
+│       └── index.ts              #   导出
+├── infra/
+│   ├── docker/
+│   │   ├── Dockerfile            #   生产镜像
+│   │   └── docker-compose.yml    #   API + PG + Qdrant + Ollama + Jaeger
+│   ├── migrations/
+│   │   ├── 001_init.sql          #   documents / chunks / acl_policies / ingestion_jobs
+│   │   ├── 002_sources.sql       #   sources 表
+│   │   └── 003_observability.sql #   feedback / audit_log / request_metrics
+│   ├── qdrant/
+│   │   └── init_collection.sh    #   Collection + payload 索引创建
+│   └── helm/ragbot/              #   Kubernetes 部署
+│       ├── Chart.yaml
+│       ├── values.yaml
+│       └── templates/
+│           ├── deployment.yaml
+│           └── service.yaml
+└── tests/
+    └── test_agent.py             # 167 项单元/集成测试
+```
 
-- 多轮检索与工具调用（Agent）
-- 严格引用（citations）
-- SQL 工具（只读/白名单/限流/超时）
-- Cursor-like：代码问答、定位函数/调用链、生成 patch（至少 unified diff）
-- 多模型：云端（OpenAI/Anthropic 等）+ 本地（Ollama/vLLM/LM Studio 等）
+### 2.3 Agent 状态机
 
-API/客户端：
+```
+Request
+  │
+  ▼
+┌─────────┐
+│ Route   │  LLM 意图分类（可回退关键词匹配）
+│         │  → doc_rag / sql / code / mixed / web_fallback
+└────┬────┘
+     │
+     ▼  ╔══════════════════════════════════╗
+  ┌──▶  ║  Action Loop (max 3 iterations) ║
+  │     ╚══════════════════════════════════╝
+  │         │
+  │     ┌───▼───────────────────────────┐
+  │     │ retrieve / sql / code / web   │  工具调用（带 timeout/retry/breaker）
+  │     │ open_file / apply_patch /     │
+  │     │ explain_error                 │
+  │     └───┬───────────────────────────┘
+  │         │
+  │     ┌───▼────────┐
+  │     │ Synthesize │  基于证据生成草稿（LLM 或模板回退）
+  │     └───┬────────┘
+  │         │
+  │     ┌───▼─────┐
+  │     │ Verify  │  证据充分性检查
+  │     └───┬─────┘
+  │         │
+  │    enough_evidence?
+  │    ├── No  → 生成 next_query → 回到 Action Loop
+  │    └── Yes ↓
+  │
+  │     ┌─────────┐
+  └─    │Finalize │  confidence = high/medium/low + citations
+        └─────────┘
+```
 
-- REST + SSE（已有）
-- 兼容 OpenAI 风格 Chat Completions（便于接入生态）
-- Node SDK（已有示例方向）+ Python SDK
-- 工具代理（Node Tool Proxy）支持组织内系统扩展
+### 2.4 数据模型
 
-### 2.2 非目标（先不做）
+**Postgres 核心表：**
 
-- 全功能 IDE（先做 VSCode 插件/CLI，不做完整编辑器）
-- 实时协作文档编辑
-- 自训练 embedding/LLM（先以可插拔推理为主）
+| 表 | 主要字段 | 用途 |
+|---|---|---|
+| `documents` | doc_id, tenant_id, source_type, title, uri, version, tags, acl_policy_id | 文档元数据 |
+| `chunks` | chunk_id, doc_id, tenant_id, chunk_index, text, checksum, tsv(GIN) | 片段 + FTS |
+| `acl_policies` | acl_policy_id, tenant_id, rules(jsonb), policy_hash | 权限策略 |
+| `sources` | source_id, tenant_id, source_type, name, config, status | 数据源管理 |
+| `ingestion_jobs` | job_id, tenant_id, source_id, status, chunk_count, error | 摄取任务 |
+| `feedback` | id, request_id, feedback, created_at | 用户反馈 |
+| `audit_log` | id, request_id, tenant_id, user_id, action, detail | 审计日志 |
+| `request_metrics` | id, request_id, tenant_id, confidence, duration_ms, tool_calls | 请求指标 |
 
----
+**Qdrant payload（向量检索过滤）：**
 
-## 3. 目标架构（商业级）
+`tenant_id`, `source_type`, `doc_id`, `chunk_index`, `path`, `url`, `page`, `section`, `language`, `ingested_at`, `doc_updated_at`, `version`, `checksum`, `acl_hash`, `tags[]`, `embedding_model`
 
-### 3.1 服务拆分（推荐）
+### 2.5 API 端点
 
-- api-gateway（Python/FastAPI）：/chat /ingest /sources /admin /auth
-- ingestion-worker（Python）：连接器抓取、chunk、embed、upsert、去重、版本化
-- retrieval-service（Python lib）：Qdrant + Postgres FTS + rerank + ACL filter
-- tool-proxy（Node，可选）：组织内部工具（Jira/CI/工单/内部 API）统一代理
-- model-router（可选）：统一管理本地/云端模型调用、限流、回退策略
+| 端点 | 方法 | 功能 |
+|---|---|---|
+| `/chat` | POST | 主 Agentic RAG（JSON + SSE 流式） |
+| `/search` | POST | 纯检索（不触发 Agent） |
+| `/v1/chat/completions` | POST | OpenAI 兼容层 |
+| `/sources` | CRUD | 数据源管理 |
+| `/ingest/jobs` | POST/GET | 摄取任务触发/查询 |
+| `/admin/health` | GET | 健康检查 |
+| `/admin/metrics` | GET | 聚合质量指标 |
+| `/admin/metrics/history` | GET | 请求历史 |
+| `/admin/feedback` | POST | 用户反馈录入 |
+| `/admin/cost` | GET | LLM 成本追踪 |
+| `/admin/cache` | GET | 缓存统计 |
 
-### 3.2 数据层
+### 2.6 环境变量
 
-- Postgres：documents/chunks/acl/jobs/audit/sessions/feedback（强一致）
-- Qdrant：向量检索（payload 带 tenant/acl/doc/path/url/time/version/tags）
-- 对象存储（可选）：原文/附件缓存（S3/MinIO）
+```bash
+# LLM
+RAGBOT_LLM_PROVIDER=openai|ollama    # 默认 openai
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5:14b
 
----
+# 向量存储
+QDRANT_URL=http://localhost:6333
+QDRANT_COLLECTION=rag_chunks
+QDRANT_DIM=1536
 
-## 4. 里程碑（Milestones）
+# 数据库
+POSTGRES_DSN=postgresql://user:pass@localhost:5432/ragbot
+POSTGRES_ALLOWED_SCHEMAS=public
 
-> 时间仅作参考：你可以按团队规模压缩或拉长。每个里程碑包含：交付物 + 验收标准。
+# 安全
+RAGBOT_API_KEYS=key1,key2            # 空值允许所有请求
 
-### ✅ Milestone A（已完成）：把骨架变成可用内测版
+# 可观测
+RAGBOT_TRACING_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 
-目标：稳定、可回放、引用严格，SSE 事件真实流式。
+# 缓存 & 路由
+RAGBOT_CACHE_ENABLED=true
+RAGBOT_CACHE_TTL_SECONDS=300
+RAGBOT_MODEL_ROUTING=false
 
-**完成情况：**
-
-| 交付项 | 状态 | 说明 |
-|--------|------|------|
-| Citation 强制与校验 | ✅ | verify_node 强制校验；缺证据时降级输出"证据不足"说明 |
-| 工具可靠性（timeout/retry/circuit breaker） | ✅ | reliability.py；6 个 node 均已接入 safe_tool_call() |
-| SSE 真实流式（tool_call/tool_result 即时推送） | ✅ | QueueCallback；agent 线程 emit → async SSE 生成器实时 yield |
-| 模型适配器（OpenAI + Ollama 可切换） | ✅ 额外增加 | ModelProvider Protocol；RAGBOT_LLM_PROVIDER 运行时切换 |
-| OpenAI 兼容层 /v1/chat/completions | ✅ 额外增加 | 非流式 + 流式；附加 citations 字段 |
-| 纯检索端点 /search | ✅ 额外增加 | ACL 一致；不触发 agent 循环 |
-| CORS + 请求日志中间件 | ✅ 额外增加 | Request-ID 传播；RAGBOT_CORS_ORIGINS 配置 |
-| infra/ 基础设施文件 | ✅ 额外增加 | Docker + docker-compose + SQL 迁移脚本 + Qdrant 初始化 |
-| 基础安全（API Auth） | 部分 | API Key 校验已有；JWT/rate limit/secrets redaction 待 Milestone B |
-| 单元测试覆盖 | ✅ | 51 条全通过，新增 24 条，覆盖所有新功能 |
-
----
-
-### ✅ Milestone B（已完成）：企业级数据接入（本地文档 + DB）闭环
-
-目标：真实连接器 + 增量更新 + 权限映射 + 可管理数据源。
-
-**完成情况：**
-
-| 交付项 | 状态 | 说明 |
-|--------|------|------|
-| Source 模型 + `/sources` CRUD API | ✅ | Source dataclass + CRUD 端点（POST/GET/PUT/DELETE） |
-| Ingestion Pipeline 编排器 | ✅ | `services/worker/pipeline.py`：Source → Job → connector → chunk → dedup → embed → upsert |
-| `/ingest/jobs` 任务管理 API | ✅ | trigger / list / status / retry 端点；异步执行 |
-| Local FS 连接器 + Markdown/TXT 切分 | ✅ | `connectors/local_fs.py` + `jobs/ingest_text.py`：目录扫描、文件过滤、MD 段落提取 |
-| DB Schema Introspection | ✅ | `SqlEngine.introspect_schema()` + `PostgresSqlEngine.introspect_schema()`（information_schema 查询） |
-| ACL 增强（group/role） | ✅ | `compute_security_scope()` 新增 groups/roles 参数；`UserContext` 类；`compute_security_scope_from_context()` |
-| 文档版本化 + chunk 去重 | ✅ | pipeline 内 checksum 去重；`next_version()` 自动升版 |
-| Job 状态管理 | ✅ | pending → running → completed/failed；含 doc_count、chunk_count、error、时间戳 |
-| 数据库迁移 | ✅ | `infra/migrations/002_sources.sql`：sources 表 + ingestion_jobs.source_id |
-| 测试覆盖 | ✅ | 新增 35 条测试，总计 **86 条，全部通过**（0 failures, 0 warnings） |
-
-**WU-B1 - Source 模型 + `/sources` CRUD API**
-- `Source` dataclass（`storage/models.py`）：source_id, tenant_id, source_type, name, config, status, acl_policy_id, tags
-- 支持 6 种 source_type：`local_fs` | `pdf` | `web` | `repo` | `email` | `database`
-- InMemoryRepo 扩展：add/get/list/update/delete_source
-- FastAPI router：`routes/sources.py`（POST/GET/PUT/DELETE `/sources`）
-
-**WU-B2 - Ingestion Pipeline 编排器（`services/worker/pipeline.py`）**
-- `run_ingest_pipeline(source, repo, qdrant)`：完整生命周期管理
-- 自动创建 IngestionJob（running → completed/failed）
-- 连接器分发：local_fs/pdf/web/repo 各走对应 ingest_* 函数
-- chunk 去重：checksum 比对，已存在跳过
-- Document 记录自动创建/升版
-
-**WU-B3 - `/ingest/jobs` 任务管理 API（`routes/ingest.py`）**
-- `POST /ingest/jobs`：触发任务（异步线程池执行）
-- `GET /ingest/jobs`：列表（支持 tenant_id / source_id 过滤）
-- `GET /ingest/jobs/{job_id}`：查看状态
-- `POST /ingest/jobs/{job_id}/retry`：重试失败任务
-
-**WU-B4 - Local FS 连接器 + Markdown/TXT 切分**
-- `connectors/local_fs.py`：`list_files()` 递归扫描（排除 .git/node_modules 等）+ `read_file()`
-- `jobs/ingest_text.py`：`ingest_text_file()` 单文件 + `ingest_local_fs()` 批量目录
-- Markdown 自动提取段落标题（`section` 字段）
-
-**WU-B5 - DB Schema Introspection**
-- `SqlEngine.introspect_schema()`：基于 InMemoryRepo 的 TableData
-- `PostgresSqlEngine.introspect_schema()`：查询 `information_schema.columns`，按 allowed_schemas 过滤
-- `_describe_tables()` 增强：优先使用 `introspect_schema()`，回退到 export_state
-
-**WU-B6 - ACL 增强（group/role 支持）**
-- `compute_security_scope()` 新增 `groups`/`roles` 可选参数（向后兼容）
-- 新增 `UserContext` 类：封装 user_id + groups + roles
-- 新增 `compute_security_scope_from_context()` 便捷方法
-- 规则支持：`allow_all` / `allow_users` / `allow_groups` / `allow_roles`
-
-**WU-B7 - 测试覆盖**
-- 新增 35 条测试，总计 86 条，全部通过
-- 覆盖：Source CRUD、Job 管理、ACL group/role、Schema Introspection、Local FS 连接器、Text 切分、Pipeline 端到端、Pipeline 去重、Pipeline 错误处理、/sources + /ingest/jobs 端点
-
-结论：ragbot 已完成 Milestone B 的全部工作，具备企业级数据接入能力：数据源管理 → 触发任务 → 连接器抓取 → 切分 → 去重 → 向量化 → 可检索。ACL 支持用户/组/角色三级权限。
-
----
-
-### Milestone C（6～10 周）：Cursor-like 编程体验（Repo + 本地文档 + 多工具）  ✅ 已完成
-
-目标：在 IDE/CLI 里实现会检索、会定位、会改代码的编程助手。
-
-交付物：
-
-1) Repo Ingestion + Code Search
-- 以 symbol/函数/类为切分单位 + path 元数据
-- 支持 blame/commit-ish（可选）
-- 混合检索：代码符号关键词优先 + 向量辅助（注释/README 更语义）
-
-2) 编程工具集（Agent tools）
-- `code_search`：ripgrep/索引
-- `open_file/read_range`：读取文件片段（带行号引用）
-- `apply_patch`：输出 unified diff（由客户端应用）
-- `run_tests`（可选）：通过 Node 工具代理接 CI 或本地命令（沙盒化）
-- `explain_error`：输入日志/堆栈，定位相关代码与文档
-
-3) 客户端
-- VSCode 插件（推荐优先）或 JetBrains 插件（后置）
-- CLI：支持 `rag ask`、`rag search`、`rag patch`
-- Node SDK：用于插件/前端接入，支持 SSE
-
-4) 上下文策略
-- IDE 打开文件、选中区域、git diff、最近错误日志 → 进入 constraints
-- 成本控制：上下文压缩、引用优先、重复证据去重
-
-验收标准：
-
-- 典型任务（定位函数解释生成 patch）：一次成功率可用（内部基准集评测）
-- patch 输出可被应用，且引用指向具体 path+line
-- IDE 端 P95 交互延迟可接受（首 token、工具调用可视）
-
-**实现状态（Milestone C）：**
-
-| 交付项 | 状态 | 关键文件 |
-|--------|------|----------|
-| 1. 符号级 Repo Ingestion | ✅ | `services/worker/jobs/ingest_repo.py` — AST-based Python 切分 + regex C-like 切分 + 行号/语言元数据 |
-| 2a. `open_file/read_range` | ✅ | `services/api/app/agent/nodes/code.py` — `CodeSearch.open_file()` + `open_file_node()` |
-| 2b. `apply_patch` (unified diff) | ✅ | `services/api/app/agent/nodes/code.py` — `CodeSearch.generate_patch()` + `apply_patch_node()` |
-| 2c. `explain_error` | ✅ | `services/api/app/agent/nodes/code.py` — 多语言堆栈解析 (Python/JS/Go/Java) + 关键词回退 |
-| 3a. CLI client | ✅ | `cli/rag.py` — `rag ask`, `rag search`, `rag patch`, `rag ingest`（本地/远程双模式） |
-| 3b. CLI pyproject entry point | ✅ | `pyproject.toml` — `[project.scripts] rag = "cli.rag:main"` |
-| 4a. Client context 处理 | ✅ | `services/api/app/agent/context.py` — `process_client_context()` 支持 selected_text/open_files/git_diff/errors |
-| 4b. Evidence 去重 | ✅ | `services/api/app/agent/context.py` — `dedup_evidence()` MD5 文本哈希去重 |
-| 4c. Evidence 压缩 | ✅ | `services/api/app/agent/context.py` — `compress_evidence()` 按分数排序+截断+预算控制 |
-| 5. Agent 工具调度扩展 | ✅ | `services/api/app/agent/graph.py` — 新增 open_file/apply_patch/explain_error 分发 |
-| 6. 类型系统扩展 | ✅ | `contracts/types.py` — PatchResult + 新 ToolName + 新 EvidenceItem 类型 |
-| 7. API 集成 | ✅ | `services/api/app/api.py` v0.4.0 + `main.py` — client_context 注入 + evidence 后处理 |
-| 8. 测试 | ✅ | 新增 43 条测试，总计 129 条，全部通过 |
-
-测试覆盖清单：
-- 符号级切分（Python AST / regex / 行回退 / 大符号拆分 / 语言检测）
-- open_file（全文/范围/未找到）
-- generate_patch（有变更/无变更）
-- explain_error（堆栈解析/关键词回退）
-- 堆栈解析（Python/JS/Java 格式）
-- 文件引用解析（path:line-line / path:line / path）
-- Agent 节点集成（open_file_node / explain_error_node）
-- CLI（ask/search/help/no-command）
-- Client context（selected_text/repo/open_files/git_diff/errors/constraints 保留）
-- Evidence 去重（重复移除/唯一保留）
-- Evidence 压缩（低分丢弃/长文截断/空列表）
-- 端到端集成（chat + client_context / run_agent + initial_evidence / /chat API）
-
-结论：ragbot Milestone C 全部完成，具备 Cursor-like 编程助手核心能力：符号级代码检索、文件读取、Patch 生成、错误定位、CLI 客户端、IDE 上下文注入、证据去重与压缩。
-
----
-
-### ✅ Milestone D（已完成）：商业级可运维与可评测（SLO/监控/评测/成本）
-
-目标：能上线、能监控、能回归、能控成本。
-
-**完成情况：**
-
-| 交付项 | 状态 | 说明 |
-|--------|------|------|
-| 1a. OpenTelemetry traces | ✅ | `observability/tracing.py` — RequestTracer + context-manager Span，覆盖 route/retrieve/sql/code/web/synthesize/verify/finalize 全链路 |
-| 1b. 质量指标 | ✅ | `observability/metrics.py` — MetricsCollector 线程安全收集：citation_coverage, retrieval_hit_rate, tool_failure_rate, user_feedback |
-| 1c. 指标 API | ✅ | `/admin/metrics` 聚合 + `/admin/metrics/history` 历史 + `/admin/feedback` 反馈录入 |
-| 2a. 评测数据集 | ✅ | `eval/datasets.py` — EvalCase（doc_qa/db_qa/code_task/mixed）+ 样本数据集 + JSON 导入导出 |
-| 2b. 自动化回归 runner | ✅ | `eval/runner.py` — run_eval_case() + run_eval_suite() + summarize_results()；支持 category/tag 过滤 |
-| 2c. 失败分析 | ✅ | `eval/runner.py` — _analyze_failure()：bad_routing / bad_retrieval / bad_synthesis / bad_tool / error 五类分类 |
-| 3a. 模型路由（fast/strong） | ✅ | `llm/router.py` — ModelRouter + TASK_TIER_MAP（route/verify→fast, synthesize/apply_patch/explain_error→strong） |
-| 3b. 成本追踪 | ✅ | `llm/router.py` — CostTracker 按 task/tier 记录 token 用量 + 成本估算；`/admin/cost` API |
-| 3c. Caching | ✅ | `cache/cache.py` — LRUCache（TTL+LRU 双淘汰）+ RetrievalCache + EmbeddingCache；`/admin/cache` API |
-| 4a. Docker Compose 增强 | ✅ | Jaeger 服务（observability profile）+ OTEL/cache/routing 环境变量 |
-| 4b. Helm Chart | ✅ | `infra/helm/ragbot/` — Chart + values + Deployment + Service；rolling update + health probes + secret 引用 |
-| 4c. 数据库迁移 | ✅ | `infra/migrations/003_observability.sql` — feedback / audit_log / request_metrics 表 + 索引 |
-| 5. 测试覆盖 | ✅ | 新增 38 条测试，总计 **167 条，全部通过**（0 failures） |
-
-**WU-D1 - Observability（`services/api/app/observability/`）**
-- `tracing.py`：`RequestTracer` 包含 context-manager 式 Span（自动计时、异常捕获、属性记录）
-- `TraceRecord.to_dict()`：可序列化为 JSON，兼容 OTLP 导出
-- `setup_tracing()`：读取 `RAGBOT_TRACING_ENABLED` 环境变量，可选启用 OpenTelemetry SDK
-- `metrics.py`：`RequestMetrics` 记录每请求指标，`AggregateMetrics` 聚合统计
-- `build_request_metrics(state, trace_record)`：从 AgentState 自动提取指标
-- `get_metrics_collector()`：全局单例，线程安全
-
-**WU-D2 - Evaluation & Regression（`eval/`）**
-- `datasets.py`：`EvalCase` 支持 setup_tables / setup_files / setup_chunks 预置数据
-- `build_sample_dataset()`：预置 doc_qa + db_qa + code_task 样本
-- `runner.py`：端到端执行 + 多维检查（route / answer_contains / min_citations / min_evidence / confidence）
-- `summarize_results()`：pass_rate + category 分布 + failure_categories 统计
-- `_analyze_failure()`：自动分类失败原因（routing / retrieval / synthesis / tool / error）
-
-**WU-D3 - 模型路由与成本控制**
-- `llm/router.py`：`ModelRouter`（`RAGBOT_MODEL_ROUTING` 环境变量开关）
-- `TASK_TIER_MAP`：route/verify → fast，synthesize/apply_patch/explain_error → strong
-- `CostTracker`：按 tier 定价估算 token 成本（fast: $0.15/$0.60, strong: $3.00/$15.00 per M tokens）
-- `cache/cache.py`：`LRUCache`（OrderedDict O(1) 淘汰 + TTL 过期）+ `RetrievalCache` + `EmbeddingCache`
-- `RAGBOT_CACHE_ENABLED` / `RAGBOT_CACHE_TTL_SECONDS` 环境变量控制
-
-**WU-D4 - 部署**
-- Docker Compose：Jaeger 追踪 UI（`docker compose --profile observability up`）
-- Helm Chart：2 副本 + RollingUpdate（maxUnavailable=0, maxSurge=1）+ liveness/readiness probes
-- Secret 管理：existingSecret 引用 K8s Secret（postgres-dsn / openai-api-key / api-keys）
-- 自动扩缩容配置（HPA 就绪，默认关闭；targetCPU=70%）
-- 数据库迁移：feedback + audit_log + request_metrics 表
-
-**WU-D5 - 测试覆盖**
-- 新增 38 条测试，总计 167 条，全部通过
-- 覆盖：RequestTracer span 计时/异常/多 span/序列化、MetricsCollector 聚合/反馈/历史/build_request_metrics、TracingIntegration、EvalCase 数据集管理/runner 执行/失败分析/suite 汇总、ModelRouter tier 映射/provider 选择/CostTracker、LRUCache TTL 过期/LRU 淘汰/统计/清除、RetrievalCache/EmbeddingCache、admin 端点（metrics/history/feedback/cost/cache）
-
-结论：ragbot Milestone D 全部完成，具备商业级可运维能力：全链路追踪、质量指标自动收集、评测回归框架、模型路由与成本控制、多级缓存、Helm 生产部署。
+# 中间件
+RAGBOT_CORS_ORIGINS=http://localhost:3000
+LOG_LEVEL=INFO
+LOG_FORMAT=json
+```
 
 ---
 
-## 5. API Roadmap（多接口能力）
+## 3. 已完成里程碑摘要
 
-### 5.1 必须提供的 API
+### Milestone A — 可用内测版 (v0.2.0)
 
-- ✅ `POST /chat`（JSON + SSE）— 已实现，SSE 真实流式
-- ✅ `POST /search`（纯检索：返回 chunks/rows/snippets + citations）— 已实现
-- ✅ `POST /sources` / `GET /sources` / `PUT /sources/{id}` / `DELETE /sources/{id}`（数据源 CRUD）— 已实现
-- ✅ `POST /ingest/jobs` / `GET /ingest/jobs` / `GET /ingest/jobs/{id}` / `POST /ingest/jobs/{id}/retry`（任务管理）— 已实现
-- `POST /tools/{name}`（可选：工具代理入口，Node 实现）— Milestone C
+- ModelProvider Protocol（OpenAI + Ollama 可切换）
+- 工具可靠性（timeout / retry / circuit breaker，6 个 node 全接入）
+- SSE 真实流式（QueueCallback 线程安全队列）
+- OpenAI 兼容层 `/v1/chat/completions`
+- 纯检索端点 `/search` + CORS 中间件 + Request-ID 传播
+- Docker + docker-compose + SQL 迁移 + Qdrant 初始化
+- 51 项测试全部通过
 
-### 5.2 OpenAI 兼容层（强烈建议）
+### Milestone B — 企业级数据接入 (v0.3.0)
 
-- ✅ `/v1/chat/completions`：已实现，支持非流式 + 流式，附加 `citations` 字段
-- 好处：前端/插件生态接入成本极低（尤其是 IDE 插件、社区工具）
+- Source CRUD API + Ingestion Pipeline 编排器
+- 连接器实现：Local FS / PDF / Web / Git
+- DB Schema Introspection（InMemory + PostgreSQL）
+- ACL 增强（user / group / role 三级权限）
+- 文档版本化 + chunk 去重（checksum）
+- 86 项测试全部通过
 
-### 5.3 Cursor-like 客户端协议建议
+### Milestone C — Cursor-like 编程助手 (v0.4.0)
 
-- SSE 事件：token / tool_call / tool_result / evidence / final
-- 支持 partial citations 与 evidence preview 事件，便于 IDE UI 先展示证据
+- 符号级 Repo Ingestion（Python AST + regex C-like + 行回退）
+- 编程工具集：open_file / apply_patch / explain_error
+- CLI 客户端：`rag ask` / `search` / `patch` / `ingest`
+- IDE 上下文注入：selected_text / open_files / git_diff / recent_errors
+- Evidence 去重 + 压缩（MD5 哈希 + 分数排序 + 预算控制）
+- 129 项测试全部通过
+
+### Milestone D — 商业级可运维 (v0.5.0)
+
+- 全链路追踪：RequestTracer + context-manager Span（OpenTelemetry 兼容）
+- 质量指标：citation_coverage / retrieval_hit_rate / tool_failure_rate / user_feedback
+- 评测回归：EvalCase 数据集 + run_eval_suite() + 失败分类（5 类）
+- 模型路由：ModelRouter fast/strong 分级 + CostTracker
+- 多级缓存：LRU (TTL+LRU 双淘汰) + RetrievalCache + EmbeddingCache
+- Helm Chart（rolling update + health probes + K8s secrets）
+- 167 项测试全部通过
 
 ---
 
-## 6. 本地大模型（Local LLM）支持路线
+## 4. 代码审查与修复记录
 
-### ✅ Phase 1（已完成）：统一推理接口（Adapter）
+> 全量源码审查于 2026-02-27 完成，发现 32 项优化建议，已全部修复。
 
-- `ModelProvider` 抽象（PEP 544 Protocol）：OpenAI / Ollama 已实现，vLLM / LM Studio 可用同样接口扩展
-- 能力探测：`enabled` 属性；`web_search` 降级（Ollama 返回空列表）
-- JSON 模式降级：Ollama 不支持 json_schema 时，在 system prompt 内嵌 schema + 手动解析
-- 切换方式：`RAGBOT_LLM_PROVIDER=openai|ollama`，`OLLAMA_BASE_URL`，`OLLAMA_MODEL`
+### P0 修复（6 项 — 安全/正确性）
 
-### Phase 2：检索与 rerank 本地化
+| 问题 | 修复 |
+|------|------|
+| tenant_id/user_id 无认证 | API Key 认证中间件（`RAGBOT_API_KEYS`） |
+| sql_node 直接执行用户原文 | NL2SQL：`_resolve_sql()` + LLM 转换 + 回退 |
+| code_search 正则注入 | `re.escape()` + `re.IGNORECASE` |
+| CodeSearch 可读取敏感文件 | 白名单后缀 + 排除 .git/.env + `resolve()` 防遍历 |
+| API Key 泄露风险 | `_sanitize_error()` 异常脱敏 |
+| pg_fts 缺少 source_types 过滤 | 添加过滤 + 时间比较统一为 `_to_epoch()` |
 
-- embedding：本地 embedding 模型（可选）
-- rerank：本地 cross-encoder（可选）
-- 让云端仅用于复杂推理（成本控制）
+### P1 修复（9 项 — 功能/性能）
+
+| 问题 | 修复 |
+|------|------|
+| 同步阻塞 LLM 调用 | `async def` + `asyncio.to_thread()` |
+| SSE 假流式 | QueueCallback 真实时推送 |
+| verify next_query 未生效 | `_next_step()` 中更新 state.query |
+| FTS 全表扫描 | `InvertedIndex` 倒排索引 O(K) |
+| embed_text 伪嵌入 | `get_embed_fn()` 工厂 + 真实 API 回退 |
+| 路由不使用 LLM | `_llm_route()` + 关键词回退 |
+| web_node 空结果误报 | LLM 不可用时 `ok=False` |
+| LLM 异常静默 | `logger.warning()` 记录 |
+| types.py 与 state.py 重复 | state.py 从 contracts.types 导入 |
+
+### P2/P3 修复（17 项 — 质量/长期改进）
+
+包括：AgentServices Protocol 类型化、Citation `__hash__`/`__eq__`、payload_map O(1) 查找、pyproject.toml 包管理、InMemoryRepo threading.Lock、embed_and_upsert 批量、Worker 真实连接器实现、任务队列 Protocol、会话存储、Node SSE 支持、日志框架、infra 补齐、RAGAS 评测、versioning 健壮化等。
 
 ---
 
-## 7. 风险与关键决策（尽早拍板）
+## 5. 下一步规划（Milestone E+）
 
-1) 邮件权限模型：单账户隔离 vs 组织共享邮箱/组映射
-2) 代码工具安全：apply_patch 的执行边界（谁来落盘、怎么审计）
-3) SQL 安全：只读用户 + 白名单 schema + 强 LIMIT + 超时（必须）
-4) 引用策略：强制引用会降低看起来流畅的回答，但这是商业可信度核心
-5) 连接器增量：必须做版本化/去重，否则索引会膨胀并劣化质量
+### Milestone E：生产级检索质量 + 异步化
+
+> 目标：让检索质量达到可度量的生产水平，消除同步瓶颈。
+
+**E1 — 真实 Embedding 集成**
+- 接入 OpenAI `text-embedding-3-small/large`（已有 `get_embed_fn()` 工厂）
+- 本地 embedding：sentence-transformers / BGE / E5（通过 Ollama 或独立服务）
+- Embedding 模型升级策略：增量重建 + `embedding_model` payload 字段版本区分
+
+**E2 — Cross-Encoder Rerank**
+- 接入 Cohere rerank / BGE-reranker / ms-marco-MiniLM
+- `RetrievalService` 在 RRF 融合后增加 rerank 阶段
+- 可配置开关 `RAGBOT_RERANK_ENABLED` + `RAGBOT_RERANK_MODEL`
+
+**E3 — 异步化改造**
+- `OpenAIClient` → `httpx.AsyncClient`
+- Agent 核心路径改为 async（`run_agent` → `async run_agent`）
+- mixed 路由下 `asyncio.gather` 并发多工具（retrieve + sql + code）
+- WebSocket 端点替代 SSE（可选）
+
+**E4 — 检索质量评测基线**
+- 基于 eval/runner.py 建立回归基线：至少 200 条（doc_qa 100 + db_qa 50 + code_task 50）
+- CI 门禁：pass_rate < 阈值 → 阻断合并
+- 检索命中率（MRR@10 / Recall@10）纳入自动评测
+
+**E5 — PostgreSQL Repo 实现**
+- `PostgresRepo` 替代 `InMemoryRepo`（生产必须）
+- 连接池：`psycopg_pool.AsyncConnectionPool`
+- migration 工具（alembic 或手动 .sql 管理）
+
+### Milestone F：多数据源扩展 + 安全加固
+
+> 目标：覆盖企业常见数据源，安全性达到生产标准。
+
+**F1 — 邮件连接器**
+- Gmail（IMAP / Google API）
+- Outlook（Microsoft Graph API）
+- 权限模型：按账户隔离
+
+**F2 — Office 文档连接器**
+- DOCX（python-docx）、PPTX（python-pptx）、XLSX（openpyxl）
+- 表格数据 → 自动注册为 TableData（供 SQL 工具查询）
+
+**F3 — JWT 认证**
+- 替代当前 API Key 认证
+- 从 JWT claims 提取 tenant_id / user_id / groups / roles
+- Rate limiting（令牌桶 / 滑动窗口）
+
+**F4 — Secrets Redaction**
+- 日志/traces 中自动脱敏 API Key / DSN / PII
+- SQL 结果中的敏感列标记与遮蔽
+
+**F5 — 多数据库支持**
+- MySQL adapter（SQLAlchemy backend）
+- 通用 JDBC/SQLAlchemy 接口
+
+### Milestone G：IDE 集成 + 前端
+
+> 目标：端到端用户体验闭环。
+
+**G1 — VSCode 插件**
+- 基于 Node SDK + SSE 流式
+- 侧边栏：问答 + 引用跳转
+- 编辑器内：选中代码 → 解释/重构/生成测试
+- apply_patch：直接在编辑器中显示 diff 预览
+
+**G2 — Web 前端**
+- 轻量 Chat UI（React / Vue）
+- 对话历史 + 引用展示 + 反馈按钮
+- Admin Dashboard：指标可视化 + 数据源管理
+
+**G3 — 多轮对话**
+- 基于 `session.py` 的 InMemorySessionStore → PostgresSessionStore
+- 上下文窗口管理：历史 turn 摘要 + 最近 N 轮原文
+- 指代消解（LLM 或规则）
+
+### 架构演进方向
+
+**短期（当前 → Milestone E）：**
+- 保持 monolith 单进程架构（FastAPI + Worker 同进程）
+- InMemoryRepo → PostgresRepo 切换为强一致存储
+- 异步化消除 LLM 调用阻塞
+
+**中期（Milestone F–G）：**
+- Worker 独立进程：Celery / Dramatiq 任务队列
+- 检索服务拆分：独立 retrieval-service 微服务
+- API Gateway：统一认证 + 限流 + 路由
+
+**长期：**
+- 多区域部署（数据驻留合规）
+- Embedding 模型在线热切换 + 增量重建
+- A/B 测试框架（路由策略 / prompt 变体）
+- Plugin 系统：第三方工具注册 + 沙箱执行
+
+---
+
+## 6. 工具 Schema（跨语言契约）
+
+所有工具入参/出参定义于 `contracts/tools.schema.json`，Python/Node 共用。
+
+| 工具 | 入参 | 出参 |
+|------|------|------|
+| `retrieve` | query, top_k, filters(tenant_id, source_types, tags, time_range, security_scope) | chunks[{chunk_id, doc_id, text, score, citations, metadata}] |
+| `sql_query` | dialect, query, params, limit, timeout_ms | rows[], columns[{name,type}], stats{row_count, elapsed_ms} |
+| `code_search` | query, repo, ref, path_glob, max_hits | snippets[{path, ref, line_start, line_end, content}] |
+| `open_file` | path, repo, start_line, end_line | content(带行号) |
+| `apply_patch` | path, original, replacement | PatchResult{path, diff, original_lines, modified_lines} |
+| `explain_error` | error_text, repo | locations[{path, line, context}] |
+| `web_search` | query, recency_days, domains | snippets[] |
+
+> `security_scope` 由服务端计算注入，客户端不可伪造。
+
+---
+
+## 7. 技术决策与风险
+
+| 决策项 | 当前选择 | 风险 / 备注 |
+|--------|----------|-------------|
+| Agent 同步执行 | `asyncio.to_thread` 卸载 | Milestone E 需全面异步化 |
+| 存储 | InMemoryRepo (dev) / Postgres (prod) | PostgresRepo 尚未实现生产版 |
+| Embedding | hash-based 伪嵌入 (dev) / OpenAI API (prod) | 本地 embedding 待接入 |
+| 认证 | API Key | 生产需 JWT + RBAC |
+| 任务队列 | InProcessQueue（同步） | 生产需 Celery / Dramatiq |
+| SQL 安全 | READ ONLY 事务 + 关键词黑名单 | 可增加 sqlglot 语法级校验 |
+| 代码工具 | apply_patch 输出 diff，客户端落盘 | 需审计 + 回滚机制 |
+| 邮件权限 | 未实现 | 需确定隔离模型 |
 
 ---
 
 ## 8. Definition of Done（商业级）
 
-- ✅ 多租户隔离 + ACL 前置过滤 + 审计日志
-- ✅ 文档/邮件/DB/代码至少三类数据源闭环（ingest → search → answer → cite）
-- ✅ Cursor-like：支持 repo 代码问答 + 生成 patch（diff）
-- ✅ 多模型：云端 + 本地可切换、可回退
-- ✅ 可观测 + 可评测 + CI 回归门禁
-- ✅ 部署与升级策略明确（迁移/回滚/embedding 重建）
+- [x] 多租户隔离 + ACL 前置过滤 + 审计日志
+- [x] 文档/DB/代码三类数据源闭环（ingest → search → answer → cite）
+- [x] Cursor-like：repo 代码问答 + 生成 patch（diff）
+- [x] 多模型：云端 + 本地可切换、可回退
+- [x] 可观测 + 可评测 + CI 回归门禁
+- [x] 部署与升级策略明确（迁移/回滚/embedding 重建）
+- [ ] 邮件数据源闭环
+- [ ] JWT 认证 + Rate Limiting
+- [ ] PostgresRepo 生产级实现
+- [ ] 检索质量 MRR@10 基线达标
+- [ ] 异步化 agent 路径

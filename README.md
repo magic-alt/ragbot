@@ -1,118 +1,141 @@
-# ragbot
+# Ragbot
 
-这是基于 `PROJECT.md` 的 **最小可运行 Agentic RAG** 实现，重点覆盖：
+商业级 Agentic RAG 平台 — 支持文档/数据库/代码仓库的检索、总结、引用与多步工具调用。
 
-- Postgres/Qdrant 的接口与过滤字段设计（含真实适配器 + in-memory 回退）
-- Agent 状态机（route → retrieve/sql/code → synthesize → verify → finalize）
-- 跨语言工具契约（`contracts/tools.schema.json`）
-- 单元测试覆盖路由、检索、SQL、安全过滤、融合排序
+> **v0.5.0** | Milestone A–D 已完成 | 167 项测试全部通过
 
-> 说明：本仓库实现的是 **可运行的参考骨架**。默认使用内存适配器，可通过环境变量启用真实 Postgres/Qdrant。
+## 核心特性
 
-## 目录结构
-
-- `contracts/`：OpenAPI + 工具 Schema + TS/Python 类型
-- `services/api/app/`：核心 Agent 与检索逻辑
-- `services/worker/`：摄取/嵌入/去重（最小实现）
-- `packages/node-client/`：Node 客户端示例
-- `tests/`：单元测试
+- **Agentic RAG**：route → retrieve/sql/code/web → synthesize → verify → finalize 多步循环
+- **多数据源**：PDF / Web / Git / 本地文件，Source CRUD + Ingestion Pipeline
+- **Cursor-like 编程助手**：代码问答、open_file、apply_patch、explain_error
+- **混合检索**：Qdrant 向量 + PostgreSQL FTS → RRF 融合
+- **多模型**：OpenAI + Ollama 可切换（ModelProvider Protocol）
+- **工具可靠性**：timeout / retry / circuit breaker
+- **SSE 流式**：真实时事件推送（QueueCallback 线程安全队列）
+- **OpenAI 兼容**：`/v1/chat/completions` 端点
+- **多租户安全**：ACL 前置过滤（user/group/role）+ API Key 认证 + 审计日志
+- **可观测**：全链路追踪（OpenTelemetry 兼容）+ 质量指标 + 成本追踪
+- **可评测**：EvalCase 数据集 + 自动回归 + RAGAS 评测
+- **多级缓存**：LRU (TTL+LRU) + RetrievalCache + EmbeddingCache
+- **部署就绪**：Docker Compose + Helm Chart + SQL 迁移
 
 ## 快速开始
 
-运行单元测试：
+### 安装依赖
 
 ```bash
-python -m unittest discover -s tests -p "test_*.py"
+pip install -r requirements.txt
 ```
 
-启动 FastAPI（默认走内存适配器）：
+### 运行测试
 
 ```bash
+python -m pytest tests/test_agent.py -v
+```
+
+### 启动服务
+
+```bash
+# 内存适配器模式（开发）
 uvicorn services.api.app.api:app --reload --host 0.0.0.0 --port 8000
+
+# Docker Compose（含 Postgres + Qdrant + Ollama + Jaeger）
+docker-compose -f infra/docker/docker-compose.yml up -d
 ```
 
-启用真实 Postgres/Qdrant：
+### 环境变量
 
 ```bash
-set POSTGRES_DSN=postgresql://user:pass@localhost:5432/dbname
-set POSTGRES_ALLOWED_SCHEMAS=public
-set QDRANT_URL=http://localhost:6333
-set QDRANT_COLLECTION=rag_chunks
-set QDRANT_DIM=1536
+# LLM
+RAGBOT_LLM_PROVIDER=openai|ollama    # 默认 openai
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5:14b
+
+# 向量存储
+QDRANT_URL=http://localhost:6333
+QDRANT_COLLECTION=rag_chunks
+
+# 数据库
+POSTGRES_DSN=postgresql://user:pass@localhost:5432/ragbot
+
+# 安全
+RAGBOT_API_KEYS=key1,key2            # 空值允许所有请求
+
+# 可观测
+RAGBOT_TRACING_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 ```
 
-启用 LLM 与 Web Search（OpenAI）：
+完整环境变量列表见 [ROADMAP.md §2.6](ROADMAP.md)。
+
+## API 端点
+
+| 端点 | 方法 | 功能 |
+|---|---|---|
+| `/chat` | POST | 主 Agentic RAG（JSON + SSE 流式） |
+| `/search` | POST | 纯检索（不触发 Agent） |
+| `/v1/chat/completions` | POST | OpenAI 兼容层 |
+| `/sources` | CRUD | 数据源管理 |
+| `/ingest/jobs` | POST/GET | 摄取任务管理 |
+| `/admin/health` | GET | 健康检查 |
+| `/admin/metrics` | GET | 质量指标 |
+| `/admin/feedback` | POST | 用户反馈 |
+| `/admin/cost` | GET | LLM 成本追踪 |
+
+## CLI
 
 ```bash
-set OPENAI_API_KEY=sk-...
-set OPENAI_MODEL=gpt-4o-mini
-    set OPENAI_WEB_MODEL=gpt-5
+rag ask "Postgres 在系统中的作用"      # 问答
+rag search "向量检索"                   # 纯检索
+rag patch "修复类型错误" --repo .       # 生成 patch
+rag ingest ./docs --source-type pdf    # 数据摄取
 ```
 
-说明：
-- LLM 结构化输出使用 Chat Completions 的 `json_schema`。
-- Web Search 使用 Responses API 的 `web_search` 工具，请选择支持该工具的模型。
+## 架构
 
-运行示例聊天（Python）：
-
-```python
-from services.api.app.main import chat
-from services.api.app.agent.graph import build_default_services
-from services.api.app.storage.models import Document, Chunk
-from services.api.app.auth.acl import build_policy
-from services.worker.jobs.embed_and_upsert import embed_and_upsert
-
-services = build_default_services()
-repo = services.repo
-qdrant = services.qdrant
-
-policy = build_policy("p1", "tenant-a", {"allow_users": ["u1"]})
-repo.add_policy(policy)
-
-doc = Document(
-    doc_id="doc-1",
-    tenant_id="tenant-a",
-    source_type="pdf",
-    title="Demo",
-    uri="file://demo.pdf",
-    version="v1",
-    doc_updated_at="2025-01-01",
-    ingested_at="2025-01-02",
-    tags=["demo"],
-    acl_policy_id=policy.acl_policy_id,
-)
-repo.add_document(doc)
-
-chunk = Chunk(
-    chunk_id="chunk-1",
-    doc_id=doc.doc_id,
-    tenant_id=doc.tenant_id,
-    chunk_index=0,
-    text="这是一个示例文档片段，介绍 Postgres 和 Qdrant。",
-    metadata={
-        "source_type": "pdf",
-        "ingested_at": doc.ingested_at,
-        "doc_updated_at": doc.doc_updated_at,
-        "version": doc.version,
-        "acl_hash": policy.policy_hash,
-        "tags": doc.tags,
-    },
-)
-embed_and_upsert(repo, qdrant, [chunk])
-
-response = chat("请说明 Postgres 在系统中的作用", "tenant-a", "u1", services)
-print(response)
+```
+Client (CLI / Node SDK / IDE)
+    │  REST + SSE
+    ▼
+API Gateway (FastAPI)
+    │  Agent Pipeline: route → action loop → synthesize → verify → finalize
+    ▼
+┌──────────┬──────────┬─────────┬───────────┐
+│ Qdrant   │ Postgres │  LLM    │  Worker   │
+│ (vector) │ (FTS+DB) │ OpenAI/ │ PDF/Git/  │
+│          │          │ Ollama  │ Web/FS    │
+└──────────┴──────────┴─────────┴───────────┘
 ```
 
-## 设计说明（与 PROJECT.md 对齐）
+## 目录结构
 
-- **检索融合**：`Qdrant TopK` + `FTS TopK` → `RRF` 融合 → TopK 输出
-- **安全过滤**：检索前按 `tenant_id + acl_hash` 过滤
-- **工具约束**：SQL 仅支持简单 `SELECT`，内置限制行数
-- **引用强制**：每条证据生成 `cite` 字段，最终回答附带引用
+```
+ragbot/
+├── contracts/          # 跨语言共享契约（types.py/ts, openapi.yaml, tools.schema.json）
+├── services/
+│   ├── api/app/        # API 网关 + Agent 状态机 + 检索 + 存储 + LLM + 认证 + 可观测
+│   └── worker/         # 摄取 Pipeline（connectors + jobs + dedup）
+├── cli/                # CLI 客户端（rag ask/search/patch/ingest）
+├── eval/               # 评测框架（datasets + runner + RAGAS）
+├── packages/node-client/ # Node SDK（chat + chatStream SSE）
+├── infra/              # Docker + Helm + SQL 迁移 + Qdrant 初始化
+└── tests/              # 167 项单元/集成测试
+```
 
-## 后续扩展建议
+详细架构、数据模型、技术路线见 [ROADMAP.md](ROADMAP.md)。
 
-- 增强 `web_node` 外部检索
-- 增加 Rerank Cross-Encoder 模块
+## 里程碑
 
+| 版本 | 里程碑 | 测试数 |
+|------|--------|--------|
+| v0.2.0 | A — 可用内测版（ModelProvider + 可靠性 + SSE + OpenAI 兼容） | 51 |
+| v0.3.0 | B — 企业数据接入（Source CRUD + 连接器 + ACL 增强） | 86 |
+| v0.4.0 | C — Cursor-like 编程助手（代码工具 + CLI + IDE 上下文） | 129 |
+| v0.5.0 | D — 商业级可运维（追踪 + 评测 + 路由 + 缓存 + Helm） | 167 |
+
+## License
+
+内部项目，暂不公开。
