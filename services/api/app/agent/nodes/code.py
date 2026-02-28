@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from ..state import AgentState, Citation, EvidenceItem, ToolCallRecord, now_ms
+from ..reliability import safe_tool_call
 from contracts.types import CodeSnippet
 
 logger = logging.getLogger(__name__)
@@ -100,7 +101,7 @@ def code_node(state: AgentState, services: Any) -> AgentState:
     params = {"query": state.query, "repo": repo, "ref": state.constraints.ref or "main"}
     start_ms = now_ms()
     try:
-        snippets = services.code_search.search(state.query, repo=repo, max_hits=8)
+        snippets = safe_tool_call("code_search", services.code_search.search, state.query, repo=repo, max_hits=8)
         citations = [
             Citation(
                 kind="code",

@@ -5,7 +5,6 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from dataclasses import asdict
 from typing import AsyncIterator, Iterator, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -13,10 +12,14 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
+from .agent.callbacks import QueueCallback
 from .agent.graph import run_agent
 from .agent.state import Constraints, SourceType
 from .factory import build_services_from_env
 from .main import chat
+from .middleware import setup_middleware
+from .routes.openai_compat import create_openai_compat_endpoint
+from .routes.search import create_search_endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,13 @@ async def verify_api_key(api_key: Optional[str] = Depends(_API_KEY_HEADER)) -> O
 _services = None
 
 
+def _get_services():
+    global _services
+    if _services is None:
+        _services = build_services_from_env()
+    return _services
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     global _VALID_API_KEYS
@@ -53,7 +63,14 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         engine.close()
 
 
-app = FastAPI(title="ragbot API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="ragbot API", version="0.2.0", lifespan=lifespan)
+
+# Register middleware (CORS + request logging)
+setup_middleware(app)
+
+# Register routers
+app.include_router(create_search_endpoint(_get_services, verify_api_key))
+app.include_router(create_openai_compat_endpoint(_get_services, verify_api_key))
 
 
 class ConstraintsModel(BaseModel):
@@ -66,9 +83,7 @@ class ConstraintsModel(BaseModel):
     url_prefix: Optional[str] = None
     time_from: Optional[str] = None
     time_to: Optional[str] = None
-
-    class Config:
-        extra = "forbid"
+    model_config = {"extra": "forbid"}
 
 
 class ChatRequest(BaseModel):
@@ -91,7 +106,7 @@ async def chat_endpoint(payload: ChatRequest, _key: str = Depends(verify_api_key
     services = _get_services()
     if payload.stream:
         return StreamingResponse(
-            _chat_stream(payload),
+            _chat_stream_realtime(payload),
             media_type="text/event-stream",
         )
     constraints = _constraints_from_model(payload.constraints)
@@ -124,74 +139,59 @@ def _constraints_from_model(model: Optional[ConstraintsModel]) -> Optional[Const
     return Constraints(**model.dict())
 
 
-def _chat_stream(payload: ChatRequest) -> Iterator[str]:
+async def _chat_stream_realtime(payload: ChatRequest) -> AsyncIterator[str]:
+    """Real-time SSE streaming using QueueCallback.
+
+    The agent runs in a background thread and emits events to a thread-safe
+    queue. This async generator reads from the queue and yields SSE events.
+    """
     services = _get_services()
     constraints = _constraints_from_model(payload.constraints)
-    state = run_agent(
-        query=payload.query,
-        tenant_id=payload.tenant_id,
-        user_id=payload.user_id,
-        services=services,
-        constraints=constraints,
-        session_id=payload.session_id,
-    )
-    request_id = state.request_id
+    cb = QueueCallback()
 
-    for call in state.tool_calls:
-        yield _sse(
-            "tool_call",
-            {"request_id": request_id, "name": call.name, "args": call.args},
-        )
-        yield _sse(
-            "tool_result",
-            {
-                "request_id": request_id,
-                "name": call.name,
-                "ok": call.ok,
-                "meta": call.result_preview,
-                "error": call.error,
-            },
+    async def _run_agent():
+        await asyncio.to_thread(
+            run_agent,
+            query=payload.query,
+            tenant_id=payload.tenant_id,
+            user_id=payload.user_id,
+            services=services,
+            constraints=constraints,
+            session_id=payload.session_id,
+            callback=cb,
         )
 
-    final_answer = state.final.answer if state.final else ""
-    streamed_answer = final_answer
+    task = asyncio.create_task(_run_agent())
+    request_id = None
 
-    if state.final and state.final.confidence != "low":
-        llm = getattr(services, "llm", None)
-        if llm and getattr(llm, "enabled", False) and state.draft and state.draft.answer_outline:
-            streamed_answer = ""
-            system, user = _build_stream_prompt(payload.query, state.draft.answer_outline)
+    try:
+        while True:
             try:
-                for delta in llm.stream_text(system=system, user=user, temperature=0.2):
-                    streamed_answer += delta
-                    yield _sse("token", {"request_id": request_id, "delta": delta})
+                event = await asyncio.to_thread(cb.get, 0.5)
             except Exception:
-                streamed_answer = final_answer
-                for delta in _iter_tokens(final_answer):
-                    yield _sse("token", {"request_id": request_id, "delta": delta})
-        else:
-            for delta in _iter_tokens(final_answer):
-                yield _sse("token", {"request_id": request_id, "delta": delta})
-    else:
-        for delta in _iter_tokens(final_answer):
-            yield _sse("token", {"request_id": request_id, "delta": delta})
+                if task.done():
+                    break
+                continue
 
-    if state.final:
-        if state.final.citations:
-            yield _sse(
-                "citation",
-                {"request_id": request_id, "citations": [asdict(cite) for cite in state.final.citations]},
-            )
-        yield _sse(
-            "final",
-            {
-                "request_id": request_id,
-                "answer": streamed_answer,
-                "citations": [asdict(cite) for cite in state.final.citations],
-                "confidence": state.final.confidence,
-                "followups": state.final.followups,
-            },
-        )
+            if event is None:
+                break
+
+            data = dict(event.data)
+            if "request_id" in data:
+                request_id = data["request_id"]
+
+            if event.event_type == "tool_call":
+                yield _sse("tool_call", data)
+            elif event.event_type == "tool_result":
+                yield _sse("tool_result", data)
+            elif event.event_type == "final":
+                answer = data.get("answer", "")
+                # Stream the final answer as token chunks
+                for delta in _iter_tokens(answer):
+                    yield _sse("token", {"request_id": request_id, "delta": delta})
+                yield _sse("final", data)
+    finally:
+        await task
 
 
 def _iter_tokens(text: str, size: int = 8) -> Iterator[str]:
@@ -201,23 +201,6 @@ def _iter_tokens(text: str, size: int = 8) -> Iterator[str]:
         yield text[i : i + size]
 
 
-def _build_stream_prompt(question: str, claim_lines: List[str]) -> tuple[str, str]:
-    system = (
-        "You are a helpful assistant. Rewrite the provided claims into a concise answer. "
-        "Do not add new facts. Preserve citations exactly as given."
-    )
-    claims = "\n".join(f"- {line}" for line in claim_lines)
-    user = f"Question:\n{question}\n\nClaims:\n{claims}\n\nAnswer:"
-    return system, user
-
-
 def _sse(event: str, data: dict) -> str:
     payload = json.dumps(data, ensure_ascii=False)
     return f"event: {event}\ndata: {payload}\n\n"
-
-
-def _get_services():
-    global _services
-    if _services is None:
-        _services = build_services_from_env()
-    return _services

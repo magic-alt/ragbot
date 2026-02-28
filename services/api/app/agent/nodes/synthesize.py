@@ -5,6 +5,7 @@ import re
 from typing import Any, Iterable, List, Sequence, Tuple
 
 from ..state import AgentState, Draft, EvidenceItem, Citation
+from ..reliability import safe_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +18,9 @@ def synthesize_node(state: AgentState, services: Any) -> AgentState:
     llm = getattr(services, "llm", None)
     if llm and getattr(llm, "enabled", False):
         try:
-            claims, used_citations, insufficient, missing = _llm_build_claims(state, llm)
+            claims, used_citations, insufficient, missing = safe_tool_call(
+                "synthesize", _llm_build_claims, state, llm
+            )
             claim_lines = _render_claim_lines(claims)
             answer_text = " ".join(claim_lines).strip()
             if insufficient and not claim_lines:

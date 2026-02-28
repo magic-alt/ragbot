@@ -6,6 +6,7 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from ..state import AgentState, Citation, EvidenceItem, ToolCallRecord, now_ms
+from ..reliability import safe_tool_call
 from contracts.types import SqlResult
 from ...storage.repo import InMemoryRepo
 
@@ -94,7 +95,7 @@ def sql_node(state: AgentState, services: Any) -> AgentState:
     params = {"dialect": "postgres", "query": sql_query, "timeout_ms": 3000, "limit": 200}
     start_ms = now_ms()
     try:
-        result = services.sql_engine.query(sql_query)
+        result = safe_tool_call("sql_query", services.sql_engine.query, sql_query)
         citations = _rows_to_citations(result.rows)
         text = _format_sql_result(result.rows, max_rows=5)
         state.evidence.append(

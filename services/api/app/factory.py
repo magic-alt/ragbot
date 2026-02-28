@@ -6,7 +6,7 @@ from typing import Optional
 from .agent.graph import AgentServices
 from .agent.nodes.code import CodeSearch
 from .agent.nodes.sql import PostgresSqlEngine, SqlEngine
-from .llm.client import OpenAIClient
+from .llm.provider import build_model_provider
 from .retrieval.qdrant import InMemoryQdrant, QdrantClientAdapter
 from .retrieval.service import Retriever
 from .storage.repo import InMemoryRepo
@@ -49,7 +49,7 @@ def build_services_from_env(repo: Optional[InMemoryRepo] = None) -> AgentService
 
     repo_root = os.getenv("CODE_REPO_ROOT", ".")
     code_search = CodeSearch(repo_roots={"default": repo_root})
-    llm = OpenAIClient()
+    llm = build_model_provider()
 
     return AgentServices(
         repo=repo,

@@ -5,10 +5,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, runtime_checkable
 
 from typing import Protocol
 
-from ..llm.client import OpenAIClient
+from ..llm.provider import ModelProvider, build_model_provider
 from ..retrieval.qdrant import InMemoryQdrant
 from ..retrieval.service import Retriever
 from ..storage.repo import InMemoryRepo
+from .callbacks import AgentEvent, EventCallback, NullCallback
 from .nodes.code import CodeSearch, code_node
 from .nodes.finalize import finalize_node
 from .nodes.retrieve import retrieve_node
@@ -52,7 +53,7 @@ class AgentServices:
     retriever: Retriever
     sql_engine: SqlEngineInterface
     code_search: CodeSearch
-    llm: OpenAIClient
+    llm: ModelProvider
 
 
 def build_default_services(repo: Optional[InMemoryRepo] = None) -> AgentServices:
@@ -61,7 +62,7 @@ def build_default_services(repo: Optional[InMemoryRepo] = None) -> AgentServices
     retriever = Retriever(repo, qdrant)
     sql_engine = SqlEngine(repo)
     code_search = CodeSearch(repo_roots={"default": "."})
-    llm = OpenAIClient()
+    llm = build_model_provider()
     return AgentServices(
         repo=repo,
         qdrant=qdrant,
@@ -80,7 +81,9 @@ def run_agent(
     constraints: Optional[Constraints] = None,
     session_id: Optional[str] = None,
     request_id: Optional[str] = None,
+    callback: Optional[EventCallback] = None,
 ) -> AgentState:
+    cb = callback or NullCallback()
     state = build_initial_state(
         query=query,
         tenant_id=tenant_id,
@@ -90,10 +93,13 @@ def run_agent(
         request_id=request_id,
     )
     state = route_node(state, services)
+    cb.emit(AgentEvent("route", {"route": state.route, "request_id": state.request_id}))
 
     action = _initial_action(state)
     while True:
         state.iteration += 1
+        prev_calls = len(state.tool_calls)
+
         if action == "sql_query":
             state = sql_node(state, services)
         elif action == "code_search":
@@ -103,6 +109,15 @@ def run_agent(
         elif action == "web_search":
             state = web_node(state, services)
 
+        # Emit events for any new tool calls
+        for call in state.tool_calls[prev_calls:]:
+            cb.emit(AgentEvent("tool_call", {"name": call.name, "args": call.args, "request_id": state.request_id}))
+            cb.emit(AgentEvent("tool_result", {
+                "name": call.name, "ok": call.ok,
+                "meta": call.result_preview, "error": call.error,
+                "request_id": state.request_id,
+            }))
+
         state = synthesize_node(state, services)
         state = verify_node(state, services)
         if not _should_continue(state):
@@ -110,6 +125,13 @@ def run_agent(
         action = _next_step(state)
 
     state = finalize_node(state, services)
+    if state.final:
+        cb.emit(AgentEvent("final", {
+            "request_id": state.request_id,
+            "answer": state.final.answer,
+            "confidence": state.final.confidence,
+        }))
+    cb.close()
     return state
 
 

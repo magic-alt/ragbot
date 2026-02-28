@@ -4,6 +4,7 @@ import logging
 from typing import List
 
 from ..state import AgentState, Verification, ROUTE_CODE, ROUTE_DOC_RAG, ROUTE_MIXED, ROUTE_SQL
+from ..reliability import safe_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +13,7 @@ def verify_node(state: AgentState, services: object) -> AgentState:
     llm = getattr(services, "llm", None)
     if llm and getattr(llm, "enabled", False):
         try:
-            state.verification = _llm_verify(state, llm)
+            state.verification = safe_tool_call("verify", _llm_verify, state, llm)
             return state
         except Exception as exc:
             logger.warning("LLM verification failed: %s: %s", type(exc).__name__, exc)

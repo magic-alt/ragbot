@@ -5,6 +5,7 @@ from typing import Any, List, Optional
 from urllib.parse import urlparse
 
 from ..state import AgentState, Citation, EvidenceItem, ToolCallRecord, now_ms
+from ..reliability import safe_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +18,7 @@ def web_node(state: AgentState, services: Any) -> AgentState:
         allowed_domains = _domains_from_prefix(state.constraints.url_prefix)
         snippets = []
         if llm and getattr(llm, "enabled", False):
-            snippets = llm.web_search(state.query, allowed_domains=allowed_domains, recency_days=30)
+            snippets = safe_tool_call("web_search", llm.web_search, state.query, allowed_domains=allowed_domains, recency_days=30)
             executed = True
         else:
             executed = False

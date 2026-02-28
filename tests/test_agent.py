@@ -1,3 +1,5 @@
+import time
+import threading
 import unittest
 
 from services.api.app.agent.graph import build_default_services, run_agent
@@ -9,7 +11,15 @@ from services.api.app.agent.nodes.verify import verify_node
 from services.api.app.agent.nodes.web import web_node
 from services.api.app.agent.session import InMemorySessionStore, SessionTurn
 from services.api.app.agent.state import build_initial_state
+from services.api.app.agent.callbacks import AgentEvent, QueueCallback, NullCallback
+from services.api.app.agent.reliability import (
+    CircuitBreaker, CircuitOpenError, ToolTimeoutError,
+    with_timeout, with_retry, safe_tool_call, RetryConfig,
+)
 from services.api.app.auth.acl import build_policy
+from services.api.app.llm.client import OpenAIClient
+from services.api.app.llm.ollama import OllamaAdapter
+from services.api.app.llm.provider import ModelProvider
 from services.api.app.retrieval.rerank import rrf_fuse
 from services.api.app.storage.models import Chunk, Document, TableData
 from services.worker.dedup.hashing import content_hash
@@ -302,6 +312,279 @@ class EmbedAndUpsertBatchTests(unittest.TestCase):
         embed_and_upsert(services.repo, services.qdrant, chunks, batch_size=2)
         for i in range(5):
             self.assertIsNotNone(services.repo.get_chunk(f"batch-{i}"))
+
+
+# ── WU1: ModelProvider Protocol Tests ──────────────────────────────────
+
+
+class ModelProviderProtocolTests(unittest.TestCase):
+    def test_openai_client_satisfies_protocol(self):
+        client = OpenAIClient()
+        self.assertIsInstance(client, ModelProvider)
+
+    def test_ollama_adapter_satisfies_protocol(self):
+        adapter = OllamaAdapter()
+        self.assertIsInstance(adapter, ModelProvider)
+
+    def test_openai_client_enabled_without_key(self):
+        client = OpenAIClient(api_key=None)
+        # Without an API key env var, enabled should be False
+        import os
+        if not os.getenv("OPENAI_API_KEY"):
+            self.assertFalse(client.enabled)
+
+    def test_ollama_adapter_always_enabled(self):
+        adapter = OllamaAdapter()
+        self.assertTrue(adapter.enabled)
+
+
+# ── WU2: Reliability Tests ─────────────────────────────────────────────
+
+
+class TimeoutTests(unittest.TestCase):
+    def test_timeout_triggers(self):
+        def slow_fn():
+            time.sleep(5)
+            return "done"
+
+        with self.assertRaises(ToolTimeoutError):
+            with_timeout(slow_fn, 0.1)
+
+    def test_timeout_passes(self):
+        def fast_fn():
+            return 42
+
+        result = with_timeout(fast_fn, 5.0)
+        self.assertEqual(result, 42)
+
+
+class RetryTests(unittest.TestCase):
+    def test_retry_recovers(self):
+        attempts = []
+
+        def flaky_fn():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise ConnectionError("transient")
+            return "ok"
+
+        config = RetryConfig(max_retries=3, base_delay=0.01)
+        result = with_retry(flaky_fn, config)
+        self.assertEqual(result, "ok")
+        self.assertEqual(len(attempts), 3)
+
+    def test_retry_exhausted(self):
+        def always_fail():
+            raise ConnectionError("permanent")
+
+        config = RetryConfig(max_retries=2, base_delay=0.01)
+        with self.assertRaises(ConnectionError):
+            with_retry(always_fail, config)
+
+    def test_non_retryable_exception_raises_immediately(self):
+        attempts = []
+
+        def value_error_fn():
+            attempts.append(1)
+            raise ValueError("not retryable")
+
+        config = RetryConfig(max_retries=3, base_delay=0.01)
+        with self.assertRaises(ValueError):
+            with_retry(value_error_fn, config)
+        self.assertEqual(len(attempts), 1)
+
+
+class CircuitBreakerTests(unittest.TestCase):
+    def test_circuit_opens_after_threshold(self):
+        cb = CircuitBreaker(failure_threshold=2, cooldown_seconds=0.1)
+        self.assertFalse(cb.is_open)
+        cb.record_failure()
+        self.assertFalse(cb.is_open)
+        cb.record_failure()
+        self.assertTrue(cb.is_open)
+
+    def test_circuit_resets_after_cooldown(self):
+        cb = CircuitBreaker(failure_threshold=1, cooldown_seconds=0.05)
+        cb.record_failure()
+        self.assertTrue(cb.is_open)
+        time.sleep(0.1)
+        self.assertFalse(cb.is_open)
+
+    def test_circuit_success_resets(self):
+        cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=30)
+        cb.record_failure()
+        cb.record_failure()
+        cb.record_success()
+        cb.record_failure()
+        cb.record_failure()
+        # Should not open because success reset the counter
+        self.assertFalse(cb.is_open)
+
+    def test_safe_tool_call_circuit_open_raises(self):
+        # Force the circuit open for a tool
+        from services.api.app.agent.reliability import _get_breaker
+        breaker = _get_breaker("test_tool_circuit")
+        for _ in range(5):
+            breaker.record_failure()
+        self.assertTrue(breaker.is_open)
+        with self.assertRaises(CircuitOpenError):
+            safe_tool_call("test_tool_circuit", lambda: "nope")
+
+
+# ── WU3: Callback Tests ───────────────────────────────────────────────
+
+
+class QueueCallbackTests(unittest.TestCase):
+    def test_emit_and_get(self):
+        cb = QueueCallback()
+        event = AgentEvent("test", {"key": "value"})
+        cb.emit(event)
+        received = cb.get(timeout=1.0)
+        self.assertIsNotNone(received)
+        self.assertEqual(received.event_type, "test")
+        self.assertEqual(received.data["key"], "value")
+
+    def test_close_signals_none(self):
+        cb = QueueCallback()
+        cb.close()
+        result = cb.get(timeout=0.1)
+        self.assertIsNone(result)
+
+    def test_null_callback_noop(self):
+        cb = NullCallback()
+        cb.emit(AgentEvent("test", {}))
+        cb.close()
+        # Should not raise
+
+    def test_run_agent_with_callback(self):
+        services = build_default_services()
+        cb = QueueCallback()
+        state = run_agent("hello world", "t1", "u1", services, callback=cb)
+        self.assertIsNotNone(state.final)
+        # Callback should have been signaled to close
+        self.assertTrue(cb._closed.is_set())
+        # Drain the remaining events
+        while True:
+            result = cb.get(timeout=0.1)
+            if result is None:
+                break
+        self.assertTrue(cb.closed)
+
+    def test_callback_receives_events(self):
+        services = build_default_services()
+        table = TableData(
+            name="items",
+            columns=[{"name": "name", "type": "text"}],
+            rows=[{"name": "item1"}],
+        )
+        services.repo.register_table(table)
+
+        events = []
+        cb = QueueCallback()
+
+        def run_in_thread():
+            run_agent("select name from items", "t1", "u1", services, callback=cb)
+
+        t = threading.Thread(target=run_in_thread)
+        t.start()
+
+        while True:
+            try:
+                event = cb.get(timeout=2.0)
+            except Exception:
+                break
+            if event is None:
+                break
+            events.append(event)
+
+        t.join(timeout=5)
+        event_types = [e.event_type for e in events]
+        self.assertIn("route", event_types)
+        self.assertIn("final", event_types)
+
+
+# ── WU5/WU6: FastAPI Endpoint + Middleware Tests ───────────────────────
+
+
+class FastAPIEndpointTests(unittest.TestCase):
+    """Test the FastAPI app endpoints using TestClient."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            raise unittest.SkipTest("fastapi TestClient not available")
+
+        from services.api.app.api import app, _get_services
+        from services.api.app.agent.graph import build_default_services
+        from services.api.app.storage.models import TableData
+
+        # Pre-build services with test data
+        import services.api.app.api as api_mod
+        api_mod._services = build_default_services()
+
+        table = TableData(
+            name="users",
+            columns=[{"name": "name", "type": "text"}, {"name": "role", "type": "text"}],
+            rows=[{"name": "alice", "role": "admin"}, {"name": "bob", "role": "user"}],
+        )
+        api_mod._services.repo.register_table(table)
+
+        cls.client = TestClient(app)
+
+    def test_health_endpoint(self):
+        response = self.client.get("/admin/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ok")
+
+    def test_chat_endpoint(self):
+        response = self.client.post("/chat", json={
+            "query": "hello",
+            "tenant_id": "t1",
+            "user_id": "u1",
+        })
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("answer", data)
+        self.assertIn("request_id", data)
+
+    def test_search_endpoint(self):
+        response = self.client.post("/search", json={
+            "query": "test search",
+            "tenant_id": "t1",
+            "user_id": "u1",
+            "top_k": 5,
+        })
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("request_id", data)
+        self.assertIn("chunks", data)
+        self.assertIn("total", data)
+
+    def test_openai_compat_endpoint(self):
+        response = self.client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hello"}],
+        }, headers={"X-Tenant-ID": "t1", "X-User-ID": "u1"})
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("id", data)
+        self.assertEqual(data["object"], "chat.completion")
+        self.assertEqual(len(data["choices"]), 1)
+        self.assertEqual(data["choices"][0]["message"]["role"], "assistant")
+        self.assertIn("usage", data)
+
+    def test_request_id_header(self):
+        response = self.client.get("/admin/health", headers={"X-Request-ID": "test-123"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("X-Request-ID"), "test-123")
+
+    def test_request_id_generated(self):
+        response = self.client.get("/admin/health")
+        self.assertEqual(response.status_code, 200)
+        request_id = response.headers.get("X-Request-ID")
+        self.assertIsNotNone(request_id)
+        self.assertTrue(len(request_id) > 0)
 
 
 if __name__ == "__main__":
