@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ragbot"
-version = "0.1.0"
+version = "0.5.0"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.100",
@@ -17,10 +17,16 @@ dependencies = [
 postgres = ["psycopg[binary]>=3.1", "psycopg_pool>=3.1"]
 qdrant = ["qdrant-client>=1.7"]
 worker = ["PyPDF2>=3.0", "beautifulsoup4>=4.12", "gitpython>=3.1"]
+observability = [
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.20",
+    "python-json-logger>=2.0",
+]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
 
 [tool.setuptools.packages.find]
-include = ["contracts*", "services*", "cli*"]
+include = ["contracts*", "services*", "cli*", "eval*"]
 
 [project.scripts]
 rag = "cli.rag:main"

@@ -6,6 +6,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, runtime_checkable
 from typing import Protocol
 
 from ..llm.provider import ModelProvider, build_model_provider
+from ..observability.tracing import RequestTracer
+from ..observability.metrics import build_request_metrics, get_metrics_collector
 from ..retrieval.qdrant import InMemoryQdrant
 from ..retrieval.service import Retriever
 from ..storage.repo import InMemoryRepo
@@ -93,10 +95,15 @@ def run_agent(
         constraints=constraints,
         request_id=request_id,
     )
+    tracer = RequestTracer(request_id=state.request_id)
+
     # Inject initial evidence from client_context
     if initial_evidence:
         state.evidence.extend(initial_evidence)
-    state = route_node(state, services)
+
+    with tracer.span("route") as s:
+        state = route_node(state, services)
+        s.attributes["route"] = state.route or ""
     cb.emit(AgentEvent("route", {"route": state.route, "request_id": state.request_id}))
 
     action = _initial_action(state)
@@ -104,20 +111,28 @@ def run_agent(
         state.iteration += 1
         prev_calls = len(state.tool_calls)
 
-        if action == "sql_query":
-            state = sql_node(state, services)
-        elif action == "code_search":
-            state = code_node(state, services)
-        elif action == "open_file":
-            state = open_file_node(state, services)
-        elif action == "apply_patch":
-            state = apply_patch_node(state, services)
-        elif action == "explain_error":
-            state = explain_error_node(state, services)
-        elif action == "retrieve":
-            state = retrieve_node(state, services)
-        elif action == "web_search":
-            state = web_node(state, services)
+        with tracer.span(action, iteration=state.iteration) as s:
+            if action == "sql_query":
+                state = sql_node(state, services)
+            elif action == "code_search":
+                state = code_node(state, services)
+            elif action == "open_file":
+                state = open_file_node(state, services)
+            elif action == "apply_patch":
+                state = apply_patch_node(state, services)
+            elif action == "explain_error":
+                state = explain_error_node(state, services)
+            elif action == "retrieve":
+                state = retrieve_node(state, services)
+            elif action == "web_search":
+                state = web_node(state, services)
+
+            new_calls = state.tool_calls[prev_calls:]
+            s.attributes["tool_calls"] = len(new_calls)
+            s.attributes["evidence_total"] = len(state.evidence)
+            for nc in new_calls:
+                if not nc.ok:
+                    s.attributes["has_failure"] = True
 
         # Emit events for any new tool calls
         for call in state.tool_calls[prev_calls:]:
@@ -128,13 +143,17 @@ def run_agent(
                 "request_id": state.request_id,
             }))
 
-        state = synthesize_node(state, services)
-        state = verify_node(state, services)
+        with tracer.span("synthesize", iteration=state.iteration):
+            state = synthesize_node(state, services)
+        with tracer.span("verify", iteration=state.iteration):
+            state = verify_node(state, services)
         if not _should_continue(state):
             break
         action = _next_step(state)
 
-    state = finalize_node(state, services)
+    with tracer.span("finalize"):
+        state = finalize_node(state, services)
+
     if state.final:
         cb.emit(AgentEvent("final", {
             "request_id": state.request_id,
@@ -142,6 +161,12 @@ def run_agent(
             "confidence": state.final.confidence,
         }))
     cb.close()
+
+    # Collect metrics
+    trace_record = tracer.finish()
+    metrics = build_request_metrics(state, trace_record)
+    get_metrics_collector().record(metrics)
+
     return state
 
 

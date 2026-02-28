@@ -1,0 +1,80 @@
+# Default values for ragbot Helm chart
+
+replicaCount: 2
+
+image:
+  repository: ragbot
+  tag: "0.5.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8000
+
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+  hosts:
+    - host: ragbot.local
+      paths:
+        - path: /
+          pathType: Prefix
+
+resources:
+  limits:
+    cpu: "2"
+    memory: 2Gi
+  requests:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+env:
+  LOG_LEVEL: INFO
+  LOG_FORMAT: json
+  RAGBOT_LLM_PROVIDER: openai
+  RAGBOT_TRACING_ENABLED: "true"
+  RAGBOT_CACHE_ENABLED: "true"
+  RAGBOT_CACHE_TTL_SECONDS: "300"
+  RAGBOT_MODEL_ROUTING: "false"
+  OTEL_SERVICE_NAME: ragbot-api
+
+# External services
+postgres:
+  dsn: ""  # Set via secret
+qdrant:
+  url: ""
+  collection: rag_chunks
+  dim: "1536"
+otel:
+  endpoint: ""
+
+# Secrets (reference existing k8s secrets)
+existingSecret: ""
+
+# Health check
+livenessProbe:
+  httpGet:
+    path: /admin/health
+    port: 8000
+  initialDelaySeconds: 10
+  periodSeconds: 30
+readinessProbe:
+  httpGet:
+    path: /admin/health
+    port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+# Rolling update strategy
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1

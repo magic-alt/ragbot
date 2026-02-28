@@ -19,6 +19,8 @@ from .agent.state import Constraints, SourceType
 from .factory import build_services_from_env
 from .main import chat
 from .middleware import setup_middleware
+from .observability.metrics import get_metrics_collector
+from .observability.tracing import setup_tracing
 from .routes.openai_compat import create_openai_compat_endpoint
 from .routes.ingest import create_ingest_router
 from .routes.search import create_search_endpoint
@@ -59,6 +61,7 @@ def _get_services():
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     global _VALID_API_KEYS
     _VALID_API_KEYS = _load_api_keys()
+    setup_tracing()
     yield
     services = _get_services()
     engine = services.sql_engine
@@ -66,7 +69,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         engine.close()
 
 
-app = FastAPI(title="ragbot API", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="ragbot API", version="0.5.0", lifespan=lifespan)
 
 # Register middleware (CORS + request logging)
 setup_middleware(app)
@@ -130,6 +133,66 @@ async def chat_endpoint(payload: ChatRequest, _key: str = Depends(verify_api_key
 @app.get("/admin/health")
 async def health_endpoint() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/admin/metrics")
+async def metrics_endpoint(_key: str = Depends(verify_api_key)) -> dict:
+    collector = get_metrics_collector()
+    agg = collector.aggregate()
+    return {
+        "total_requests": agg.total_requests,
+        "citation_coverage": round(agg.citation_coverage, 4),
+        "retrieval_hit_rate": round(agg.retrieval_hit_rate, 4),
+        "tool_failure_rate": round(agg.tool_failure_rate, 4),
+        "avg_duration_ms": round(agg.avg_duration_ms, 1),
+        "p95_duration_ms": round(agg.p95_duration_ms, 1),
+        "avg_iterations": round(agg.avg_iterations, 2),
+        "confidence_distribution": agg.confidence_distribution,
+        "tool_stats": agg.tool_stats,
+        "feedback_score": round(agg.feedback_score, 4),
+        "positive_feedback": agg.positive_feedback,
+        "negative_feedback": agg.negative_feedback,
+    }
+
+
+@app.get("/admin/metrics/history")
+async def metrics_history_endpoint(
+    last_n: int = 100,
+    _key: str = Depends(verify_api_key),
+) -> dict:
+    collector = get_metrics_collector()
+    return {"requests": collector.get_history(last_n)}
+
+
+class FeedbackRequest(BaseModel):
+    request_id: str
+    feedback: str = Field(pattern="^(positive|negative)$")
+
+
+@app.post("/admin/feedback")
+async def feedback_endpoint(payload: FeedbackRequest, _key: str = Depends(verify_api_key)):
+    collector = get_metrics_collector()
+    found = collector.record_feedback(payload.request_id, payload.feedback)
+    if not found:
+        raise HTTPException(status_code=404, detail="Request not found")
+    return {"status": "ok"}
+
+
+@app.get("/admin/cost")
+async def cost_endpoint(_key: str = Depends(verify_api_key)) -> dict:
+    from .llm.router import CostTracker
+    # Return empty summary if no router is configured
+    return CostTracker().summary()
+
+
+@app.get("/admin/cache")
+async def cache_endpoint(_key: str = Depends(verify_api_key)) -> dict:
+    from .cache.cache import get_retrieval_cache, get_embedding_cache, is_cache_enabled
+    return {
+        "enabled": is_cache_enabled(),
+        "retrieval": get_retrieval_cache().stats(),
+        "embedding": get_embedding_cache().stats(),
+    }
 
 
 def _constraints_from_model(model: Optional[ConstraintsModel]) -> Optional[Constraints]:

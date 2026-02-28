@@ -1441,3 +1441,448 @@ class MilestoneCIntegrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertIn("answer", data)
+
+
+# ── Milestone D: Observability Tests ──────────────────────────────────
+
+
+class RequestTracerTests(unittest.TestCase):
+    def test_span_timing(self):
+        from services.api.app.observability.tracing import RequestTracer
+        tracer = RequestTracer(request_id="test-001")
+        with tracer.span("test_span") as s:
+            time.sleep(0.01)
+            s.attributes["key"] = "value"
+        record = tracer.finish()
+        self.assertEqual(record.request_id, "test-001")
+        self.assertEqual(len(record.spans), 1)
+        self.assertEqual(record.spans[0].name, "test_span")
+        self.assertTrue(record.spans[0].duration_ms >= 1)
+        self.assertEqual(record.spans[0].attributes["key"], "value")
+
+    def test_span_error(self):
+        from services.api.app.observability.tracing import RequestTracer
+        tracer = RequestTracer(request_id="test-002")
+        try:
+            with tracer.span("bad_span") as s:
+                raise ValueError("test error")
+        except ValueError:
+            pass
+        record = tracer.finish()
+        self.assertEqual(record.spans[0].status, "error")
+        self.assertIn("test error", record.spans[0].attributes.get("error", ""))
+
+    def test_multiple_spans(self):
+        from services.api.app.observability.tracing import RequestTracer
+        tracer = RequestTracer(request_id="test-003")
+        with tracer.span("route"):
+            pass
+        with tracer.span("retrieve"):
+            pass
+        with tracer.span("synthesize"):
+            pass
+        record = tracer.finish()
+        self.assertEqual(len(record.spans), 3)
+        names = [s.name for s in record.spans]
+        self.assertEqual(names, ["route", "retrieve", "synthesize"])
+
+    def test_trace_record_to_dict(self):
+        from services.api.app.observability.tracing import RequestTracer
+        tracer = RequestTracer(request_id="test-004")
+        with tracer.span("op"):
+            pass
+        record = tracer.finish()
+        d = record.to_dict()
+        self.assertIn("trace_id", d)
+        self.assertIn("spans", d)
+        self.assertEqual(len(d["spans"]), 1)
+
+
+class MetricsCollectorTests(unittest.TestCase):
+    def test_record_and_aggregate(self):
+        from services.api.app.observability.metrics import MetricsCollector, RequestMetrics
+        collector = MetricsCollector()
+        collector.record(RequestMetrics(
+            request_id="r1", tenant_id="t1", user_id="u1",
+            confidence="high", has_citations=True, citation_count=2,
+            evidence_count=3, total_duration_ms=100, iterations=1,
+            tool_calls=[{"name": "retrieve", "ok": True, "duration_ms": 50}],
+            tool_success_count=1, tool_failure_count=0,
+        ))
+        collector.record(RequestMetrics(
+            request_id="r2", tenant_id="t1", user_id="u1",
+            confidence="low", has_citations=False, citation_count=0,
+            evidence_count=0, total_duration_ms=200, iterations=2,
+            tool_calls=[{"name": "retrieve", "ok": False, "duration_ms": 100}],
+            tool_success_count=0, tool_failure_count=1,
+        ))
+        agg = collector.aggregate()
+        self.assertEqual(agg.total_requests, 2)
+        self.assertAlmostEqual(agg.citation_coverage, 0.5, places=2)
+        self.assertEqual(agg.confidence_distribution["high"], 1)
+        self.assertEqual(agg.confidence_distribution["low"], 1)
+        self.assertAlmostEqual(agg.tool_failure_rate, 0.5, places=2)
+        self.assertAlmostEqual(agg.avg_duration_ms, 150.0, places=1)
+
+    def test_record_feedback(self):
+        from services.api.app.observability.metrics import MetricsCollector, RequestMetrics
+        collector = MetricsCollector()
+        collector.record(RequestMetrics(request_id="r1", tenant_id="t1", user_id="u1"))
+        found = collector.record_feedback("r1", "positive")
+        self.assertTrue(found)
+        not_found = collector.record_feedback("nonexistent", "negative")
+        self.assertFalse(not_found)
+        agg = collector.aggregate()
+        self.assertEqual(agg.positive_feedback, 1)
+
+    def test_aggregate_empty(self):
+        from services.api.app.observability.metrics import MetricsCollector
+        collector = MetricsCollector()
+        agg = collector.aggregate()
+        self.assertEqual(agg.total_requests, 0)
+
+    def test_metrics_history(self):
+        from services.api.app.observability.metrics import MetricsCollector, RequestMetrics
+        collector = MetricsCollector()
+        for i in range(5):
+            collector.record(RequestMetrics(request_id=f"r{i}", tenant_id="t1", user_id="u1"))
+        history = collector.get_history(last_n=3)
+        self.assertEqual(len(history), 3)
+        self.assertEqual(history[-1]["request_id"], "r4")
+
+    def test_build_request_metrics(self):
+        from services.api.app.observability.metrics import build_request_metrics
+        services = build_default_services()
+        state = run_agent("hello world", "t1", "u1", services)
+        metrics = build_request_metrics(state)
+        self.assertEqual(metrics.request_id, state.request_id)
+        self.assertEqual(metrics.tenant_id, "t1")
+        self.assertTrue(metrics.iterations >= 1)
+
+
+class TracingIntegrationTests(unittest.TestCase):
+    def test_run_agent_collects_metrics(self):
+        """Verify that run_agent auto-collects metrics."""
+        from services.api.app.observability.metrics import get_metrics_collector
+        collector = get_metrics_collector()
+        collector.reset()
+        services = build_default_services()
+        state = run_agent("hello world", "t1", "u1", services)
+        agg = collector.aggregate()
+        self.assertTrue(agg.total_requests >= 1)
+
+
+# ── Milestone D: Evaluation Tests ─────────────────────────────────────
+
+
+class EvalDatasetTests(unittest.TestCase):
+    def test_build_sample_dataset(self):
+        from eval.datasets import build_sample_dataset
+        cases = build_sample_dataset()
+        self.assertTrue(len(cases) >= 3)
+        categories = {c.category for c in cases}
+        self.assertIn("doc_qa", categories)
+        self.assertIn("db_qa", categories)
+        self.assertIn("code_task", categories)
+
+    def test_save_and_load_dataset(self):
+        from eval.datasets import build_sample_dataset, save_dataset, load_dataset
+        cases = build_sample_dataset()
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            save_dataset(cases, path)
+            loaded = load_dataset(path)
+            self.assertEqual(len(loaded), len(cases))
+            self.assertEqual(loaded[0].case_id, cases[0].case_id)
+        finally:
+            os.unlink(path)
+
+    def test_eval_case_fields(self):
+        from eval.datasets import EvalCase
+        case = EvalCase(
+            case_id="test-1",
+            query="What is X?",
+            category="doc_qa",
+            expected_answer_contains=["X"],
+            expected_route="doc_rag",
+            expected_min_citations=1,
+            tags=["smoke"],
+        )
+        self.assertEqual(case.case_id, "test-1")
+        self.assertIn("X", case.expected_answer_contains)
+
+
+class EvalRunnerTests(unittest.TestCase):
+    def test_run_eval_case_simple(self):
+        from eval.datasets import EvalCase
+        from eval.runner import run_eval_case
+        case = EvalCase(
+            case_id="test-route",
+            query="select name from users",
+            category="db_qa",
+            expected_route="sql",
+            setup_tables=[{
+                "name": "users",
+                "columns": [{"name": "name", "type": "text"}],
+                "rows": [{"name": "alice"}],
+            }],
+        )
+        result = run_eval_case(case)
+        self.assertEqual(result.case_id, "test-route")
+        self.assertEqual(result.actual_route, "sql")
+        self.assertTrue(result.checks.get("route", False))
+
+    def test_run_eval_case_code(self):
+        from eval.datasets import EvalCase
+        from eval.runner import run_eval_case
+        case = EvalCase(
+            case_id="test-code",
+            query="hello 函数报错怎么修",
+            category="code_task",
+            expected_route="code",
+            expected_min_evidence=1,
+            setup_files={"default": {"main.py": "def hello():\n    print('world')\n"}},
+        )
+        result = run_eval_case(case)
+        self.assertEqual(result.actual_route, "code")
+
+    def test_summarize_results(self):
+        from eval.datasets import EvalResult
+        from eval.runner import summarize_results
+        results = [
+            EvalResult(case_id="c1", category="doc_qa", passed=True, duration_ms=100),
+            EvalResult(case_id="c2", category="doc_qa", passed=False, duration_ms=200,
+                       failure_category="bad_retrieval"),
+            EvalResult(case_id="c3", category="db_qa", passed=True, duration_ms=150),
+        ]
+        summary = summarize_results(results)
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["passed"], 2)
+        self.assertEqual(summary["failed"], 1)
+        self.assertAlmostEqual(summary["pass_rate"], 2/3, places=3)
+        self.assertIn("bad_retrieval", summary["failure_categories"])
+
+    def test_run_eval_suite(self):
+        from eval.datasets import build_sample_dataset
+        from eval.runner import run_eval_suite, summarize_results
+        cases = build_sample_dataset()
+        results = run_eval_suite(cases)
+        self.assertEqual(len(results), len(cases))
+        summary = summarize_results(results)
+        self.assertEqual(summary["total"], len(cases))
+
+
+# ── Milestone D: Model Router Tests ──────────────────────────────────
+
+
+class ModelRouterTests(unittest.TestCase):
+    def test_router_default_tier(self):
+        from services.api.app.llm.router import ModelRouter, TASK_TIER_MAP
+        router = ModelRouter(fast_provider=None, routing_enabled=False)
+        self.assertEqual(router.get_tier("route"), "fast")
+        self.assertEqual(router.get_tier("default"), "fast")
+
+    def test_router_tier_mapping(self):
+        from services.api.app.llm.router import ModelRouter, TASK_TIER_MAP
+        router = ModelRouter(fast_provider=None, routing_enabled=True)
+        self.assertEqual(router.get_tier("route"), "fast")
+        self.assertEqual(router.get_tier("synthesize"), "strong")
+        self.assertEqual(router.get_tier("apply_patch"), "strong")
+        self.assertEqual(router.get_tier("explain_error"), "strong")
+        self.assertEqual(router.get_tier("verify"), "fast")
+
+    def test_cost_tracker(self):
+        from services.api.app.llm.router import CostTracker
+        tracker = CostTracker()
+        tracker.record("route", "fast", prompt_tokens=100, completion_tokens=50)
+        tracker.record("synthesize", "strong", prompt_tokens=500, completion_tokens=200)
+        summary = tracker.summary()
+        self.assertEqual(summary["total_calls"], 2)
+        self.assertEqual(summary["total_tokens"], 850)
+        self.assertTrue(summary["total_cost_usd"] > 0)
+        self.assertIn("fast", summary["by_tier"])
+        self.assertIn("strong", summary["by_tier"])
+        self.assertIn("route", summary["by_task"])
+
+    def test_cost_tracker_empty(self):
+        from services.api.app.llm.router import CostTracker
+        tracker = CostTracker()
+        summary = tracker.summary()
+        self.assertEqual(summary["total_tokens"], 0)
+        self.assertEqual(summary["total_cost_usd"], 0.0)
+
+    def test_router_provider_selection(self):
+        """Test that routing disabled returns fast provider."""
+        from services.api.app.llm.router import ModelRouter
+        fast = object()
+        strong = object()
+        router = ModelRouter(fast_provider=fast, strong_provider=strong, routing_enabled=False)
+        self.assertIs(router.get_provider("synthesize"), fast)
+        router2 = ModelRouter(fast_provider=fast, strong_provider=strong, routing_enabled=True)
+        # strong doesn't have .enabled, so falls back to fast
+        self.assertIs(router2.get_provider("route"), fast)
+
+
+# ── Milestone D: Cache Tests ─────────────────────────────────────────
+
+
+class LRUCacheTests(unittest.TestCase):
+    def test_put_and_get(self):
+        from services.api.app.cache.cache import LRUCache
+        cache = LRUCache(max_entries=10, ttl_seconds=60)
+        cache.put("k1", "v1")
+        self.assertEqual(cache.get("k1"), "v1")
+
+    def test_ttl_expiry(self):
+        from services.api.app.cache.cache import LRUCache
+        cache = LRUCache(max_entries=10, ttl_seconds=0.05)
+        cache.put("k1", "v1")
+        self.assertEqual(cache.get("k1"), "v1")
+        time.sleep(0.1)
+        self.assertIsNone(cache.get("k1"))
+
+    def test_lru_eviction(self):
+        from services.api.app.cache.cache import LRUCache
+        cache = LRUCache(max_entries=3, ttl_seconds=60)
+        cache.put("k1", "v1")
+        cache.put("k2", "v2")
+        cache.put("k3", "v3")
+        cache.put("k4", "v4")  # Should evict k1
+        self.assertIsNone(cache.get("k1"))
+        self.assertEqual(cache.get("k2"), "v2")
+
+    def test_cache_stats(self):
+        from services.api.app.cache.cache import LRUCache
+        cache = LRUCache(max_entries=10, ttl_seconds=60)
+        cache.put("k1", "v1")
+        cache.get("k1")  # hit
+        cache.get("k2")  # miss
+        stats = cache.stats()
+        self.assertEqual(stats["size"], 1)
+        self.assertEqual(stats["hits"], 1)
+        self.assertEqual(stats["misses"], 1)
+        self.assertAlmostEqual(stats["hit_rate"], 0.5, places=2)
+
+    def test_cache_clear(self):
+        from services.api.app.cache.cache import LRUCache
+        cache = LRUCache()
+        cache.put("k1", "v1")
+        cache.clear()
+        self.assertIsNone(cache.get("k1"))
+        stats = cache.stats()
+        self.assertEqual(stats["size"], 0)
+
+
+class RetrievalCacheTests(unittest.TestCase):
+    def test_cache_hit(self):
+        from services.api.app.cache.cache import RetrievalCache
+        cache = RetrievalCache()
+        cache.put("test query", {"tenant_id": "t1"}, 10, ["chunk1", "chunk2"])
+        result = cache.get("test query", {"tenant_id": "t1"}, 10)
+        self.assertEqual(result, ["chunk1", "chunk2"])
+
+    def test_cache_miss(self):
+        from services.api.app.cache.cache import RetrievalCache
+        cache = RetrievalCache()
+        result = cache.get("nonexistent", {}, 10)
+        self.assertIsNone(result)
+
+    def test_different_filters_different_keys(self):
+        from services.api.app.cache.cache import RetrievalCache
+        cache = RetrievalCache()
+        cache.put("q", {"tenant_id": "t1"}, 10, ["a"])
+        cache.put("q", {"tenant_id": "t2"}, 10, ["b"])
+        r1 = cache.get("q", {"tenant_id": "t1"}, 10)
+        r2 = cache.get("q", {"tenant_id": "t2"}, 10)
+        self.assertEqual(r1, ["a"])
+        self.assertEqual(r2, ["b"])
+
+
+class EmbeddingCacheTests(unittest.TestCase):
+    def test_cache_embedding(self):
+        from services.api.app.cache.cache import EmbeddingCache
+        cache = EmbeddingCache()
+        embedding = [0.1, 0.2, 0.3]
+        cache.put("test text", embedding)
+        result = cache.get("test text")
+        self.assertEqual(result, embedding)
+
+    def test_cache_miss(self):
+        from services.api.app.cache.cache import EmbeddingCache
+        cache = EmbeddingCache()
+        self.assertIsNone(cache.get("never cached"))
+
+
+# ── Milestone D: Admin Endpoint Tests ─────────────────────────────────
+
+
+class MilestoneDEndpointTests(unittest.TestCase):
+    """Test new admin endpoints from Milestone D."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            raise unittest.SkipTest("fastapi TestClient not available")
+
+        from services.api.app.api import app
+        import services.api.app.api as api_mod
+        api_mod._services = build_default_services()
+        cls.client = TestClient(app)
+
+    def test_metrics_endpoint(self):
+        # First make a chat request to populate metrics
+        self.client.post("/chat", json={
+            "query": "hello", "tenant_id": "t1", "user_id": "u1",
+        })
+        response = self.client.get("/admin/metrics")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("total_requests", data)
+        self.assertIn("citation_coverage", data)
+        self.assertIn("tool_failure_rate", data)
+        self.assertIn("avg_duration_ms", data)
+
+    def test_metrics_history_endpoint(self):
+        response = self.client.get("/admin/metrics/history?last_n=5")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("requests", data)
+        self.assertIsInstance(data["requests"], list)
+
+    def test_feedback_endpoint(self):
+        # Make a chat request first
+        chat_resp = self.client.post("/chat", json={
+            "query": "test", "tenant_id": "t1", "user_id": "u1",
+        })
+        request_id = chat_resp.json().get("request_id", "")
+
+        response = self.client.post("/admin/feedback", json={
+            "request_id": request_id,
+            "feedback": "positive",
+        })
+        self.assertEqual(response.status_code, 200)
+
+    def test_feedback_not_found(self):
+        response = self.client.post("/admin/feedback", json={
+            "request_id": "nonexistent-id",
+            "feedback": "negative",
+        })
+        self.assertEqual(response.status_code, 404)
+
+    def test_cost_endpoint(self):
+        response = self.client.get("/admin/cost")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("total_tokens", data)
+        self.assertIn("total_cost_usd", data)
+
+    def test_cache_endpoint(self):
+        response = self.client.get("/admin/cache")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("enabled", data)
+        self.assertIn("retrieval", data)
+        self.assertIn("embedding", data)
