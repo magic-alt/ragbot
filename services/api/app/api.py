@@ -13,6 +13,7 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from .agent.callbacks import QueueCallback
+from .agent.context import process_client_context, dedup_evidence, compress_evidence
 from .agent.graph import run_agent
 from .agent.state import Constraints, SourceType
 from .factory import build_services_from_env
@@ -65,7 +66,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         engine.close()
 
 
-app = FastAPI(title="ragbot API", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="ragbot API", version="0.4.0", lifespan=lifespan)
 
 # Register middleware (CORS + request logging)
 setup_middleware(app)
@@ -109,6 +110,10 @@ async def chat_endpoint(payload: ChatRequest, _key: str = Depends(verify_api_key
             media_type="text/event-stream",
         )
     constraints = _constraints_from_model(payload.constraints)
+    # Process client_context (IDE context injection)
+    constraints, initial_evidence = process_client_context(
+        payload.client_context, constraints,
+    )
     result = await asyncio.to_thread(
         chat,
         payload.query,
@@ -117,6 +122,7 @@ async def chat_endpoint(payload: ChatRequest, _key: str = Depends(verify_api_key
         services,
         constraints,
         payload.session_id,
+        initial_evidence=initial_evidence,
     )
     return result
 

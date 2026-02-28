@@ -30,10 +30,18 @@ class CodeSnippet:
     content: str
 
 
+@dataclass
+class PatchResult:
+    path: str
+    diff: str
+    original_lines: int
+    modified_lines: int
+
+
 SourceType = Literal["pdf", "web", "repo", "db_doc"]
 RouteType = Literal["doc_rag", "sql", "code", "mixed", "web_fallback"]
 Confidence = Literal["high", "medium", "low"]
-ToolName = Literal["retrieve", "sql_query", "code_search", "web_search", "web_fetch"]
+ToolName = Literal["retrieve", "sql_query", "code_search", "web_search", "web_fetch", "open_file", "apply_patch", "explain_error"]
 
 
 @dataclass(eq=False)
@@ -69,7 +77,7 @@ class Citation:
 
 @dataclass
 class EvidenceItem:
-    kind: Literal["doc_chunk", "sql_rows", "code_snippets", "web_snippets"]
+    kind: Literal["doc_chunk", "sql_rows", "code_snippets", "web_snippets", "file_content", "patch", "error_analysis"]
     score: float = 0.0
     text: str = ""
     citations: List[Citation] = field(default_factory=list)
@@ -106,7 +114,7 @@ class Verification:
     enough_evidence: bool
     missing: List[str] = field(default_factory=list)
     next_query: Optional[str] = None
-    next_action: Optional[Literal["retrieve", "sql_query", "code_search", "web_search"]] = None
+    next_action: Optional[Literal["retrieve", "sql_query", "code_search", "web_search", "open_file", "apply_patch", "explain_error"]] = None
 
 
 @dataclass

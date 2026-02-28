@@ -10,7 +10,7 @@ from ..retrieval.qdrant import InMemoryQdrant
 from ..retrieval.service import Retriever
 from ..storage.repo import InMemoryRepo
 from .callbacks import AgentEvent, EventCallback, NullCallback
-from .nodes.code import CodeSearch, code_node
+from .nodes.code import CodeSearch, code_node, open_file_node, apply_patch_node, explain_error_node
 from .nodes.finalize import finalize_node
 from .nodes.retrieve import retrieve_node
 from .nodes.route import route_node
@@ -82,6 +82,7 @@ def run_agent(
     session_id: Optional[str] = None,
     request_id: Optional[str] = None,
     callback: Optional[EventCallback] = None,
+    initial_evidence: Optional[list] = None,
 ) -> AgentState:
     cb = callback or NullCallback()
     state = build_initial_state(
@@ -92,6 +93,9 @@ def run_agent(
         constraints=constraints,
         request_id=request_id,
     )
+    # Inject initial evidence from client_context
+    if initial_evidence:
+        state.evidence.extend(initial_evidence)
     state = route_node(state, services)
     cb.emit(AgentEvent("route", {"route": state.route, "request_id": state.request_id}))
 
@@ -104,6 +108,12 @@ def run_agent(
             state = sql_node(state, services)
         elif action == "code_search":
             state = code_node(state, services)
+        elif action == "open_file":
+            state = open_file_node(state, services)
+        elif action == "apply_patch":
+            state = apply_patch_node(state, services)
+        elif action == "explain_error":
+            state = explain_error_node(state, services)
         elif action == "retrieve":
             state = retrieve_node(state, services)
         elif action == "web_search":

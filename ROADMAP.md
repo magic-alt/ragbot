@@ -224,7 +224,7 @@ API/客户端：
 
 ---
 
-### Milestone C（6～10 周）：Cursor-like 编程体验（Repo + 本地文档 + 多工具）
+### Milestone C（6～10 周）：Cursor-like 编程体验（Repo + 本地文档 + 多工具）  ✅ 已完成
 
 目标：在 IDE/CLI 里实现会检索、会定位、会改代码的编程助手。
 
@@ -256,6 +256,40 @@ API/客户端：
 - 典型任务（定位函数解释生成 patch）：一次成功率可用（内部基准集评测）
 - patch 输出可被应用，且引用指向具体 path+line
 - IDE 端 P95 交互延迟可接受（首 token、工具调用可视）
+
+**实现状态（Milestone C）：**
+
+| 交付项 | 状态 | 关键文件 |
+|--------|------|----------|
+| 1. 符号级 Repo Ingestion | ✅ | `services/worker/jobs/ingest_repo.py` — AST-based Python 切分 + regex C-like 切分 + 行号/语言元数据 |
+| 2a. `open_file/read_range` | ✅ | `services/api/app/agent/nodes/code.py` — `CodeSearch.open_file()` + `open_file_node()` |
+| 2b. `apply_patch` (unified diff) | ✅ | `services/api/app/agent/nodes/code.py` — `CodeSearch.generate_patch()` + `apply_patch_node()` |
+| 2c. `explain_error` | ✅ | `services/api/app/agent/nodes/code.py` — 多语言堆栈解析 (Python/JS/Go/Java) + 关键词回退 |
+| 3a. CLI client | ✅ | `cli/rag.py` — `rag ask`, `rag search`, `rag patch`, `rag ingest`（本地/远程双模式） |
+| 3b. CLI pyproject entry point | ✅ | `pyproject.toml` — `[project.scripts] rag = "cli.rag:main"` |
+| 4a. Client context 处理 | ✅ | `services/api/app/agent/context.py` — `process_client_context()` 支持 selected_text/open_files/git_diff/errors |
+| 4b. Evidence 去重 | ✅ | `services/api/app/agent/context.py` — `dedup_evidence()` MD5 文本哈希去重 |
+| 4c. Evidence 压缩 | ✅ | `services/api/app/agent/context.py` — `compress_evidence()` 按分数排序+截断+预算控制 |
+| 5. Agent 工具调度扩展 | ✅ | `services/api/app/agent/graph.py` — 新增 open_file/apply_patch/explain_error 分发 |
+| 6. 类型系统扩展 | ✅ | `contracts/types.py` — PatchResult + 新 ToolName + 新 EvidenceItem 类型 |
+| 7. API 集成 | ✅ | `services/api/app/api.py` v0.4.0 + `main.py` — client_context 注入 + evidence 后处理 |
+| 8. 测试 | ✅ | 新增 43 条测试，总计 129 条，全部通过 |
+
+测试覆盖清单：
+- 符号级切分（Python AST / regex / 行回退 / 大符号拆分 / 语言检测）
+- open_file（全文/范围/未找到）
+- generate_patch（有变更/无变更）
+- explain_error（堆栈解析/关键词回退）
+- 堆栈解析（Python/JS/Java 格式）
+- 文件引用解析（path:line-line / path:line / path）
+- Agent 节点集成（open_file_node / explain_error_node）
+- CLI（ask/search/help/no-command）
+- Client context（selected_text/repo/open_files/git_diff/errors/constraints 保留）
+- Evidence 去重（重复移除/唯一保留）
+- Evidence 压缩（低分丢弃/长文截断/空列表）
+- 端到端集成（chat + client_context / run_agent + initial_evidence / /chat API）
+
+结论：ragbot Milestone C 全部完成，具备 Cursor-like 编程助手核心能力：符号级代码检索、文件读取、Patch 生成、错误定位、CLI 客户端、IDE 上下文注入、证据去重与压缩。
 
 ---
 

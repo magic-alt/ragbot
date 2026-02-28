@@ -20,4 +20,7 @@ worker = ["PyPDF2>=3.0", "beautifulsoup4>=4.12", "gitpython>=3.1"]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
 
 [tool.setuptools.packages.find]
-include = ["contracts*", "services*"]
+include = ["contracts*", "services*", "cli*"]
+
+[project.scripts]
+rag = "cli.rag:main"

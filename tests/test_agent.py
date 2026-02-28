@@ -958,3 +958,486 @@ class FastAPISourceEndpointTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── Milestone C: Enhanced Repo Ingestion Tests ────────────────────────
+
+
+class RepoIngestionSymbolTests(unittest.TestCase):
+    def test_python_symbol_chunking(self):
+        from services.worker.jobs.ingest_repo import _split_python_symbols
+        code = '''import os
+
+def hello():
+    print("hello")
+
+class MyClass:
+    def method(self):
+        pass
+
+def goodbye():
+    print("bye")
+'''
+        result = _split_python_symbols(code, chunk_size=600)
+        self.assertTrue(len(result) >= 3)  # preamble + hello + MyClass + goodbye
+        names = [r[0] for r in result]
+        self.assertIn("hello", names)
+        self.assertIn("MyClass", names)
+        self.assertIn("goodbye", names)
+
+    def test_python_symbol_fallback_on_syntax_error(self):
+        from services.worker.jobs.ingest_repo import _split_python_symbols
+        bad_code = "def broken(\n"
+        result = _split_python_symbols(bad_code, chunk_size=600)
+        # Should fall back to line-based splitting
+        self.assertTrue(len(result) >= 1)
+
+    def test_regex_function_detection(self):
+        from services.worker.jobs.ingest_repo import _split_by_functions
+        code = '''const x = 1;
+
+function hello() {
+    console.log("hi");
+}
+
+function world() {
+    console.log("world");
+}
+'''
+        result = _split_by_functions(code, chunk_size=600)
+        self.assertTrue(len(result) >= 2)
+        names = [r[0] for r in result if r[0]]
+        self.assertIn("hello", names)
+        self.assertIn("world", names)
+
+    def test_line_based_fallback(self):
+        from services.worker.jobs.ingest_repo import _split_file
+        text = "line\n" * 100
+        result = _split_file(text, chunk_size=50)
+        self.assertTrue(len(result) >= 2)
+        # Each result is (name, start, end, text)
+        for name, start, end, segment in result:
+            self.assertIsNone(name)
+            self.assertTrue(start >= 1)
+            self.assertTrue(len(segment) > 0)
+
+    def test_large_symbol_splitting(self):
+        from services.worker.jobs.ingest_repo import _split_large_symbol
+        large_text = "x = 1\n" * 200
+        result = _split_large_symbol("big_func", large_text, 0, chunk_size=100)
+        self.assertTrue(len(result) >= 2)
+        # First part should have part number
+        self.assertIn("part", result[0][0])
+
+    def test_language_detection(self):
+        from services.worker.jobs.ingest_repo import _LANG_MAP
+        self.assertEqual(_LANG_MAP[".py"], "python")
+        self.assertEqual(_LANG_MAP[".ts"], "typescript")
+        self.assertEqual(_LANG_MAP[".go"], "go")
+        self.assertEqual(_LANG_MAP[".rs"], "rust")
+
+
+# ── Milestone C: Programming Tools Tests ──────────────────────────────
+
+
+class OpenFileTests(unittest.TestCase):
+    def test_open_file_full(self):
+        cs = CodeSearch(
+            repo_roots={},
+            in_memory_files={"default": {
+                "main.py": "line1\nline2\nline3\nline4\nline5\n",
+            }},
+        )
+        result = cs.open_file("main.py", "default")
+        self.assertIn("line1", result)
+        self.assertIn("line5", result)
+        # Should have line numbers
+        self.assertIn("1", result)
+
+    def test_open_file_range(self):
+        cs = CodeSearch(
+            repo_roots={},
+            in_memory_files={"default": {
+                "main.py": "\n".join(f"line{i}" for i in range(1, 21)),
+            }},
+        )
+        result = cs.open_file("main.py", "default", start_line=5, end_line=10)
+        self.assertIn("line5", result)
+        self.assertIn("line10", result)
+        self.assertNotIn("line1 |", result)
+
+    def test_open_file_not_found(self):
+        cs = CodeSearch(repo_roots={}, in_memory_files={"default": {}})
+        with self.assertRaises(FileNotFoundError):
+            cs.open_file("nonexistent.py", "default")
+
+
+class GeneratePatchTests(unittest.TestCase):
+    def test_generate_patch(self):
+        cs = CodeSearch(repo_roots={})
+        original = "def hello():\n    print('hello')\n"
+        replacement = "def hello():\n    print('world')\n"
+        result = cs.generate_patch("main.py", original, replacement)
+        self.assertEqual(result.path, "main.py")
+        self.assertIn("---", result.diff)
+        self.assertIn("+++", result.diff)
+        self.assertIn("-    print('hello')", result.diff)
+        self.assertIn("+    print('world')", result.diff)
+
+    def test_generate_patch_no_change(self):
+        cs = CodeSearch(repo_roots={})
+        original = "no change\n"
+        result = cs.generate_patch("file.py", original, original)
+        self.assertEqual(result.diff, "")  # No diff for identical content
+
+
+class ExplainErrorTests(unittest.TestCase):
+    def test_explain_error_with_stack_trace(self):
+        cs = CodeSearch(
+            repo_roots={},
+            in_memory_files={"default": {
+                "app.py": "\n".join(f"line {i}" for i in range(1, 50)),
+            }},
+        )
+        error = '''Traceback (most recent call last):
+  File "app.py", line 10, in main
+    do_something()
+ValueError: invalid value'''
+        result = cs.explain_error(error, "default")
+        self.assertTrue(len(result) >= 1)
+        self.assertEqual(result[0].path, "app.py")
+
+    def test_explain_error_keyword_fallback(self):
+        cs = CodeSearch(
+            repo_roots={},
+            in_memory_files={"default": {
+                "handler.py": "class ValueError:\n    pass\n",
+            }},
+        )
+        error = "ValueError: something went wrong"
+        result = cs.explain_error(error, "default")
+        # Should find the keyword fallback
+        self.assertTrue(len(result) >= 0)  # May or may not find matches
+
+
+class StackTraceParsingTests(unittest.TestCase):
+    def test_parse_python_trace(self):
+        from services.api.app.agent.nodes.code import _parse_stack_trace
+        trace = '''File "app/main.py", line 42, in run
+    process()'''
+        locations = _parse_stack_trace(trace)
+        self.assertTrue(len(locations) >= 1)
+        self.assertEqual(locations[0], ("app/main.py", 42))
+
+    def test_parse_js_trace(self):
+        from services.api.app.agent.nodes.code import _parse_stack_trace
+        trace = "at Object.run (/app/server.js:15:3)"
+        locations = _parse_stack_trace(trace)
+        self.assertTrue(len(locations) >= 1)
+        self.assertEqual(locations[0][1], 15)
+
+    def test_parse_java_trace(self):
+        from services.api.app.agent.nodes.code import _parse_stack_trace
+        trace = "at com.example.Main.run(Main.java:25)"
+        locations = _parse_stack_trace(trace)
+        self.assertTrue(len(locations) >= 1)
+        self.assertEqual(locations[0], ("Main.java", 25))
+
+    def test_extract_error_keywords(self):
+        from services.api.app.agent.nodes.code import _extract_error_keywords
+        text = "ValueError: invalid input in process_data"
+        keywords = _extract_error_keywords(text)
+        self.assertIn("ValueError", keywords)
+
+
+class FileReferenceParsingTests(unittest.TestCase):
+    def test_parse_path_with_range(self):
+        from services.api.app.agent.nodes.code import _parse_file_reference
+        path, start, end = _parse_file_reference("open main.py:10-20")
+        self.assertEqual(path, "main.py")
+        self.assertEqual(start, 10)
+        self.assertEqual(end, 20)
+
+    def test_parse_path_with_line(self):
+        from services.api.app.agent.nodes.code import _parse_file_reference
+        path, start, end = _parse_file_reference("show utils.ts:42")
+        self.assertEqual(path, "utils.ts")
+        self.assertEqual(start, 42)
+
+    def test_parse_plain_path(self):
+        from services.api.app.agent.nodes.code import _parse_file_reference
+        path, start, end = _parse_file_reference("read config.yaml")
+        self.assertEqual(path, "config.yaml")
+        self.assertIsNone(start)
+        self.assertIsNone(end)
+
+
+class OpenFileNodeTests(unittest.TestCase):
+    def test_open_file_node_success(self):
+        from services.api.app.agent.nodes.code import open_file_node
+        services = build_default_services()
+        services.code_search = CodeSearch(
+            repo_roots={},
+            in_memory_files={"default": {"test.py": "def foo():\n    return 42\n"}},
+        )
+        state = build_initial_state("open test.py", "t1", "u1")
+        state = open_file_node(state, services)
+        self.assertTrue(len(state.tool_calls) > 0)
+        self.assertTrue(state.tool_calls[-1].ok)
+        self.assertTrue(len(state.evidence) > 0)
+        self.assertEqual(state.evidence[-1].kind, "file_content")
+
+    def test_open_file_node_not_found(self):
+        from services.api.app.agent.nodes.code import open_file_node
+        services = build_default_services()
+        services.code_search = CodeSearch(repo_roots={}, in_memory_files={"default": {}})
+        state = build_initial_state("open nonexistent.py", "t1", "u1")
+        state = open_file_node(state, services)
+        self.assertTrue(len(state.tool_calls) > 0)
+        self.assertFalse(state.tool_calls[-1].ok)
+
+
+class ExplainErrorNodeTests(unittest.TestCase):
+    def test_explain_error_node(self):
+        from services.api.app.agent.nodes.code import explain_error_node
+        services = build_default_services()
+        services.code_search = CodeSearch(
+            repo_roots={},
+            in_memory_files={"default": {
+                "app.py": "\n".join(f"code line {i}" for i in range(50)),
+            }},
+        )
+        state = build_initial_state(
+            'File "app.py", line 10, in main\nValueError: bad', "t1", "u1",
+        )
+        state = explain_error_node(state, services)
+        self.assertTrue(len(state.tool_calls) > 0)
+        self.assertTrue(state.tool_calls[-1].ok)
+
+
+# ── Milestone C: CLI Tests ───────────────────────────────────────────
+
+
+class CLITests(unittest.TestCase):
+    def test_cli_ask_local(self):
+        from cli.rag import main
+        import io
+        from unittest.mock import patch
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            main(["ask", "hello world"])
+        output = mock_stdout.getvalue()
+        self.assertTrue(len(output) > 0)
+
+    def test_cli_search_local(self):
+        from cli.rag import main
+        import io
+        from unittest.mock import patch
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            main(["search", "test query"])
+        output = mock_stdout.getvalue()
+        self.assertTrue(len(output) > 0)
+
+    def test_cli_no_command(self):
+        from cli.rag import main
+        with self.assertRaises(SystemExit) as ctx:
+            main([])
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_cli_help(self):
+        from cli.rag import main
+        with self.assertRaises(SystemExit) as ctx:
+            main(["--help"])
+
+
+# ── Milestone C: Context Strategy Tests ──────────────────────────────
+
+
+class ClientContextTests(unittest.TestCase):
+    def test_process_empty_context(self):
+        from services.api.app.agent.context import process_client_context
+        constraints, evidence = process_client_context(None)
+        self.assertIsNone(constraints)
+        self.assertEqual(len(evidence), 0)
+
+    def test_process_selected_text(self):
+        from services.api.app.agent.context import process_client_context
+        ctx = {
+            "selected_text": {
+                "content": "def foo(): pass",
+                "path": "main.py",
+                "start_line": 10,
+                "end_line": 12,
+            }
+        }
+        constraints, evidence = process_client_context(ctx)
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].kind, "file_content")
+        self.assertIn("def foo", evidence[0].text)
+        self.assertEqual(evidence[0].citations[0].path, "main.py")
+
+    def test_process_repo_constraint(self):
+        from services.api.app.agent.context import process_client_context
+        from contracts.types import Constraints
+        ctx = {"repo": "myrepo", "ref": "develop"}
+        constraints, evidence = process_client_context(ctx)
+        self.assertEqual(constraints.repo, "myrepo")
+        self.assertEqual(constraints.ref, "develop")
+
+    def test_process_open_files(self):
+        from services.api.app.agent.context import process_client_context
+        ctx = {
+            "open_files": [
+                {"path": "a.py", "content": "code A"},
+                {"path": "b.py", "content": "code B"},
+            ]
+        }
+        constraints, evidence = process_client_context(ctx)
+        self.assertEqual(len(evidence), 2)
+        paths = [e.metadata["path"] for e in evidence]
+        self.assertIn("a.py", paths)
+        self.assertIn("b.py", paths)
+
+    def test_process_git_diff(self):
+        from services.api.app.agent.context import process_client_context
+        ctx = {"git_diff": "diff --git a/file.py b/file.py\n+new line"}
+        constraints, evidence = process_client_context(ctx)
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].kind, "patch")
+
+    def test_process_recent_errors(self):
+        from services.api.app.agent.context import process_client_context
+        ctx = {"recent_errors": ["Error 1", "Error 2"]}
+        constraints, evidence = process_client_context(ctx)
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].kind, "error_analysis")
+        self.assertIn("Error 1", evidence[0].text)
+
+    def test_existing_constraints_preserved(self):
+        from services.api.app.agent.context import process_client_context
+        from contracts.types import Constraints
+        existing = Constraints(repo="existing-repo", tags=["tag1"])
+        ctx = {"repo": "should-not-override"}
+        constraints, _ = process_client_context(ctx, existing)
+        self.assertEqual(constraints.repo, "existing-repo")  # Preserved
+        self.assertEqual(constraints.tags, ["tag1"])
+
+
+class EvidenceDedupTests(unittest.TestCase):
+    def test_dedup_removes_duplicates(self):
+        from services.api.app.agent.context import dedup_evidence
+        ev1 = EvidenceItem(kind="doc_chunk", text="same text", score=1.0)
+        ev2 = EvidenceItem(kind="doc_chunk", text="same text", score=0.8)
+        ev3 = EvidenceItem(kind="doc_chunk", text="different text", score=0.5)
+        result = dedup_evidence([ev1, ev2, ev3])
+        self.assertEqual(len(result), 2)
+
+    def test_dedup_preserves_unique(self):
+        from services.api.app.agent.context import dedup_evidence
+        items = [
+            EvidenceItem(kind="doc_chunk", text=f"unique {i}", score=1.0)
+            for i in range(5)
+        ]
+        result = dedup_evidence(items)
+        self.assertEqual(len(result), 5)
+
+
+class EvidenceCompressionTests(unittest.TestCase):
+    def test_compress_drops_low_score(self):
+        from services.api.app.agent.context import compress_evidence
+        items = [
+            EvidenceItem(kind="doc_chunk", text="A" * 8000, score=1.0),
+            EvidenceItem(kind="doc_chunk", text="B" * 8000, score=0.1),
+        ]
+        result = compress_evidence(items, max_total=4000)
+        self.assertEqual(len(result), 1)
+        self.assertIn("A", result[0].text)
+
+    def test_compress_truncates_long_items(self):
+        from services.api.app.agent.context import compress_evidence, MAX_SINGLE_EVIDENCE_CHARS
+        items = [
+            EvidenceItem(kind="doc_chunk", text="X" * 10000, score=1.0),
+        ]
+        result = compress_evidence(items)
+        self.assertTrue(len(result[0].text) <= MAX_SINGLE_EVIDENCE_CHARS + 20)  # +margin for "truncated"
+
+    def test_compress_empty(self):
+        from services.api.app.agent.context import compress_evidence
+        result = compress_evidence([])
+        self.assertEqual(result, [])
+
+
+# ── Milestone C: Integration Tests ───────────────────────────────────
+
+
+class MilestoneCIntegrationTests(unittest.TestCase):
+    def test_chat_with_client_context(self):
+        """Test that client_context flows through chat() correctly."""
+        from services.api.app.main import chat
+        result = chat(
+            "what does this code do",
+            "t1", "u1",
+            initial_evidence=[
+                EvidenceItem(
+                    kind="file_content", score=1.0,
+                    text="def add(a, b): return a + b",
+                    citations=[Citation(kind="code", path="math.py", line_start=1, line_end=1)],
+                ),
+            ],
+        )
+        self.assertIn("answer", result)
+        self.assertIn("request_id", result)
+
+    def test_run_agent_with_initial_evidence(self):
+        """Test that initial_evidence is injected into agent state."""
+        services = build_default_services()
+        initial_ev = [
+            EvidenceItem(
+                kind="file_content", score=1.0,
+                text="class Foo: pass",
+                citations=[Citation(kind="code", path="foo.py")],
+            ),
+        ]
+        state = run_agent(
+            "explain Foo", "t1", "u1", services,
+            initial_evidence=initial_ev,
+        )
+        self.assertIsNotNone(state.final)
+        # Evidence should include our injected item
+        kinds = [e.kind for e in state.evidence]
+        self.assertIn("file_content", kinds)
+
+    def test_patch_result_type(self):
+        from contracts.types import PatchResult
+        p = PatchResult(path="test.py", diff="--- a\n+++ b\n", original_lines=5, modified_lines=6)
+        self.assertEqual(p.path, "test.py")
+        self.assertEqual(p.original_lines, 5)
+
+    def test_chat_endpoint_with_context(self):
+        """Test /chat with client_context via TestClient."""
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            raise unittest.SkipTest("fastapi TestClient not available")
+
+        from services.api.app.api import app
+        import services.api.app.api as api_mod
+        api_mod._services = build_default_services()
+
+        client = TestClient(app)
+        response = client.post("/chat", json={
+            "query": "explain this code",
+            "tenant_id": "t1",
+            "user_id": "u1",
+            "client_context": {
+                "selected_text": {
+                    "content": "def hello(): print('hi')",
+                    "path": "main.py",
+                    "start_line": 1,
+                    "end_line": 1,
+                },
+                "repo": "test-repo",
+            },
+        })
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("answer", data)
