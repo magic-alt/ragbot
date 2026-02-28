@@ -9,7 +9,7 @@ from .agent.state import Constraints, FinalAnswer
 from contracts.types import EvidenceItem
 
 
-def chat(
+async def chat(
     query: str,
     tenant_id: str,
     user_id: str,
@@ -20,7 +20,7 @@ def chat(
     initial_evidence: Optional[List[EvidenceItem]] = None,
 ) -> Dict[str, object]:
     services = services or build_default_services()
-    state = run_agent(
+    state = await run_agent(
         query=query,
         tenant_id=tenant_id,
         user_id=user_id,

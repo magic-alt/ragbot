@@ -4,9 +4,9 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
-import requests
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ class OllamaAdapter:
     def enabled(self) -> bool:
         return True
 
-    def chat_json(
+    async def chat_json(
         self,
         system: str,
         user: str,
@@ -52,17 +52,17 @@ class OllamaAdapter:
         }
         if max_output_tokens:
             payload["options"] = {"num_predict": max_output_tokens}
-        data = self._post_json("/v1/chat/completions", payload)
+        data = await self._post_json("/v1/chat/completions", payload)
         content = data["choices"][0]["message"]["content"]
         return _extract_json(content)
 
-    def stream_text(
+    async def stream_text(
         self,
         system: str,
         user: str,
         temperature: float = 0.2,
         max_output_tokens: Optional[int] = None,
-    ) -> Iterator[str]:
+    ) -> AsyncIterator[str]:
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": [
@@ -76,30 +76,31 @@ class OllamaAdapter:
             payload["options"] = {"num_predict": max_output_tokens}
         url = f"{self.base_url}/v1/chat/completions"
         try:
-            response = requests.post(url, json=payload, stream=True, timeout=self.timeout)
-            response.raise_for_status()
-        except requests.RequestException as exc:
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST", url, json=payload, timeout=self.timeout
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data = line[len("data: "):].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        if not event.get("choices"):
+                            continue
+                        delta = event["choices"][0].get("delta", {})
+                        content = delta.get("content")
+                        if content:
+                            yield content
+        except httpx.HTTPError as exc:
             raise RuntimeError(f"Ollama stream failed: {type(exc).__name__}") from None
 
-        with response:
-            for line in response.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data: "):
-                    continue
-                data = line[len("data: "):].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    event = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                if not event.get("choices"):
-                    continue
-                delta = event["choices"][0].get("delta", {})
-                content = delta.get("content")
-                if content:
-                    yield content
-
-    def web_search(
+    async def web_search(
         self,
         query: str,
         allowed_domains: Optional[List[str]] = None,
@@ -108,12 +109,13 @@ class OllamaAdapter:
         # Ollama does not support web search natively
         return []
 
-    def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
         try:
-            response = requests.post(url, json=payload, timeout=self.timeout)
-            response.raise_for_status()
-        except requests.RequestException as exc:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json=payload, timeout=self.timeout)
+                response.raise_for_status()
+        except httpx.HTTPError as exc:
             raise RuntimeError(f"Ollama API request failed: {type(exc).__name__}") from None
         return response.json()
 

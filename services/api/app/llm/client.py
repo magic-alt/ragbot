@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
 
-import requests
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ class OpenAIClient:
     def enabled(self) -> bool:
         return bool(self.api_key)
 
-    def chat_json(
+    async def chat_json(
         self,
         system: str,
         user: str,
@@ -61,17 +61,17 @@ class OpenAIClient:
         }
         if max_output_tokens:
             payload["max_tokens"] = max_output_tokens
-        data = self._post_json("/v1/chat/completions", payload)
+        data = await self._post_json("/v1/chat/completions", payload)
         content = data["choices"][0]["message"]["content"]
         return json.loads(content)
 
-    def stream_text(
+    async def stream_text(
         self,
         system: str,
         user: str,
         temperature: float = 0.2,
         max_output_tokens: Optional[int] = None,
-    ) -> Iterator[str]:
+    ) -> AsyncIterator[str]:
         if not self.enabled:
             raise RuntimeError("OPENAI_API_KEY is not set")
         payload: Dict[str, Any] = {
@@ -85,7 +85,7 @@ class OpenAIClient:
         }
         if max_output_tokens:
             payload["max_tokens"] = max_output_tokens
-        for delta in self._stream_chat(payload):
+        async for delta in self._stream_chat(payload):
             if delta:
                 yield delta
 
@@ -100,7 +100,7 @@ class OpenAIClient:
             headers["OpenAI-Project"] = self.project
         return headers
 
-    def web_search(
+    async def web_search(
         self,
         query: str,
         allowed_domains: Optional[List[str]] = None,
@@ -119,47 +119,51 @@ class OpenAIClient:
             "input": query,
             "include": ["web_search_call.action.sources"],
         }
-        data = self._post_json("/v1/responses", payload)
+        data = await self._post_json("/v1/responses", payload)
         return _extract_web_sources(data)
 
-    def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
         headers = self._build_headers()
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
-            response.raise_for_status()
-        except requests.RequestException as exc:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    url, headers=headers, json=payload, timeout=self.timeout
+                )
+                response.raise_for_status()
+        except httpx.HTTPError as exc:
             raise RuntimeError(f"LLM API request failed: {type(exc).__name__}: {_sanitize_error(exc)}") from None
         return response.json()
 
-    def _stream_chat(self, payload: Dict[str, Any]) -> Iterator[str]:
+    async def _stream_chat(self, payload: Dict[str, Any]) -> AsyncIterator[str]:
         url = f"{self.base_url}/v1/chat/completions"
         headers = self._build_headers()
         try:
-            response = requests.post(url, headers=headers, json=payload, stream=True, timeout=self.timeout)
-            response.raise_for_status()
-        except requests.RequestException as exc:
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST", url, headers=headers, json=payload, timeout=self.timeout
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        if not line.startswith("data: "):
+                            continue
+                        data = line[len("data: "):].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        if not event.get("choices"):
+                            continue
+                        delta = event["choices"][0].get("delta", {})
+                        content = delta.get("content")
+                        if content:
+                            yield content
+        except httpx.HTTPError as exc:
             raise RuntimeError(f"LLM API stream failed: {type(exc).__name__}: {_sanitize_error(exc)}") from None
-
-        with response:
-            for line in response.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
-                if not line.startswith("data: "):
-                    continue
-                data = line[len("data: ") :].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    event = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                if not event.get("choices"):
-                    continue
-                delta = event["choices"][0].get("delta", {})
-                content = delta.get("content")
-                if content:
-                    yield content
 
 
 def _extract_web_sources(data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -222,4 +226,3 @@ def _sanitize_error(exc: Exception) -> str:
                 end = len(msg)
             msg = msg[:start] + "[REDACTED]" + msg[end:]
     return msg
-

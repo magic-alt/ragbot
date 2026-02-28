@@ -134,12 +134,12 @@ class PostgresSqlEngine:
         return list(tables.values())
 
 
-def sql_node(state: AgentState, services: Any) -> AgentState:
-    sql_query = _resolve_sql(state.query, services)
+async def sql_node(state: AgentState, services: Any) -> AgentState:
+    sql_query = await _resolve_sql(state.query, services)
     params = {"dialect": "postgres", "query": sql_query, "timeout_ms": 3000, "limit": 200}
     start_ms = now_ms()
     try:
-        result = safe_tool_call("sql_query", services.sql_engine.query, sql_query)
+        result = await safe_tool_call("sql_query", services.sql_engine.query, sql_query)
         citations = _rows_to_citations(result.rows)
         text = _format_sql_result(result.rows, max_rows=5)
         state.evidence.append(
@@ -172,7 +172,7 @@ def sql_node(state: AgentState, services: Any) -> AgentState:
     return state
 
 
-def _resolve_sql(query: str, services: Any) -> str:
+async def _resolve_sql(query: str, services: Any) -> str:
     if _looks_like_sql(query):
         return query
     llm = getattr(services, "llm", None)
@@ -182,7 +182,7 @@ def _resolve_sql(query: str, services: Any) -> str:
     if not tables_desc:
         return query
     try:
-        return _llm_nl2sql(llm, query, tables_desc)
+        return await _llm_nl2sql(llm, query, tables_desc)
     except Exception as exc:
         logger.warning("NL2SQL failed, using raw query: %s", exc)
         return query
@@ -203,14 +203,14 @@ _NL2SQL_SCHEMA = {
 }
 
 
-def _llm_nl2sql(llm: Any, question: str, tables_desc: str) -> str:
+async def _llm_nl2sql(llm: Any, question: str, tables_desc: str) -> str:
     system = (
         "You are a SQL expert. Convert the user's natural language question into a valid "
         "SELECT SQL query. Only output read-only SELECT queries. Return JSON with "
         "fields: sql (the SQL string), explanation (brief explanation)."
     )
     user = f"Tables:\n{tables_desc}\n\nQuestion: {question}"
-    result = llm.chat_json(system=system, user=user, schema=_NL2SQL_SCHEMA)
+    result = await llm.chat_json(system=system, user=user, schema=_NL2SQL_SCHEMA)
     sql = result.get("sql", "").strip()
     if not sql:
         raise ValueError("LLM returned empty SQL")

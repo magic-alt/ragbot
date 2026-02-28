@@ -1,6 +1,7 @@
 """Agent event callback system for real-time SSE streaming."""
 from __future__ import annotations
 
+import asyncio
 import queue
 import threading
 from dataclasses import dataclass, field
@@ -87,3 +88,69 @@ class QueueCallback:
     @property
     def closed(self) -> bool:
         return self._closed.is_set() and self._queue.empty()
+
+
+class AsyncQueueCallback:
+    """Async callback that writes events to an asyncio.Queue.
+
+    Used for native async SSE streaming without thread bridging.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, maxsize: int = 256) -> None:
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
+        self._closed = False
+
+    def emit(self, event: AgentEvent) -> None:
+        if self._closed:
+            return
+        try:
+            self._queue.put_nowait(event)
+        except asyncio.QueueFull:
+            # Drop oldest event to make room
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self._queue.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
+
+    def close(self) -> None:
+        """Signal that no more events will be emitted."""
+        self._closed = True
+        try:
+            self._queue.put_nowait(self._SENTINEL)
+        except asyncio.QueueFull:
+            pass
+
+    async def get(self, timeout: float = 1.0) -> Optional[AgentEvent]:
+        """Get the next event asynchronously."""
+        try:
+            item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+            if item is self._SENTINEL:
+                return None
+            return item
+        except asyncio.TimeoutError:
+            if self._closed:
+                return None
+            raise
+
+    @property
+    def closed(self) -> bool:
+        return self._closed and self._queue.empty()
+
+    async def __aiter__(self):
+        """Async iterator over events until close."""
+        while True:
+            try:
+                event = await self.get(timeout=5.0)
+                if event is None:
+                    break
+                yield event
+            except asyncio.TimeoutError:
+                if self._closed:
+                    break
+                continue

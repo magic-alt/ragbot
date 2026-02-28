@@ -16,7 +16,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Literal, Optional
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +169,7 @@ class ModelRouter:
             return "fast"
         return TASK_TIER_MAP.get(task, "fast")
 
-    def chat_json(
+    async def chat_json(
         self,
         system: str,
         user: str,
@@ -182,7 +182,7 @@ class ModelRouter:
         provider = self.get_provider(task)
         tier = self.get_tier(task)
 
-        result = provider.chat_json(
+        result = await provider.chat_json(
             system=system,
             user=user,
             schema=schema,
@@ -197,20 +197,20 @@ class ModelRouter:
 
         return result
 
-    def stream_text(
+    async def stream_text(
         self,
         system: str,
         user: str,
         task: str = "default",
         temperature: float = 0.2,
         max_output_tokens: Optional[int] = None,
-    ) -> Iterator[str]:
+    ) -> AsyncIterator[str]:
         """Route a stream_text call to the appropriate provider."""
         provider = self.get_provider(task)
         tier = self.get_tier(task)
 
         total_text = []
-        for chunk in provider.stream_text(
+        async for chunk in provider.stream_text(
             system=system,
             user=user,
             temperature=temperature,
@@ -227,7 +227,7 @@ class ModelRouter:
     def enabled(self) -> bool:
         return self.fast is not None and self.fast.enabled
 
-    def web_search(
+    async def web_search(
         self,
         query: str,
         allowed_domains: Optional[List[str]] = None,
@@ -235,7 +235,7 @@ class ModelRouter:
     ) -> List[Dict[str, Any]]:
         """Web search always goes through the strong provider (if available)."""
         provider = self.strong if (self.strong and self.strong.enabled) else self.fast
-        return provider.web_search(query, allowed_domains, recency_days)
+        return await provider.web_search(query, allowed_domains, recency_days)
 
 
 def build_model_router() -> ModelRouter:

@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
-from .agent.callbacks import QueueCallback
+from .agent.callbacks import AsyncQueueCallback
 from .agent.context import process_client_context, dedup_evidence, compress_evidence
 from .agent.graph import run_agent
 from .agent.state import Constraints, SourceType
@@ -117,8 +117,7 @@ async def chat_endpoint(payload: ChatRequest, _key: str = Depends(verify_api_key
     constraints, initial_evidence = process_client_context(
         payload.client_context, constraints,
     )
-    result = await asyncio.to_thread(
-        chat,
+    result = await chat(
         payload.query,
         payload.tenant_id,
         payload.user_id,
@@ -202,18 +201,17 @@ def _constraints_from_model(model: Optional[ConstraintsModel]) -> Optional[Const
 
 
 async def _chat_stream_realtime(payload: ChatRequest) -> AsyncIterator[str]:
-    """Real-time SSE streaming using QueueCallback.
+    """Real-time SSE streaming using AsyncQueueCallback.
 
-    The agent runs in a background thread and emits events to a thread-safe
-    queue. This async generator reads from the queue and yields SSE events.
+    The agent runs as an async task and emits events to an asyncio queue.
+    This async generator reads from the queue and yields SSE events.
     """
     services = _get_services()
     constraints = _constraints_from_model(payload.constraints)
-    cb = QueueCallback()
+    cb = AsyncQueueCallback()
 
-    async def _run_agent():
-        await asyncio.to_thread(
-            run_agent,
+    async def _run():
+        await run_agent(
             query=payload.query,
             tenant_id=payload.tenant_id,
             user_id=payload.user_id,
@@ -223,21 +221,11 @@ async def _chat_stream_realtime(payload: ChatRequest) -> AsyncIterator[str]:
             callback=cb,
         )
 
-    task = asyncio.create_task(_run_agent())
+    task = asyncio.create_task(_run())
     request_id = None
 
     try:
-        while True:
-            try:
-                event = await asyncio.to_thread(cb.get, 0.5)
-            except Exception:
-                if task.done():
-                    break
-                continue
-
-            if event is None:
-                break
-
+        async for event in cb:
             data = dict(event.data)
             if "request_id" in data:
                 request_id = data["request_id"]

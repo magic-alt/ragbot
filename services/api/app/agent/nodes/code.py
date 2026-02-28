@@ -186,12 +186,12 @@ class CodeSearch:
             yield rel_path, content
 
 
-def code_node(state: AgentState, services: Any) -> AgentState:
+async def code_node(state: AgentState, services: Any) -> AgentState:
     repo = state.constraints.repo or "default"
     params = {"query": state.query, "repo": repo, "ref": state.constraints.ref or "main"}
     start_ms = now_ms()
     try:
-        snippets = safe_tool_call("code_search", services.code_search.search, state.query, repo=repo, max_hits=8)
+        snippets = await safe_tool_call("code_search", services.code_search.search, state.query, repo=repo, max_hits=8)
         citations = [
             Citation(
                 kind="code",
@@ -302,7 +302,7 @@ def _extract_error_keywords(text: str) -> List[str]:
 # ── Agent node functions ─────────────────────────────────────────────
 
 
-def open_file_node(state: AgentState, services: Any) -> AgentState:
+async def open_file_node(state: AgentState, services: Any) -> AgentState:
     """Agent node: read a file or file range."""
     repo = state.constraints.repo or "default"
     # Extract path from query (format: "open path/to/file.py:10-20" or just path)
@@ -310,7 +310,7 @@ def open_file_node(state: AgentState, services: Any) -> AgentState:
     params = {"path": path, "repo": repo, "start_line": start_line, "end_line": end_line}
     start_ms = now_ms()
     try:
-        content = safe_tool_call(
+        content = await safe_tool_call(
             "open_file", services.code_search.open_file,
             path=path, repo=repo,
             start_line=start_line, end_line=end_line,
@@ -336,7 +336,7 @@ def open_file_node(state: AgentState, services: Any) -> AgentState:
     return state
 
 
-def apply_patch_node(state: AgentState, services: Any) -> AgentState:
+async def apply_patch_node(state: AgentState, services: Any) -> AgentState:
     """Agent node: generate a unified diff patch."""
     repo = state.constraints.repo or "default"
     # The query should contain the patch instruction; evidence should have the code context
@@ -395,13 +395,13 @@ def apply_patch_node(state: AgentState, services: Any) -> AgentState:
     return state
 
 
-def explain_error_node(state: AgentState, services: Any) -> AgentState:
+async def explain_error_node(state: AgentState, services: Any) -> AgentState:
     """Agent node: parse stack trace and find related code."""
     repo = state.constraints.repo or "default"
     params = {"error_text": state.query, "repo": repo}
     start_ms = now_ms()
     try:
-        snippets = safe_tool_call(
+        snippets = await safe_tool_call(
             "explain_error", services.code_search.explain_error,
             error_text=state.query, repo=repo, max_hits=5,
         )

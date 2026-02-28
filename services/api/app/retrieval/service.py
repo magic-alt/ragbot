@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
+from .embedder import Embedder
 from .pg_fts import fts_search
-from .qdrant import embed_text
 from .rerank import rrf_fuse
 from ..storage.models import Chunk
-from ..storage.repo import InMemoryRepo
+from ..storage.protocol import Repo
 from contracts.types import RetrievalChunk
 
 
@@ -19,12 +19,19 @@ def build_citation(chunk: Chunk) -> str:
 
 
 class Retriever:
-    def __init__(self, repo: InMemoryRepo, qdrant: Any) -> None:
+    def __init__(self, repo: Repo, qdrant: Any, embedder: Optional[Embedder] = None, reranker: Any = None) -> None:
         self._repo = repo
         self._qdrant = qdrant
+        self._embedder = embedder
+        self._reranker = reranker
 
     def retrieve(self, query: str, filters: Dict[str, Any], top_k: int = 20) -> List[RetrievalChunk]:
-        query_vector = embed_text(query, self._qdrant.dim)
+        if self._embedder:
+            query_vector = self._embedder.embed(query)
+        else:
+            # Fallback for backward compat (should not happen in production)
+            from .embedder import HashEmbedder
+            query_vector = HashEmbedder(dim=self._qdrant.dim).embed(query)
         qdrant_hits = self._qdrant.search(query_vector, filters, top_k * 2)
         fts_hits = fts_search(self._repo, query, filters, top_k * 2)
 
@@ -35,6 +42,19 @@ class Retriever:
         payload_map: Dict[str, Dict[str, Any]] = {
             point_id: payload for point_id, _score, payload in qdrant_hits
         }
+
+        # Cross-encoder reranking (if enabled)
+        if self._reranker and hasattr(self._reranker, 'enabled') and self._reranker.enabled:
+            candidates = fused[:top_k * 2]
+            candidate_texts = []
+            for cid, _ in candidates:
+                chunk = self._repo.get_chunk(cid)
+                if chunk:
+                    candidate_texts.append(chunk.text)
+                else:
+                    candidate_texts.append(payload_map.get(cid, {}).get("text", ""))
+            reranked = self._reranker.rerank(query, candidate_texts, top_k=top_k)
+            fused = [(candidates[idx][0], score) for idx, score in reranked]
 
         results: List[RetrievalChunk] = []
         for chunk_id, fused_score in fused[:top_k]:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, runtime_checkable
+from typing import Any, AsyncIterator, Dict, List, Optional, runtime_checkable
 
 from typing import Protocol
 
@@ -12,7 +12,7 @@ class ModelProvider(Protocol):
     @property
     def enabled(self) -> bool: ...
 
-    def chat_json(
+    async def chat_json(
         self,
         system: str,
         user: str,
@@ -21,15 +21,15 @@ class ModelProvider(Protocol):
         max_output_tokens: Optional[int] = None,
     ) -> Dict[str, Any]: ...
 
-    def stream_text(
+    async def stream_text(
         self,
         system: str,
         user: str,
         temperature: float = 0.2,
         max_output_tokens: Optional[int] = None,
-    ) -> Iterator[str]: ...
+    ) -> AsyncIterator[str]: ...
 
-    def web_search(
+    async def web_search(
         self,
         query: str,
         allowed_domains: Optional[List[str]] = None,

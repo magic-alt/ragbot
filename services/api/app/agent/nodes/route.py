@@ -27,7 +27,7 @@ _LLM_ROUTE_SCHEMA = {
 }
 
 
-def route_node(state: AgentState, services: Any) -> AgentState:
+async def route_node(state: AgentState, services: Any) -> AgentState:
     query = state.query.lower()
     policies = services.repo.list_policies(state.tenant_id)
     acl_hashes = compute_security_scope(state.user_id, policies)
@@ -39,7 +39,7 @@ def route_node(state: AgentState, services: Any) -> AgentState:
     llm = getattr(services, "llm", None)
     if llm and getattr(llm, "enabled", False):
         try:
-            state.route = _llm_route(llm, state.query)
+            state.route = await _llm_route(llm, state.query)
         except Exception as exc:
             logger.warning("LLM routing failed, falling back to keyword: %s", exc)
             state.route = _keyword_route(query)
@@ -51,7 +51,7 @@ def route_node(state: AgentState, services: Any) -> AgentState:
     return state
 
 
-def _llm_route(llm: Any, query: str) -> str:
+async def _llm_route(llm: Any, query: str) -> str:
     system = (
         "You are a router for a RAG system. Classify the user question into one of: "
         "doc_rag (document retrieval), sql (structured data query), code (code search), "
@@ -59,7 +59,7 @@ def _llm_route(llm: Any, query: str) -> str:
         "Return JSON with fields: route, reasoning."
     )
     user = f"Question: {query}"
-    result = llm.chat_json(system=system, user=user, schema=_LLM_ROUTE_SCHEMA)
+    result = await llm.chat_json(system=system, user=user, schema=_LLM_ROUTE_SCHEMA)
     route = result.get("route", "mixed")
     valid = {ROUTE_DOC_RAG, ROUTE_SQL, ROUTE_CODE, ROUTE_MIXED, ROUTE_WEB}
     if route not in valid:

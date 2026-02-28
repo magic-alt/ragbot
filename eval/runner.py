@@ -15,7 +15,27 @@ from .datasets import EvalCase, EvalResult
 logger = logging.getLogger(__name__)
 
 
-def run_eval_case(
+def compute_mrr_at_k(expected: List[str], retrieved: List[str], k: int = 10) -> float:
+    """Compute MRR@k: 1/rank of first relevant item in top-k, 0 if not found."""
+    if not expected:
+        return 0.0
+    expected_set = set(expected)
+    for i, rid in enumerate(retrieved[:k]):
+        if rid in expected_set:
+            return 1.0 / (i + 1)
+    return 0.0
+
+
+def compute_recall_at_k(expected: List[str], retrieved: List[str], k: int = 10) -> float:
+    """Compute Recall@k: fraction of expected items found in top-k."""
+    if not expected:
+        return 0.0
+    expected_set = set(expected)
+    found = sum(1 for rid in retrieved[:k] if rid in expected_set)
+    return found / len(expected_set)
+
+
+async def run_eval_case(
     case: EvalCase,
     services=None,
 ) -> EvalResult:
@@ -53,7 +73,7 @@ def run_eval_case(
 
     start = time.monotonic()
     try:
-        state = run_agent(
+        state = await run_agent(
             query=case.query,
             tenant_id=case.tenant_id,
             user_id=case.user_id,
@@ -68,6 +88,16 @@ def run_eval_case(
             result.actual_answer = state.final.answer
             result.actual_confidence = state.final.confidence
             result.actual_citation_count = len(state.final.citations)
+
+        # Collect retrieved chunk IDs from evidence
+        result.retrieved_chunk_ids = [
+            e.chunk_id for e in state.evidence if hasattr(e, "chunk_id") and e.chunk_id
+        ]
+
+        # Compute MRR@10 and Recall@10 if expected_chunk_ids are provided
+        if case.expected_chunk_ids:
+            result.mrr_at_10 = compute_mrr_at_k(case.expected_chunk_ids, result.retrieved_chunk_ids, k=10)
+            result.recall_at_10 = compute_recall_at_k(case.expected_chunk_ids, result.retrieved_chunk_ids, k=10)
 
         # Run checks
         result.checks = _run_checks(case, result)
@@ -136,7 +166,7 @@ def _analyze_failure(case: EvalCase, result: EvalResult, state) -> str:
     return "bad_retrieval"
 
 
-def run_eval_suite(
+async def run_eval_suite(
     cases: List[EvalCase],
     services=None,
     category_filter: Optional[str] = None,
@@ -156,7 +186,7 @@ def run_eval_suite(
         logger.info("Running eval %d/%d: %s (%s)", i, len(filtered), case.case_id, case.category)
         # Fresh services per case to avoid cross-contamination
         svc = services or build_default_services()
-        result = run_eval_case(case, svc)
+        result = await run_eval_case(case, svc)
         results.append(result)
         status = "PASS" if result.passed else f"FAIL ({result.failure_category})"
         logger.info("  %s: %s (%.0fms)", case.case_id, status, result.duration_ms)
@@ -196,12 +226,20 @@ def summarize_results(results: List[EvalResult]) -> Dict[str, Any]:
     # Average duration
     avg_ms = sum(r.duration_ms for r in results) / total
 
+    # MRR@10 and Recall@10 averages (only for cases that have retrieval metrics)
+    mrr_results = [r for r in results if r.mrr_at_10 > 0 or r.recall_at_10 > 0]
+    avg_mrr_at_10 = round(sum(r.mrr_at_10 for r in mrr_results) / len(mrr_results), 4) if mrr_results else 0.0
+    avg_recall_at_10 = round(sum(r.recall_at_10 for r in mrr_results) / len(mrr_results), 4) if mrr_results else 0.0
+
     return {
         "total": total,
         "passed": passed,
         "failed": failed,
         "pass_rate": round(passed / total, 4),
         "avg_duration_ms": round(avg_ms, 1),
+        "avg_mrr_at_10": avg_mrr_at_10,
+        "avg_recall_at_10": avg_recall_at_10,
+        "retrieval_eval_count": len(mrr_results),
         "by_category": by_category,
         "failure_categories": failure_categories,
         "failed_cases": [

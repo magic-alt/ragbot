@@ -1,72 +1,10 @@
 from __future__ import annotations
 
 import logging
-import math
-import os
-import re
 from datetime import datetime
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
-
-import requests
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
-
-EmbedFn = Callable[[str, int], List[float]]
-
-_embed_fn: Optional[EmbedFn] = None
-
-
-def get_embed_fn() -> EmbedFn:
-    global _embed_fn
-    if _embed_fn is not None:
-        return _embed_fn
-    api_key = os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY")
-    base_url = (os.getenv("EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com").rstrip("/")
-    model = os.getenv("EMBEDDING_MODEL", "")
-    if api_key and model:
-        logger.info("Using real embedding API: model=%s", model)
-        _embed_fn = _make_api_embed_fn(api_key, base_url, model)
-    else:
-        logger.info("Using hash-based embedding (set EMBEDDING_MODEL + EMBEDDING_API_KEY for real embeddings)")
-        _embed_fn = _hash_embed
-    return _embed_fn
-
-
-def _make_api_embed_fn(api_key: str, base_url: str, model: str) -> EmbedFn:
-    def _api_embed(text: str, dim: int = 1536) -> List[float]:
-        url = f"{base_url}/v1/embeddings"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {"model": model, "input": text}
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            vector = data["data"][0]["embedding"]
-            if len(vector) != dim:
-                vector = vector[:dim] if len(vector) > dim else vector + [0.0] * (dim - len(vector))
-            return vector
-        except Exception as exc:
-            logger.warning("Embedding API failed, falling back to hash: %s", exc)
-            return _hash_embed(text, dim)
-    return _api_embed
-
-
-def _hash_embed(text: str, dim: int = 64) -> List[float]:
-    tokens = re.findall(r"[A-Za-z0-9_\-]+", text.lower())
-    vec = [0.0] * dim
-    for tok in tokens:
-        idx = (hash(tok) % dim + dim) % dim
-        vec[idx] += 1.0
-    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-    return [v / norm for v in vec]
-
-
-def embed_text(text: str, dim: int = 64) -> List[float]:
-    fn = get_embed_fn()
-    return fn(text, dim)
 
 
 class InMemoryQdrant:
@@ -147,16 +85,6 @@ class QdrantClientAdapter:
             collection_name=self._collection,
             vectors_config=rest.VectorParams(size=self._dim, distance=rest.Distance.COSINE),
         )
-
-
-def embed_text(text: str, dim: int = 64) -> List[float]:
-    tokens = re.findall(r"[A-Za-z0-9_\-]+", text.lower())
-    vec = [0.0] * dim
-    for tok in tokens:
-        idx = (hash(tok) % dim + dim) % dim
-        vec[idx] += 1.0
-    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-    return [v / norm for v in vec]
 
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:

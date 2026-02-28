@@ -10,7 +10,7 @@ from ..reliability import safe_tool_call
 logger = logging.getLogger(__name__)
 
 
-def synthesize_node(state: AgentState, services: Any) -> AgentState:
+async def synthesize_node(state: AgentState, services: Any) -> AgentState:
     if not state.evidence:
         state.draft = Draft(answer_text="未找到可用证据。")
         return state
@@ -18,7 +18,7 @@ def synthesize_node(state: AgentState, services: Any) -> AgentState:
     llm = getattr(services, "llm", None)
     if llm and getattr(llm, "enabled", False):
         try:
-            claims, used_citations, insufficient, missing = safe_tool_call(
+            claims, used_citations, insufficient, missing = await safe_tool_call(
                 "synthesize", _llm_build_claims, state, llm
             )
             claim_lines = _render_claim_lines(claims)
@@ -50,7 +50,7 @@ def synthesize_node(state: AgentState, services: Any) -> AgentState:
     return state
 
 
-def _llm_build_claims(
+async def _llm_build_claims(
     state: AgentState,
     llm: Any,
 ) -> Tuple[List[dict], List[Citation], bool, List[str]]:
@@ -93,7 +93,7 @@ def _llm_build_claims(
         "required": ["claims", "insufficient", "missing"],
         "additionalProperties": False,
     }
-    result = llm.chat_json(system=system, user=user, schema=schema)
+    result = await llm.chat_json(system=system, user=user, schema=schema)
     claims = result.get("claims", []) or []
     insufficient = bool(result.get("insufficient"))
     missing = result.get("missing", []) or []

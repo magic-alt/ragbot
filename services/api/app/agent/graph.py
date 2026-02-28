@@ -8,8 +8,11 @@ from typing import Protocol
 from ..llm.provider import ModelProvider, build_model_provider
 from ..observability.tracing import RequestTracer
 from ..observability.metrics import build_request_metrics, get_metrics_collector
+from ..retrieval.cross_encoder import NoOpReranker, Reranker
+from ..retrieval.embedder import Embedder, HashEmbedder
 from ..retrieval.qdrant import InMemoryQdrant
 from ..retrieval.service import Retriever
+from ..storage.protocol import Repo
 from ..storage.repo import InMemoryRepo
 from .callbacks import AgentEvent, EventCallback, NullCallback
 from .nodes.code import CodeSearch, code_node, open_file_node, apply_patch_node, explain_error_node
@@ -50,18 +53,22 @@ class SqlEngineInterface(Protocol):
 
 @dataclass
 class AgentServices:
-    repo: InMemoryRepo
+    repo: Repo
     qdrant: QdrantInterface
     retriever: Retriever
     sql_engine: SqlEngineInterface
     code_search: CodeSearch
     llm: ModelProvider
+    embedder: Embedder = None  # type: ignore[assignment]
+    reranker: Reranker = None  # type: ignore[assignment]
 
 
 def build_default_services(repo: Optional[InMemoryRepo] = None) -> AgentServices:
     repo = repo or InMemoryRepo()
     qdrant = InMemoryQdrant()
-    retriever = Retriever(repo, qdrant)
+    embedder = HashEmbedder()
+    reranker = NoOpReranker()
+    retriever = Retriever(repo, qdrant, embedder=embedder, reranker=reranker)
     sql_engine = SqlEngine(repo)
     code_search = CodeSearch(repo_roots={"default": "."})
     llm = build_model_provider()
@@ -72,10 +79,12 @@ def build_default_services(repo: Optional[InMemoryRepo] = None) -> AgentServices
         sql_engine=sql_engine,
         code_search=code_search,
         llm=llm,
+        embedder=embedder,
+        reranker=reranker,
     )
 
 
-def run_agent(
+async def run_agent(
     query: str,
     tenant_id: str,
     user_id: str,
@@ -102,7 +111,7 @@ def run_agent(
         state.evidence.extend(initial_evidence)
 
     with tracer.span("route") as s:
-        state = route_node(state, services)
+        state = await route_node(state, services)
         s.attributes["route"] = state.route or ""
     cb.emit(AgentEvent("route", {"route": state.route, "request_id": state.request_id}))
 
@@ -113,19 +122,19 @@ def run_agent(
 
         with tracer.span(action, iteration=state.iteration) as s:
             if action == "sql_query":
-                state = sql_node(state, services)
+                state = await sql_node(state, services)
             elif action == "code_search":
-                state = code_node(state, services)
+                state = await code_node(state, services)
             elif action == "open_file":
-                state = open_file_node(state, services)
+                state = await open_file_node(state, services)
             elif action == "apply_patch":
-                state = apply_patch_node(state, services)
+                state = await apply_patch_node(state, services)
             elif action == "explain_error":
-                state = explain_error_node(state, services)
+                state = await explain_error_node(state, services)
             elif action == "retrieve":
-                state = retrieve_node(state, services)
+                state = await retrieve_node(state, services)
             elif action == "web_search":
-                state = web_node(state, services)
+                state = await web_node(state, services)
 
             new_calls = state.tool_calls[prev_calls:]
             s.attributes["tool_calls"] = len(new_calls)
@@ -144,15 +153,15 @@ def run_agent(
             }))
 
         with tracer.span("synthesize", iteration=state.iteration):
-            state = synthesize_node(state, services)
+            state = await synthesize_node(state, services)
         with tracer.span("verify", iteration=state.iteration):
-            state = verify_node(state, services)
+            state = await verify_node(state, services)
         if not _should_continue(state):
             break
         action = _next_step(state)
 
     with tracer.span("finalize"):
-        state = finalize_node(state, services)
+        state = await finalize_node(state, services)
 
     if state.final:
         cb.emit(AgentEvent("final", {

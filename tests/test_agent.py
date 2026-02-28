@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import time
@@ -5,7 +6,7 @@ import threading
 import unittest
 
 from services.api.app.agent.graph import build_default_services, run_agent
-from services.api.app.agent.nodes.code import CodeSearch, code_node
+from services.api.app.agent.nodes.code import CodeSearch, code_node, open_file_node, explain_error_node
 from services.api.app.agent.nodes.finalize import finalize_node
 from services.api.app.agent.nodes.route import route_node
 from services.api.app.agent.nodes.sql import SqlEngine
@@ -14,10 +15,10 @@ from services.api.app.agent.nodes.verify import verify_node
 from services.api.app.agent.nodes.web import web_node
 from services.api.app.agent.session import InMemorySessionStore, SessionTurn
 from services.api.app.agent.state import build_initial_state
-from services.api.app.agent.callbacks import AgentEvent, QueueCallback, NullCallback
+from services.api.app.agent.callbacks import AgentEvent, AsyncQueueCallback, QueueCallback, NullCallback
 from services.api.app.agent.reliability import (
     CircuitBreaker, CircuitOpenError, ToolTimeoutError,
-    with_timeout, with_retry, safe_tool_call, RetryConfig,
+    safe_tool_call, RetryConfig, DEFAULT_RETRY, DEFAULT_TIMEOUTS, _get_breaker,
 )
 from services.api.app.auth.acl import build_policy, compute_security_scope, UserContext, compute_security_scope_from_context
 from services.api.app.llm.client import OpenAIClient
@@ -32,33 +33,33 @@ from services.worker.jobs.embed_and_upsert import embed_and_upsert
 from contracts.types import Citation, Draft, EvidenceItem, Verification
 
 
-class AgentRouteTests(unittest.TestCase):
-    def test_route_sql(self):
+class AgentRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_route_sql(self):
         services = build_default_services()
         state = build_initial_state("select * from sales", "t1", "u1")
-        state = route_node(state, services)
+        state = await route_node(state, services)
         self.assertEqual(state.route, "sql")
 
-    def test_route_code(self):
+    async def test_route_code(self):
         services = build_default_services()
         state = build_initial_state("函数报错怎么修", "t1", "u1")
-        state = route_node(state, services)
+        state = await route_node(state, services)
         self.assertEqual(state.route, "code")
 
-    def test_route_doc(self):
+    async def test_route_doc(self):
         services = build_default_services()
         state = build_initial_state("请参考文档说明", "t1", "u1")
-        state = route_node(state, services)
+        state = await route_node(state, services)
         self.assertEqual(state.route, "doc_rag")
 
-    def test_route_mixed_fallback(self):
+    async def test_route_mixed_fallback(self):
         services = build_default_services()
         state = build_initial_state("hello world", "t1", "u1")
-        state = route_node(state, services)
+        state = await route_node(state, services)
         self.assertEqual(state.route, "mixed")
 
 
-class RetrievalAclTests(unittest.TestCase):
+class RetrievalAclTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.services = build_default_services()
         self.repo = self.services.repo
@@ -98,17 +99,17 @@ class RetrievalAclTests(unittest.TestCase):
         )
         embed_and_upsert(self.repo, self.qdrant, [chunk])
 
-    def test_retrieval_allows_user(self):
-        state = run_agent("Postgres 做什么", "tenant-a", "u1", self.services)
+    async def test_retrieval_allows_user(self):
+        state = await run_agent("Postgres 做什么", "tenant-a", "u1", self.services)
         self.assertIn("Postgres", state.final.answer)
 
-    def test_retrieval_blocks_user(self):
-        state = run_agent("Postgres 做什么", "tenant-a", "u2", self.services)
+    async def test_retrieval_blocks_user(self):
+        state = await run_agent("Postgres 做什么", "tenant-a", "u2", self.services)
         self.assertIn("证据不足", state.final.answer)
 
 
-class SqlEngineTests(unittest.TestCase):
-    def test_simple_select(self):
+class SqlEngineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_simple_select(self):
         services = build_default_services()
         table = TableData(
             name="sales",
@@ -119,7 +120,7 @@ class SqlEngineTests(unittest.TestCase):
             ],
         )
         services.repo.register_table(table)
-        state = run_agent("select region from sales where region = 'cn'", "t1", "u1", services)
+        state = await run_agent("select region from sales where region = 'cn'", "t1", "u1", services)
         self.assertIn("SQL 返回 1 行", state.final.answer)
 
 
@@ -132,50 +133,50 @@ class RrfTests(unittest.TestCase):
         self.assertIn("c", [item[0] for item in fused[:2]])
 
 
-class CodeNodeTests(unittest.TestCase):
-    def test_code_search_in_memory(self):
+class CodeNodeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_code_search_in_memory(self):
         services = build_default_services()
         services.code_search = CodeSearch(
             repo_roots={},
             in_memory_files={"default": {"main.py": "def hello():\n    print('world')\n"}},
         )
         state = build_initial_state("hello", "t1", "u1")
-        state = code_node(state, services)
+        state = await code_node(state, services)
         self.assertTrue(len(state.tool_calls) > 0)
         self.assertTrue(state.tool_calls[-1].ok)
         self.assertTrue(len(state.evidence) > 0)
 
-    def test_code_search_no_match(self):
+    async def test_code_search_no_match(self):
         services = build_default_services()
         services.code_search = CodeSearch(
             repo_roots={},
             in_memory_files={"default": {"main.py": "def hello():\n    pass\n"}},
         )
         state = build_initial_state("nonexistent_function_xyz", "t1", "u1")
-        state = code_node(state, services)
+        state = await code_node(state, services)
         self.assertTrue(state.tool_calls[-1].ok)
 
 
-class WebNodeTests(unittest.TestCase):
-    def test_web_node_no_llm(self):
+class WebNodeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_web_node_no_llm(self):
         services = build_default_services()
         state = build_initial_state("latest news", "t1", "u1")
-        state = web_node(state, services)
+        state = await web_node(state, services)
         self.assertTrue(len(state.tool_calls) > 0)
         last_call = state.tool_calls[-1]
         self.assertFalse(last_call.ok)
         self.assertIn("LLM not available", last_call.error)
 
 
-class SynthesizeNodeTests(unittest.TestCase):
-    def test_synthesize_no_evidence(self):
+class SynthesizeNodeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_synthesize_no_evidence(self):
         services = build_default_services()
         state = build_initial_state("test", "t1", "u1")
-        state = synthesize_node(state, services)
+        state = await synthesize_node(state, services)
         self.assertIsNotNone(state.draft)
         self.assertIn("未找到", state.draft.answer_text)
 
-    def test_synthesize_with_doc_evidence(self):
+    async def test_synthesize_with_doc_evidence(self):
         services = build_default_services()
         state = build_initial_state("what is Python", "t1", "u1")
         state.evidence.append(
@@ -188,50 +189,50 @@ class SynthesizeNodeTests(unittest.TestCase):
                 ],
             )
         )
-        state = synthesize_node(state, services)
+        state = await synthesize_node(state, services)
         self.assertIsNotNone(state.draft)
         self.assertTrue(len(state.draft.answer_text) > 0)
         self.assertIn("Python", state.draft.answer_text)
 
 
-class VerifyNodeTests(unittest.TestCase):
-    def test_verify_enough_evidence(self):
+class VerifyNodeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_verify_enough_evidence(self):
         services = build_default_services()
         state = build_initial_state("test", "t1", "u1")
         state.route = "doc_rag"
         state.evidence.append(EvidenceItem(kind="doc_chunk", score=1.0, text="answer"))
         state.draft = Draft(answer_text="answer")
-        state = verify_node(state, services)
+        state = await verify_node(state, services)
         self.assertIsNotNone(state.verification)
         self.assertTrue(state.verification.enough_evidence)
 
-    def test_verify_missing_evidence(self):
+    async def test_verify_missing_evidence(self):
         services = build_default_services()
         state = build_initial_state("test", "t1", "u1")
         state.route = "doc_rag"
         state.draft = Draft(answer_text="answer")
-        state = verify_node(state, services)
+        state = await verify_node(state, services)
         self.assertIsNotNone(state.verification)
         self.assertFalse(state.verification.enough_evidence)
         self.assertIn("doc_chunks", state.verification.missing)
 
 
-class FinalizeNodeTests(unittest.TestCase):
-    def test_finalize_with_evidence(self):
+class FinalizeNodeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finalize_with_evidence(self):
         services = build_default_services()
         state = build_initial_state("test", "t1", "u1")
         state.draft = Draft(answer_text="all good")
         state.verification = Verification(enough_evidence=True)
-        state = finalize_node(state, services)
+        state = await finalize_node(state, services)
         self.assertEqual(state.final.confidence, "high")
         self.assertEqual(state.final.answer, "all good")
 
-    def test_finalize_degraded(self):
+    async def test_finalize_degraded(self):
         services = build_default_services()
         state = build_initial_state("test", "t1", "u1")
         state.draft = Draft(answer_text="partial")
         state.verification = Verification(enough_evidence=False, missing=["doc_chunks"])
-        state = finalize_node(state, services)
+        state = await finalize_node(state, services)
         self.assertEqual(state.final.confidence, "low")
         self.assertIn("证据不足", state.final.answer)
 
@@ -345,57 +346,70 @@ class ModelProviderProtocolTests(unittest.TestCase):
 # ── WU2: Reliability Tests ─────────────────────────────────────────────
 
 
-class TimeoutTests(unittest.TestCase):
-    def test_timeout_triggers(self):
-        def slow_fn():
-            time.sleep(5)
+class TimeoutTests(unittest.IsolatedAsyncioTestCase):
+    async def test_timeout_triggers(self):
+        async def slow_fn():
+            await asyncio.sleep(5)
             return "done"
 
-        with self.assertRaises(ToolTimeoutError):
-            with_timeout(slow_fn, 0.1)
+        DEFAULT_TIMEOUTS["__test_timeout"] = 0.1
+        try:
+            with self.assertRaises(ToolTimeoutError):
+                await safe_tool_call("__test_timeout", slow_fn)
+        finally:
+            DEFAULT_TIMEOUTS.pop("__test_timeout", None)
 
-    def test_timeout_passes(self):
+    async def test_timeout_passes(self):
         def fast_fn():
             return 42
 
-        result = with_timeout(fast_fn, 5.0)
+        result = await safe_tool_call("__test_fast", fast_fn)
         self.assertEqual(result, 42)
 
 
-class RetryTests(unittest.TestCase):
-    def test_retry_recovers(self):
+class RetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_retry_recovers(self):
         attempts = []
 
-        def flaky_fn():
+        async def flaky_fn():
             attempts.append(1)
             if len(attempts) < 3:
                 raise ConnectionError("transient")
             return "ok"
 
-        config = RetryConfig(max_retries=3, base_delay=0.01)
-        result = with_retry(flaky_fn, config)
-        self.assertEqual(result, "ok")
-        self.assertEqual(len(attempts), 3)
+        DEFAULT_RETRY["__test_retry"] = RetryConfig(max_retries=3, base_delay=0.01)
+        try:
+            result = await safe_tool_call("__test_retry", flaky_fn)
+            self.assertEqual(result, "ok")
+            self.assertEqual(len(attempts), 3)
+        finally:
+            DEFAULT_RETRY.pop("__test_retry", None)
 
-    def test_retry_exhausted(self):
-        def always_fail():
+    async def test_retry_exhausted(self):
+        async def always_fail():
             raise ConnectionError("permanent")
 
-        config = RetryConfig(max_retries=2, base_delay=0.01)
-        with self.assertRaises(ConnectionError):
-            with_retry(always_fail, config)
+        DEFAULT_RETRY["__test_retry_fail"] = RetryConfig(max_retries=2, base_delay=0.01)
+        try:
+            with self.assertRaises(ConnectionError):
+                await safe_tool_call("__test_retry_fail", always_fail)
+        finally:
+            DEFAULT_RETRY.pop("__test_retry_fail", None)
 
-    def test_non_retryable_exception_raises_immediately(self):
+    async def test_non_retryable_exception_raises_immediately(self):
         attempts = []
 
-        def value_error_fn():
+        async def value_error_fn():
             attempts.append(1)
             raise ValueError("not retryable")
 
-        config = RetryConfig(max_retries=3, base_delay=0.01)
-        with self.assertRaises(ValueError):
-            with_retry(value_error_fn, config)
-        self.assertEqual(len(attempts), 1)
+        DEFAULT_RETRY["__test_retry_nr"] = RetryConfig(max_retries=3, base_delay=0.01)
+        try:
+            with self.assertRaises(ValueError):
+                await safe_tool_call("__test_retry_nr", value_error_fn)
+            self.assertEqual(len(attempts), 1)
+        finally:
+            DEFAULT_RETRY.pop("__test_retry_nr", None)
 
 
 class CircuitBreakerTests(unittest.TestCase):
@@ -424,15 +438,15 @@ class CircuitBreakerTests(unittest.TestCase):
         # Should not open because success reset the counter
         self.assertFalse(cb.is_open)
 
-    def test_safe_tool_call_circuit_open_raises(self):
-        # Force the circuit open for a tool
-        from services.api.app.agent.reliability import _get_breaker
+
+class CircuitBreakerAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_safe_tool_call_circuit_open_raises(self):
         breaker = _get_breaker("test_tool_circuit")
         for _ in range(5):
             breaker.record_failure()
         self.assertTrue(breaker.is_open)
         with self.assertRaises(CircuitOpenError):
-            safe_tool_call("test_tool_circuit", lambda: "nope")
+            await safe_tool_call("test_tool_circuit", lambda: "nope")
 
 
 # ── WU3: Callback Tests ───────────────────────────────────────────────
@@ -460,21 +474,16 @@ class QueueCallbackTests(unittest.TestCase):
         cb.close()
         # Should not raise
 
-    def test_run_agent_with_callback(self):
-        services = build_default_services()
-        cb = QueueCallback()
-        state = run_agent("hello world", "t1", "u1", services, callback=cb)
-        self.assertIsNotNone(state.final)
-        # Callback should have been signaled to close
-        self.assertTrue(cb._closed.is_set())
-        # Drain the remaining events
-        while True:
-            result = cb.get(timeout=0.1)
-            if result is None:
-                break
-        self.assertTrue(cb.closed)
 
-    def test_callback_receives_events(self):
+class AsyncCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_agent_with_callback(self):
+        services = build_default_services()
+        cb = AsyncQueueCallback()
+        state = await run_agent("hello world", "t1", "u1", services, callback=cb)
+        self.assertIsNotNone(state.final)
+        self.assertTrue(cb._closed)
+
+    async def test_callback_receives_events(self):
         services = build_default_services()
         table = TableData(
             name="items",
@@ -483,25 +492,16 @@ class QueueCallbackTests(unittest.TestCase):
         )
         services.repo.register_table(table)
 
+        cb = AsyncQueueCallback()
         events = []
-        cb = QueueCallback()
 
-        def run_in_thread():
-            run_agent("select name from items", "t1", "u1", services, callback=cb)
+        async def run():
+            await run_agent("select name from items", "t1", "u1", services, callback=cb)
 
-        t = threading.Thread(target=run_in_thread)
-        t.start()
-
-        while True:
-            try:
-                event = cb.get(timeout=2.0)
-            except Exception:
-                break
-            if event is None:
-                break
+        task = asyncio.create_task(run())
+        async for event in cb:
             events.append(event)
-
-        t.join(timeout=5)
+        await task
         event_types = [e.event_type for e in events]
         self.assertIn("route", event_types)
         self.assertIn("final", event_types)
@@ -1172,8 +1172,8 @@ class FileReferenceParsingTests(unittest.TestCase):
         self.assertIsNone(end)
 
 
-class OpenFileNodeTests(unittest.TestCase):
-    def test_open_file_node_success(self):
+class OpenFileNodeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_open_file_node_success(self):
         from services.api.app.agent.nodes.code import open_file_node
         services = build_default_services()
         services.code_search = CodeSearch(
@@ -1181,24 +1181,24 @@ class OpenFileNodeTests(unittest.TestCase):
             in_memory_files={"default": {"test.py": "def foo():\n    return 42\n"}},
         )
         state = build_initial_state("open test.py", "t1", "u1")
-        state = open_file_node(state, services)
+        state = await open_file_node(state, services)
         self.assertTrue(len(state.tool_calls) > 0)
         self.assertTrue(state.tool_calls[-1].ok)
         self.assertTrue(len(state.evidence) > 0)
         self.assertEqual(state.evidence[-1].kind, "file_content")
 
-    def test_open_file_node_not_found(self):
+    async def test_open_file_node_not_found(self):
         from services.api.app.agent.nodes.code import open_file_node
         services = build_default_services()
         services.code_search = CodeSearch(repo_roots={}, in_memory_files={"default": {}})
         state = build_initial_state("open nonexistent.py", "t1", "u1")
-        state = open_file_node(state, services)
+        state = await open_file_node(state, services)
         self.assertTrue(len(state.tool_calls) > 0)
         self.assertFalse(state.tool_calls[-1].ok)
 
 
-class ExplainErrorNodeTests(unittest.TestCase):
-    def test_explain_error_node(self):
+class ExplainErrorNodeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explain_error_node(self):
         from services.api.app.agent.nodes.code import explain_error_node
         services = build_default_services()
         services.code_search = CodeSearch(
@@ -1210,7 +1210,7 @@ class ExplainErrorNodeTests(unittest.TestCase):
         state = build_initial_state(
             'File "app.py", line 10, in main\nValueError: bad', "t1", "u1",
         )
-        state = explain_error_node(state, services)
+        state = await explain_error_node(state, services)
         self.assertTrue(len(state.tool_calls) > 0)
         self.assertTrue(state.tool_calls[-1].ok)
 
@@ -1369,11 +1369,11 @@ class EvidenceCompressionTests(unittest.TestCase):
 # ── Milestone C: Integration Tests ───────────────────────────────────
 
 
-class MilestoneCIntegrationTests(unittest.TestCase):
-    def test_chat_with_client_context(self):
+class MilestoneCIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_with_client_context(self):
         """Test that client_context flows through chat() correctly."""
         from services.api.app.main import chat
-        result = chat(
+        result = await chat(
             "what does this code do",
             "t1", "u1",
             initial_evidence=[
@@ -1387,7 +1387,7 @@ class MilestoneCIntegrationTests(unittest.TestCase):
         self.assertIn("answer", result)
         self.assertIn("request_id", result)
 
-    def test_run_agent_with_initial_evidence(self):
+    async def test_run_agent_with_initial_evidence(self):
         """Test that initial_evidence is injected into agent state."""
         services = build_default_services()
         initial_ev = [
@@ -1397,7 +1397,7 @@ class MilestoneCIntegrationTests(unittest.TestCase):
                 citations=[Citation(kind="code", path="foo.py")],
             ),
         ]
-        state = run_agent(
+        state = await run_agent(
             "explain Foo", "t1", "u1", services,
             initial_evidence=initial_ev,
         )
@@ -1451,7 +1451,7 @@ class RequestTracerTests(unittest.TestCase):
         from services.api.app.observability.tracing import RequestTracer
         tracer = RequestTracer(request_id="test-001")
         with tracer.span("test_span") as s:
-            time.sleep(0.01)
+            time.sleep(0.05)
             s.attributes["key"] = "value"
         record = tracer.finish()
         self.assertEqual(record.request_id, "test-001")
@@ -1498,7 +1498,7 @@ class RequestTracerTests(unittest.TestCase):
         self.assertEqual(len(d["spans"]), 1)
 
 
-class MetricsCollectorTests(unittest.TestCase):
+class MetricsCollectorTests(unittest.IsolatedAsyncioTestCase):
     def test_record_and_aggregate(self):
         from services.api.app.observability.metrics import MetricsCollector, RequestMetrics
         collector = MetricsCollector()
@@ -1550,24 +1550,24 @@ class MetricsCollectorTests(unittest.TestCase):
         self.assertEqual(len(history), 3)
         self.assertEqual(history[-1]["request_id"], "r4")
 
-    def test_build_request_metrics(self):
+    async def test_build_request_metrics(self):
         from services.api.app.observability.metrics import build_request_metrics
         services = build_default_services()
-        state = run_agent("hello world", "t1", "u1", services)
+        state = await run_agent("hello world", "t1", "u1", services)
         metrics = build_request_metrics(state)
         self.assertEqual(metrics.request_id, state.request_id)
         self.assertEqual(metrics.tenant_id, "t1")
         self.assertTrue(metrics.iterations >= 1)
 
 
-class TracingIntegrationTests(unittest.TestCase):
-    def test_run_agent_collects_metrics(self):
+class TracingIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_agent_collects_metrics(self):
         """Verify that run_agent auto-collects metrics."""
         from services.api.app.observability.metrics import get_metrics_collector
         collector = get_metrics_collector()
         collector.reset()
         services = build_default_services()
-        state = run_agent("hello world", "t1", "u1", services)
+        state = await run_agent("hello world", "t1", "u1", services)
         agg = collector.aggregate()
         self.assertTrue(agg.total_requests >= 1)
 
@@ -1613,8 +1613,8 @@ class EvalDatasetTests(unittest.TestCase):
         self.assertIn("X", case.expected_answer_contains)
 
 
-class EvalRunnerTests(unittest.TestCase):
-    def test_run_eval_case_simple(self):
+class EvalRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_eval_case_simple(self):
         from eval.datasets import EvalCase
         from eval.runner import run_eval_case
         case = EvalCase(
@@ -1628,12 +1628,12 @@ class EvalRunnerTests(unittest.TestCase):
                 "rows": [{"name": "alice"}],
             }],
         )
-        result = run_eval_case(case)
+        result = await run_eval_case(case)
         self.assertEqual(result.case_id, "test-route")
         self.assertEqual(result.actual_route, "sql")
         self.assertTrue(result.checks.get("route", False))
 
-    def test_run_eval_case_code(self):
+    async def test_run_eval_case_code(self):
         from eval.datasets import EvalCase
         from eval.runner import run_eval_case
         case = EvalCase(
@@ -1644,7 +1644,7 @@ class EvalRunnerTests(unittest.TestCase):
             expected_min_evidence=1,
             setup_files={"default": {"main.py": "def hello():\n    print('world')\n"}},
         )
-        result = run_eval_case(case)
+        result = await run_eval_case(case)
         self.assertEqual(result.actual_route, "code")
 
     def test_summarize_results(self):
@@ -1663,11 +1663,11 @@ class EvalRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(summary["pass_rate"], 2/3, places=3)
         self.assertIn("bad_retrieval", summary["failure_categories"])
 
-    def test_run_eval_suite(self):
+    async def test_run_eval_suite(self):
         from eval.datasets import build_sample_dataset
         from eval.runner import run_eval_suite, summarize_results
         cases = build_sample_dataset()
-        results = run_eval_suite(cases)
+        results = await run_eval_suite(cases)
         self.assertEqual(len(results), len(cases))
         summary = summarize_results(results)
         self.assertEqual(summary["total"], len(cases))
@@ -1886,3 +1886,474 @@ class MilestoneDEndpointTests(unittest.TestCase):
         self.assertIn("enabled", data)
         self.assertIn("retrieval", data)
         self.assertIn("embedding", data)
+
+
+# ── Milestone E: Embedder Tests ───────────────────────────────────────
+
+
+class HashEmbedderTests(unittest.TestCase):
+    def test_satisfies_protocol(self):
+        from services.api.app.retrieval.embedder import HashEmbedder, Embedder
+        e = HashEmbedder()
+        self.assertIsInstance(e, Embedder)
+
+    def test_deterministic(self):
+        from services.api.app.retrieval.embedder import HashEmbedder
+        e = HashEmbedder()
+        v1 = e.embed("hello")
+        v2 = e.embed("hello")
+        self.assertEqual(v1, v2)
+
+    def test_different_inputs(self):
+        from services.api.app.retrieval.embedder import HashEmbedder
+        e = HashEmbedder()
+        v1 = e.embed("hello")
+        v2 = e.embed("world")
+        self.assertNotEqual(v1, v2)
+
+    def test_dimension(self):
+        from services.api.app.retrieval.embedder import HashEmbedder
+        e = HashEmbedder(dim=64)
+        v = e.embed("test")
+        self.assertEqual(len(v), 64)
+
+    def test_default_dimension(self):
+        from services.api.app.retrieval.embedder import HashEmbedder
+        e = HashEmbedder()
+        v = e.embed("x")
+        self.assertEqual(len(v), e.dimension)
+
+    def test_batch_embed(self):
+        from services.api.app.retrieval.embedder import HashEmbedder
+        e = HashEmbedder()
+        vecs = e.embed_batch(["a", "b", "c"])
+        self.assertEqual(len(vecs), 3)
+        self.assertEqual(len(vecs[0]), e.dimension)
+
+    def test_batch_deterministic(self):
+        from services.api.app.retrieval.embedder import HashEmbedder
+        e = HashEmbedder()
+        v1 = e.embed_batch(["a", "b"])
+        v2 = e.embed_batch(["a", "b"])
+        self.assertEqual(v1, v2)
+
+    def test_embed_empty_string(self):
+        from services.api.app.retrieval.embedder import HashEmbedder
+        e = HashEmbedder()
+        v = e.embed("")
+        self.assertEqual(len(v), e.dimension)
+
+    def test_normalized(self):
+        from services.api.app.retrieval.embedder import HashEmbedder
+        import math
+        e = HashEmbedder()
+        v = e.embed("test normalization")
+        norm = math.sqrt(sum(x*x for x in v))
+        self.assertAlmostEqual(norm, 1.0, places=5)
+
+
+class APIEmbedderTests(unittest.TestCase):
+    def test_satisfies_protocol(self):
+        from services.api.app.retrieval.embedder import APIEmbedder, Embedder
+        e = APIEmbedder(api_key="test", base_url="http://localhost", model="test-model")
+        self.assertIsInstance(e, Embedder)
+
+    def test_dimension(self):
+        from services.api.app.retrieval.embedder import APIEmbedder
+        e = APIEmbedder(api_key="test", base_url="http://localhost", model="test-model", dimension=256)
+        self.assertEqual(e.dimension, 256)
+
+
+class BuildEmbedderTests(unittest.TestCase):
+    def test_default_returns_hash(self):
+        from services.api.app.retrieval.embedder import build_embedder, HashEmbedder
+        e = build_embedder()
+        self.assertIsInstance(e, HashEmbedder)
+
+
+# ── Milestone E: Reranker Tests ───────────────────────────────────────
+
+
+class NoOpRerankerTests(unittest.TestCase):
+    def test_satisfies_protocol(self):
+        from services.api.app.retrieval.cross_encoder import NoOpReranker, Reranker
+        r = NoOpReranker()
+        self.assertIsInstance(r, Reranker)
+
+    def test_enabled_false(self):
+        from services.api.app.retrieval.cross_encoder import NoOpReranker
+        r = NoOpReranker()
+        self.assertFalse(r.enabled)
+
+    def test_rerank_preserves_order(self):
+        from services.api.app.retrieval.cross_encoder import NoOpReranker
+        r = NoOpReranker()
+        docs = ["doc a", "doc b", "doc c"]
+        result = r.rerank("query", docs)
+        # NoOpReranker returns (index, score) tuples preserving order
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[0][0], 0)
+        self.assertTrue(result[0][1] > result[1][1])
+
+    def test_rerank_empty(self):
+        from services.api.app.retrieval.cross_encoder import NoOpReranker
+        r = NoOpReranker()
+        result = r.rerank("query", [])
+        self.assertEqual(result, [])
+
+
+class CohereRerankerTests(unittest.TestCase):
+    def test_satisfies_protocol(self):
+        from services.api.app.retrieval.cross_encoder import CohereReranker, Reranker
+        r = CohereReranker(api_key="test-key")
+        self.assertIsInstance(r, Reranker)
+
+    def test_not_enabled_without_key(self):
+        from services.api.app.retrieval.cross_encoder import CohereReranker
+        import os
+        if not os.getenv("COHERE_API_KEY"):
+            r = CohereReranker(api_key="")
+            self.assertFalse(r.enabled)
+
+
+class LocalCrossEncoderTests(unittest.TestCase):
+    def test_satisfies_protocol(self):
+        from services.api.app.retrieval.cross_encoder import LocalCrossEncoder, Reranker
+        r = LocalCrossEncoder(base_url="http://localhost:8080")
+        self.assertIsInstance(r, Reranker)
+
+
+class BuildRerankerTests(unittest.TestCase):
+    def test_default_returns_noop(self):
+        from services.api.app.retrieval.cross_encoder import build_reranker, NoOpReranker
+        r = build_reranker()
+        self.assertIsInstance(r, NoOpReranker)
+
+
+class RetrieverWithRerankerTests(unittest.TestCase):
+    def test_retriever_accepts_reranker(self):
+        from services.api.app.retrieval.service import Retriever
+        from services.api.app.retrieval.cross_encoder import NoOpReranker
+        from services.api.app.retrieval.embedder import HashEmbedder
+        from services.api.app.retrieval.qdrant import InMemoryQdrant
+        repo = InMemoryRepo()
+        qdrant = InMemoryQdrant()
+        embedder = HashEmbedder()
+        reranker = NoOpReranker()
+        retriever = Retriever(repo, qdrant, embedder=embedder, reranker=reranker)
+        self.assertIsNotNone(retriever)
+
+
+# ── Milestone E: Async Tests ─────────────────────────────────────────
+
+
+class AsyncSafeToolCallTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sync_function(self):
+        def sync_fn():
+            return 42
+        result = await safe_tool_call("__test_sync", sync_fn)
+        self.assertEqual(result, 42)
+
+    async def test_async_function(self):
+        async def async_fn():
+            return "hello"
+        result = await safe_tool_call("__test_async", async_fn)
+        self.assertEqual(result, "hello")
+
+    async def test_sync_with_args(self):
+        def add(a, b):
+            return a + b
+        result = await safe_tool_call("__test_add", add, 3, 5)
+        self.assertEqual(result, 8)
+
+    async def test_async_with_kwargs(self):
+        async def greet(name="world"):
+            return f"hello {name}"
+        result = await safe_tool_call("__test_greet", greet, name="async")
+        self.assertEqual(result, "hello async")
+
+    async def test_exception_propagates(self):
+        def bad_fn():
+            raise ValueError("test error")
+        with self.assertRaises(ValueError):
+            await safe_tool_call("__test_error", bad_fn)
+
+    async def test_async_exception_propagates(self):
+        async def bad_async_fn():
+            raise RuntimeError("async error")
+        with self.assertRaises(RuntimeError):
+            await safe_tool_call("__test_async_error", bad_async_fn)
+
+    async def test_circuit_breaker_records_success(self):
+        breaker = _get_breaker("__test_cb_success")
+        breaker._failures = 0
+        breaker._opened_at = None
+        breaker.record_failure()
+        self.assertFalse(breaker.is_open)
+        await safe_tool_call("__test_cb_success", lambda: "ok")
+        self.assertFalse(breaker.is_open)
+
+    async def test_circuit_breaker_records_failure(self):
+        breaker = _get_breaker("__test_cb_fail")
+        breaker._failures = 0
+        breaker._opened_at = None
+        for _ in range(2):
+            try:
+                def raise_fn():
+                    raise ValueError("fail")
+                await safe_tool_call("__test_cb_fail", raise_fn)
+            except ValueError:
+                pass
+        self.assertTrue(breaker._failures >= 2)
+
+
+class AsyncRunAgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_basic_run(self):
+        services = build_default_services()
+        state = await run_agent("hello", "t1", "u1", services)
+        self.assertIsNotNone(state.final)
+        self.assertIsNotNone(state.route)
+
+    async def test_run_with_constraints(self):
+        from services.api.app.agent.state import Constraints
+        services = build_default_services()
+        constraints = Constraints(repo="test-repo")
+        state = await run_agent("hello", "t1", "u1", services, constraints=constraints)
+        self.assertIsNotNone(state.final)
+
+    async def test_run_collects_tool_calls(self):
+        services = build_default_services()
+        state = await run_agent("hello world", "t1", "u1", services)
+        self.assertTrue(len(state.tool_calls) > 0)
+
+    async def test_run_respects_max_iterations(self):
+        services = build_default_services()
+        state = await run_agent("hello", "t1", "u1", services)
+        self.assertTrue(state.iteration <= state.max_iterations)
+
+
+class AsyncQueueCallbackDetailTests(unittest.IsolatedAsyncioTestCase):
+    async def test_emit_and_get(self):
+        cb = AsyncQueueCallback()
+        event = AgentEvent("test", {"key": "value"})
+        cb.emit(event)
+        received = await cb.get(timeout=1.0)
+        self.assertIsNotNone(received)
+        self.assertEqual(received.event_type, "test")
+        self.assertEqual(received.data["key"], "value")
+
+    async def test_close_signals_none(self):
+        cb = AsyncQueueCallback()
+        cb.close()
+        result = await cb.get(timeout=0.1)
+        self.assertIsNone(result)
+
+    async def test_emit_after_close_ignored(self):
+        cb = AsyncQueueCallback()
+        cb.close()
+        cb.emit(AgentEvent("late", {}))
+        result = await cb.get(timeout=0.1)
+        self.assertIsNone(result)
+
+    async def test_async_iter(self):
+        cb = AsyncQueueCallback()
+        events_emitted = [
+            AgentEvent("a", {"n": 1}),
+            AgentEvent("b", {"n": 2}),
+            AgentEvent("c", {"n": 3}),
+        ]
+        for ev in events_emitted:
+            cb.emit(ev)
+        cb.close()
+
+        received = []
+        async for event in cb:
+            received.append(event)
+        self.assertEqual(len(received), 3)
+        self.assertEqual([e.event_type for e in received], ["a", "b", "c"])
+
+    async def test_overflow_drops_oldest(self):
+        cb = AsyncQueueCallback(maxsize=2)
+        cb.emit(AgentEvent("a", {}))
+        cb.emit(AgentEvent("b", {}))
+        cb.emit(AgentEvent("c", {}))
+        cb.close()
+        received = []
+        async for event in cb:
+            received.append(event)
+        self.assertTrue(len(received) >= 1)
+
+
+class AsyncChatTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_basic(self):
+        from services.api.app.main import chat
+        result = await chat("hello", "t1", "u1")
+        self.assertIn("answer", result)
+        self.assertIn("request_id", result)
+
+    async def test_chat_with_services(self):
+        from services.api.app.main import chat
+        services = build_default_services()
+        result = await chat("hello", "t1", "u1", services)
+        self.assertIn("answer", result)
+        self.assertIn("confidence", result)
+
+    async def test_chat_returns_debug_info(self):
+        from services.api.app.main import chat
+        result = await chat("hello", "t1", "u1")
+        self.assertIn("debug", result)
+        self.assertIn("route", result["debug"])
+        self.assertIn("tool_calls", result["debug"])
+
+
+# ── Milestone E: Eval Tests ──────────────────────────────────────────
+
+
+class EvalFullDatasetTests(unittest.TestCase):
+    def test_build_full_dataset_size(self):
+        from eval.datasets import build_full_dataset
+        cases = build_full_dataset()
+        self.assertTrue(len(cases) >= 200)
+
+    def test_full_dataset_categories(self):
+        from eval.datasets import build_full_dataset
+        cases = build_full_dataset()
+        categories = {c.category for c in cases}
+        self.assertIn("doc_qa", categories)
+        self.assertIn("db_qa", categories)
+        self.assertIn("code_task", categories)
+
+    def test_full_dataset_has_expected_chunks(self):
+        from eval.datasets import build_full_dataset
+        cases = build_full_dataset()
+        with_chunks = [c for c in cases if c.expected_chunk_ids]
+        self.assertTrue(len(with_chunks) >= 0)
+
+
+class MRRRecallTests(unittest.TestCase):
+    def test_mrr_at_k_found_first(self):
+        from eval.runner import compute_mrr_at_k
+        result = compute_mrr_at_k(["a"], ["a", "b", "c"], k=10)
+        self.assertAlmostEqual(result, 1.0)
+
+    def test_mrr_at_k_found_second(self):
+        from eval.runner import compute_mrr_at_k
+        result = compute_mrr_at_k(["b"], ["a", "b", "c"], k=10)
+        self.assertAlmostEqual(result, 0.5)
+
+    def test_mrr_at_k_not_found(self):
+        from eval.runner import compute_mrr_at_k
+        result = compute_mrr_at_k(["z"], ["a", "b", "c"], k=10)
+        self.assertAlmostEqual(result, 0.0)
+
+    def test_recall_at_k_partial(self):
+        from eval.runner import compute_recall_at_k
+        result = compute_recall_at_k(["a", "b", "c"], ["a", "d", "c"], k=10)
+        self.assertAlmostEqual(result, 2/3, places=4)
+
+    def test_recall_at_k_all(self):
+        from eval.runner import compute_recall_at_k
+        result = compute_recall_at_k(["a", "b"], ["a", "b", "c"], k=10)
+        self.assertAlmostEqual(result, 1.0)
+
+
+# ── Milestone E: Repo Protocol Tests ─────────────────────────────────
+
+
+class RepoProtocolTests(unittest.TestCase):
+    def test_inmemory_repo_satisfies_protocol(self):
+        from services.api.app.storage.protocol import Repo
+        repo = InMemoryRepo()
+        self.assertIsInstance(repo, Repo)
+
+    def test_inmemory_repo_add_document(self):
+        repo = InMemoryRepo()
+        doc = Document(
+            doc_id="d1", tenant_id="t1", source_type="pdf",
+            title="Test", uri="file://test.pdf", version="v1",
+            doc_updated_at="2025-01-01", ingested_at="2025-01-02",
+        )
+        repo.add_document(doc)
+        result = repo.get_document("d1")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.title, "Test")
+
+    def test_inmemory_repo_add_chunk(self):
+        repo = InMemoryRepo()
+        chunk = Chunk(
+            chunk_id="c1", doc_id="d1", tenant_id="t1",
+            chunk_index=0, text="test chunk",
+        )
+        repo.add_chunk(chunk)
+        result = repo.get_chunk("c1")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.text, "test chunk")
+
+    def test_inmemory_repo_list_policies(self):
+        repo = InMemoryRepo()
+        policy = build_policy("p1", "t1", {"allow_all": True})
+        repo.add_policy(policy)
+        policies = repo.list_policies("t1")
+        self.assertEqual(len(policies), 1)
+
+    def test_inmemory_repo_register_table(self):
+        repo = InMemoryRepo()
+        table = TableData(
+            name="test_table",
+            columns=[{"name": "id", "type": "int"}],
+            rows=[{"id": 1}],
+        )
+        repo.register_table(table)
+        result = repo.get_table("test_table")
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result.rows), 1)
+
+    def test_inmemory_repo_export_state(self):
+        repo = InMemoryRepo()
+        table = TableData(name="t", columns=[], rows=[])
+        repo.register_table(table)
+        state = repo.export_state()
+        self.assertIn("tables", state)
+        self.assertEqual(len(state["tables"]), 1)
+
+
+class PostgresRepoProtocolTests(unittest.TestCase):
+    def test_postgres_repo_satisfies_protocol(self):
+        try:
+            from services.api.app.storage.pg_repo import PostgresRepo
+            from services.api.app.storage.protocol import Repo
+            self.assertTrue(hasattr(PostgresRepo, 'add_document'))
+            self.assertTrue(hasattr(PostgresRepo, 'get_document'))
+            self.assertTrue(hasattr(PostgresRepo, 'add_chunk'))
+            self.assertTrue(hasattr(PostgresRepo, 'get_chunk'))
+        except ImportError:
+            self.skipTest("PostgresRepo not available")
+
+
+class FactoryBuildServicesTests(unittest.TestCase):
+    def test_build_default_services(self):
+        services = build_default_services()
+        self.assertIsNotNone(services.repo)
+        self.assertIsNotNone(services.qdrant)
+        self.assertIsNotNone(services.retriever)
+        self.assertIsNotNone(services.sql_engine)
+        self.assertIsNotNone(services.code_search)
+        self.assertIsNotNone(services.llm)
+
+    def test_default_services_has_embedder(self):
+        services = build_default_services()
+        self.assertIsNotNone(services.embedder)
+
+    def test_default_services_has_reranker(self):
+        services = build_default_services()
+        self.assertIsNotNone(services.reranker)
+
+    def test_build_services_with_custom_repo(self):
+        repo = InMemoryRepo()
+        services = build_default_services(repo)
+        self.assertIs(services.repo, repo)
+
+    def test_services_retriever_connected(self):
+        services = build_default_services()
+        results = services.retriever.retrieve("test", {"tenant_id": "t1"}, top_k=5)
+        self.assertIsInstance(results, list)

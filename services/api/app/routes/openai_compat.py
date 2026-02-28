@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from ..agent.callbacks import AgentEvent, QueueCallback, NullCallback
+from ..agent.callbacks import AgentEvent, AsyncQueueCallback, NullCallback
 from ..agent.graph import run_agent
 from ..agent.state import Constraints
 
@@ -63,8 +63,7 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
             )
 
         # Non-streaming: run agent and format as OpenAI response
-        state = await asyncio.to_thread(
-            run_agent,
+        state = await run_agent(
             query=query,
             tenant_id=tenant_id,
             user_id=user_id,
@@ -101,11 +100,10 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
         services: Any,
         request_id: str,
     ) -> AsyncIterator[str]:
-        cb = QueueCallback()
+        cb = AsyncQueueCallback()
 
         async def _run():
-            await asyncio.to_thread(
-                run_agent,
+            await run_agent(
                 query=query,
                 tenant_id=tenant_id,
                 user_id=user_id,
@@ -118,17 +116,7 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
 
         created = int(time.time())
         try:
-            while True:
-                try:
-                    event = await asyncio.to_thread(cb.get, 0.5)
-                except Exception:
-                    if task.done():
-                        break
-                    continue
-
-                if event is None:
-                    break
-
+            async for event in cb:
                 if event.event_type == "final":
                     answer = event.data.get("answer", "")
                     # Stream the answer as token chunks

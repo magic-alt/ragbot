@@ -11,6 +11,7 @@ Can target either a local ragbot instance or a remote API server.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from typing import Any, Dict, List, Optional
@@ -54,7 +55,7 @@ def _local_chat(
     c = None
     if constraints:
         c = Constraints(**constraints)
-    return chat(query, tenant_id, user_id, services, c)
+    return asyncio.run(chat(query, tenant_id, user_id, services, c))
 
 
 def cmd_ask(args: argparse.Namespace) -> None:

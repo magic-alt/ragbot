@@ -5,6 +5,6 @@ from typing import Dict
 from ..main import chat
 
 
-def handle_chat(payload: Dict[str, str]) -> Dict[str, object]:
-    return chat(payload["query"], payload["tenant_id"], payload["user_id"])
+async def handle_chat(payload: Dict[str, str]) -> Dict[str, object]:
+    return await chat(payload["query"], payload["tenant_id"], payload["user_id"])
 

@@ -9,11 +9,11 @@ from ..reliability import safe_tool_call
 logger = logging.getLogger(__name__)
 
 
-def verify_node(state: AgentState, services: object) -> AgentState:
+async def verify_node(state: AgentState, services: object) -> AgentState:
     llm = getattr(services, "llm", None)
     if llm and getattr(llm, "enabled", False):
         try:
-            state.verification = safe_tool_call("verify", _llm_verify, state, llm)
+            state.verification = await safe_tool_call("verify", _llm_verify, state, llm)
             return state
         except Exception as exc:
             logger.warning("LLM verification failed: %s: %s", type(exc).__name__, exc)
@@ -51,7 +51,7 @@ def verify_node(state: AgentState, services: object) -> AgentState:
     return state
 
 
-def _llm_verify(state: AgentState, llm: object) -> Verification:
+async def _llm_verify(state: AgentState, llm: object) -> Verification:
     system = (
         "You are a verifier. Determine whether the evidence supports the draft answer. "
         "Return JSON only."
@@ -84,7 +84,7 @@ def _llm_verify(state: AgentState, llm: object) -> Verification:
         "required": ["enough_evidence", "missing"],
         "additionalProperties": False,
     }
-    result = llm.chat_json(system=system, user=user, schema=schema)
+    result = await llm.chat_json(system=system, user=user, schema=schema)
     return Verification(
         enough_evidence=bool(result.get("enough_evidence")),
         missing=result.get("missing", []) or [],

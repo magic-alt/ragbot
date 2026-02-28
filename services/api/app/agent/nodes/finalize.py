@@ -5,7 +5,7 @@ from typing import List
 from ..state import AgentState, FinalAnswer
 
 
-def finalize_node(state: AgentState, services: object) -> AgentState:
+async def finalize_node(state: AgentState, services: object) -> AgentState:
     if state.draft and state.verification and state.verification.enough_evidence:
         confidence = "high" if not state.verification.missing else "medium"
         state.final = FinalAnswer(

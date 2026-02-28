@@ -6,12 +6,12 @@ from ..state import AgentState, Citation, EvidenceItem, ToolCallRecord, now_ms
 from ..reliability import safe_tool_call
 
 
-def retrieve_node(state: AgentState, services: Any) -> AgentState:
+async def retrieve_node(state: AgentState, services: Any) -> AgentState:
     filters = _build_filters(state)
     args = {"query": state.query, "top_k": 30, "filters": filters}
     start_ms = now_ms()
     try:
-        chunks = safe_tool_call("retrieve", services.retriever.retrieve, state.query, filters, top_k=30)
+        chunks = await safe_tool_call("retrieve", services.retriever.retrieve, state.query, filters, top_k=30)
         if chunks:
             citations = [_chunk_to_citation(chunk) for chunk in chunks[:12]]
             text = _format_chunks(chunks, limit=12)

@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..storage.models import Chunk
-from ..storage.repo import InMemoryRepo
+from ..storage.protocol import Repo
 
 
 class InvertedIndex:
@@ -40,7 +40,7 @@ class InvertedIndex:
 _global_index = InvertedIndex()
 
 
-def fts_search(repo: InMemoryRepo, query: str, filters: Dict[str, Any], top_k: int) -> List[Tuple[Chunk, float]]:
+def fts_search(repo: Repo, query: str, filters: Dict[str, Any], top_k: int) -> List[Tuple[Chunk, float]]:
     tokens = _tokenize(query)
     if not tokens:
         return []
@@ -62,7 +62,7 @@ def fts_search(repo: InMemoryRepo, query: str, filters: Dict[str, Any], top_k: i
     return results[:top_k]
 
 
-def _ensure_indexed(repo: InMemoryRepo) -> None:
+def _ensure_indexed(repo: Repo) -> None:
     for chunk in repo.iter_chunks():
         _global_index.add(chunk.chunk_id, chunk.text)
 
