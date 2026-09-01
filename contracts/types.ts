@@ -21,10 +21,27 @@ export interface CodeSnippet {
   content: string;
 }
 
-export type SourceType = "pdf" | "web" | "repo" | "db_doc";
+export interface PatchResult {
+  path: string;
+  diff: string;
+  original_lines: number;
+  modified_lines: number;
+}
+
+// Document/vector retrieval source types. SQL database access is configured
+// separately through POSTGRES_DSN and is not an ingestible source.
+export type SourceType = "pdf" | "web" | "repo" | "local_fs";
 export type RouteType = "doc_rag" | "sql" | "code" | "mixed" | "web_fallback";
 export type Confidence = "high" | "medium" | "low";
-export type ToolName = "retrieve" | "sql_query" | "code_search" | "web_search" | "web_fetch";
+export type ToolName =
+  | "retrieve"
+  | "sql_query"
+  | "code_search"
+  | "web_search"
+  | "web_fetch"
+  | "open_file"
+  | "apply_patch"
+  | "explain_error";
 
 export interface Citation {
   kind: "chunk" | "row" | "code" | "web";
@@ -42,7 +59,14 @@ export interface Citation {
 }
 
 export interface EvidenceItem {
-  kind: "doc_chunk" | "sql_rows" | "code_snippets" | "web_snippets";
+  kind:
+    | "doc_chunk"
+    | "sql_rows"
+    | "code_snippets"
+    | "web_snippets"
+    | "file_content"
+    | "patch"
+    | "error_analysis";
   score?: number;
   text?: string;
   citations: Citation[];
@@ -76,7 +100,14 @@ export interface Verification {
   enough_evidence: boolean;
   missing: string[];
   next_query?: string;
-  next_action?: "retrieve" | "sql_query" | "code_search" | "web_search";
+  next_action?:
+    | "retrieve"
+    | "sql_query"
+    | "code_search"
+    | "web_search"
+    | "open_file"
+    | "apply_patch"
+    | "explain_error";
 }
 
 export interface Draft {
