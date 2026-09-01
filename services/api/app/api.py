@@ -17,7 +17,7 @@ from .agent.context import process_client_context
 from .agent.graph import run_agent
 from .agent.state import Constraints, SourceType
 from .auth.acl import compute_security_scope
-from .auth.principal import authorize_identity
+from .auth.principal import authorize_identity, require_admin
 from .factory import build_services_from_env
 from .main import chat
 from .middleware import setup_middleware
@@ -168,6 +168,7 @@ async def readiness_endpoint() -> dict:
 
 @app.get("/admin/metrics")
 async def metrics_endpoint(_key: Optional[str] = Depends(verify_api_key)) -> dict:
+    require_admin(_key)
     collector = get_metrics_collector()
     agg = collector.aggregate()
     return {
@@ -188,8 +189,8 @@ async def metrics_endpoint(_key: Optional[str] = Depends(verify_api_key)) -> dic
 
 @app.get("/admin/metrics/history")
 async def metrics_history_endpoint(last_n: int = 100, _key: Optional[str] = Depends(verify_api_key)) -> dict:
-    collector = get_metrics_collector()
-    return {"requests": collector.get_history(last_n)}
+    require_admin(_key)
+    return {"requests": get_metrics_collector().get_history(last_n)}
 
 
 class FeedbackRequest(BaseModel):
@@ -208,12 +209,14 @@ async def feedback_endpoint(payload: FeedbackRequest, _key: Optional[str] = Depe
 
 @app.get("/admin/cost")
 async def cost_endpoint(_key: Optional[str] = Depends(verify_api_key)) -> dict:
+    require_admin(_key)
     from .llm.router import CostTracker
     return CostTracker().summary()
 
 
 @app.get("/admin/cache")
 async def cache_endpoint(_key: Optional[str] = Depends(verify_api_key)) -> dict:
+    require_admin(_key)
     from .cache.cache import get_embedding_cache, get_retrieval_cache, is_cache_enabled
     return {
         "enabled": is_cache_enabled(),
