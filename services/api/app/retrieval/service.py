@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from .embedder import Embedder
@@ -8,6 +9,8 @@ from .rerank import rrf_fuse
 from ..storage.models import Chunk
 from ..storage.protocol import Repo
 from contracts.types import RetrievalChunk
+
+logger = logging.getLogger(__name__)
 
 
 def build_citation(chunk: Chunk) -> str:
@@ -29,7 +32,6 @@ class Retriever:
         if self._embedder:
             query_vector = self._embedder.embed(query)
         else:
-            # Fallback for backward compat (should not happen in production)
             from .embedder import HashEmbedder
             query_vector = HashEmbedder(dim=self._qdrant.dim).embed(query)
         qdrant_hits = self._qdrant.search(query_vector, filters, top_k * 2)
@@ -43,8 +45,9 @@ class Retriever:
             point_id: payload for point_id, _score, payload in qdrant_hits
         }
 
-        # Cross-encoder reranking (if enabled)
-        if self._reranker and hasattr(self._reranker, 'enabled') and self._reranker.enabled:
+        # Reranking is an optional quality layer. A Cohere/local endpoint outage
+        # must not take down otherwise healthy vector + lexical retrieval.
+        if self._reranker and hasattr(self._reranker, "enabled") and self._reranker.enabled:
             candidates = fused[:top_k * 2]
             candidate_texts = []
             for cid, _ in candidates:
@@ -53,8 +56,17 @@ class Retriever:
                     candidate_texts.append(chunk.text)
                 else:
                     candidate_texts.append(payload_map.get(cid, {}).get("text", ""))
-            reranked = self._reranker.rerank(query, candidate_texts, top_k=top_k)
-            fused = [(candidates[idx][0], score) for idx, score in reranked]
+            try:
+                reranked = self._reranker.rerank(query, candidate_texts, top_k=top_k)
+                valid = [
+                    (candidates[idx][0], score)
+                    for idx, score in reranked
+                    if isinstance(idx, int) and 0 <= idx < len(candidates)
+                ]
+                if valid:
+                    fused = valid
+            except Exception:
+                logger.exception("Optional reranker failed; falling back to RRF ordering")
 
         results: List[RetrievalChunk] = []
         for chunk_id, fused_score in fused[:top_k]:
@@ -63,16 +75,13 @@ class Retriever:
                 payload = payload_map.get(chunk_id, {})
                 if not payload:
                     continue
-                text = payload.get("text", "")
-                doc_id = payload.get("doc_id", "unknown")
-                citations = [payload.get("citation", chunk_id)]
                 results.append(
                     RetrievalChunk(
                         chunk_id=chunk_id,
-                        doc_id=doc_id,
-                        text=text,
+                        doc_id=payload.get("doc_id", "unknown"),
+                        text=payload.get("text", ""),
                         score=fused_score,
-                        citations=citations,
+                        citations=[payload.get("citation", chunk_id)],
                         metadata=payload,
                     )
                 )
@@ -100,4 +109,3 @@ class Retriever:
                 )
             )
         return results
-
