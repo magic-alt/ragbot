@@ -1,0 +1,127 @@
+name: Staging Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ragbot-staging-smoke
+  cancel-in-progress: false
+
+jobs:
+  staging-smoke:
+    name: Production-style staging smoke
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ragbot
+          POSTGRES_PASSWORD: ragbot
+          POSTGRES_DB: ragbot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ragbot -d ragbot"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      qdrant:
+        image: qdrant/qdrant:v1.15.4
+        ports:
+          - 6333:6333
+
+    env:
+      RAGBOT_ENV: production
+      RAGBOT_INGESTION_MODE: worker
+      RAGBOT_API_KEYS: staging-ci-key
+      RAGBOT_API_KEY_PRINCIPALS: >-
+        {"staging-ci-key":{"tenant_ids":["staging"],"user_id":"staging-user","groups":[],"roles":["reader"],"admin":false}}
+      POSTGRES_DSN: postgresql://ragbot:ragbot@127.0.0.1:5432/ragbot
+      QDRANT_URL: http://127.0.0.1:6333
+      QDRANT_COLLECTION: rag_chunks_staging_smoke
+      QDRANT_DIM: ${{ vars.STAGING_QDRANT_DIM || '1536' }}
+      OPENAI_API_KEY: ${{ secrets.STAGING_OPENAI_API_KEY }}
+      OPENAI_BASE_URL: ${{ vars.STAGING_OPENAI_BASE_URL || 'https://api.openai.com' }}
+      OPENAI_MODEL: ${{ vars.STAGING_OPENAI_MODEL || 'gpt-4o-mini' }}
+      OPENAI_WEB_MODEL: ${{ vars.STAGING_OPENAI_MODEL || 'gpt-4o-mini' }}
+      EMBEDDING_MODEL: ${{ vars.STAGING_EMBEDDING_MODEL || 'text-embedding-3-small' }}
+      EMBEDDING_BASE_URL: ${{ vars.STAGING_EMBEDDING_BASE_URL || vars.STAGING_OPENAI_BASE_URL || 'https://api.openai.com' }}
+      RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS: /tmp/ragbot-staging
+      RAGBOT_WEB_ALLOWED_HOSTS: example.com
+      RAGBOT_PDF_ALLOWED_HOSTS: www.w3.org
+      RAGBOT_ALLOW_PRIVATE_SOURCE_NETWORKS: "false"
+      STAGING_API_KEY: staging-ci-key
+      STAGING_TENANT: staging
+      STAGING_USER: staging-user
+      STAGING_SOURCE_ROOT: /tmp/ragbot-staging
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Require real provider credential
+        shell: bash
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "Configure STAGING_OPENAI_API_KEY in the GitHub 'staging' environment before running this gate." >&2
+            exit 1
+          fi
+
+      - name: Install full runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,postgres,qdrant,worker,observability]"
+
+      - name: Wait for Qdrant
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:6333/readyz >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Qdrant did not become ready" >&2
+          exit 1
+
+      - name: Apply migrations
+        run: python -m services.api.app.storage.migrations
+
+      - name: Start API and durable worker
+        shell: bash
+        run: |
+          mkdir -p /tmp/ragbot-staging
+          nohup uvicorn services.api.app.api:app --host 127.0.0.1 --port 8000 > /tmp/ragbot-api.log 2>&1 &
+          echo $! > /tmp/ragbot-api.pid
+          nohup python -m services.worker.main > /tmp/ragbot-worker.log 2>&1 &
+          echo $! > /tmp/ragbot-worker.pid
+
+      - name: Run real end-to-end smoke
+        run: python -m eval.staging_smoke
+
+      - name: Dump service logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "===== API ====="
+          cat /tmp/ragbot-api.log || true
+          echo "===== WORKER ====="
+          cat /tmp/ragbot-worker.log || true
+
+      - name: Stop API and worker
+        if: always()
+        shell: bash
+        run: |
+          test -f /tmp/ragbot-api.pid && kill "$(cat /tmp/ragbot-api.pid)" || true
+          test -f /tmp/ragbot-worker.pid && kill "$(cat /tmp/ragbot-worker.pid)" || true
