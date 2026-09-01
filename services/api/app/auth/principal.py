@@ -10,13 +10,7 @@ from fastapi import HTTPException
 
 @dataclass(frozen=True)
 class ApiPrincipal:
-    """Trusted identity and tenant scope associated with one API key.
-
-    The legacy ``RAGBOT_API_KEYS`` setting only proves that a caller knows a
-    service credential. ``RAGBOT_API_KEY_PRINCIPALS`` optionally binds that
-    credential to tenants, a stable user identity, groups and roles so request
-    payloads cannot expand the caller's authorization scope.
-    """
+    """Trusted identity and tenant scope associated with one API key."""
 
     tenant_ids: frozenset[str]
     user_id: Optional[str] = None
@@ -42,7 +36,6 @@ def load_api_key_principals(raw: Optional[str] = None) -> Dict[str, ApiPrincipal
             raise ValueError("Principal API keys must be non-empty strings")
         if not isinstance(config, dict):
             raise ValueError(f"Principal definition for {api_key!r} must be an object")
-
         tenant_ids = _string_set(config.get("tenant_ids"), field="tenant_ids", api_key=api_key)
         groups = tuple(sorted(_string_set(config.get("groups"), field="groups", api_key=api_key)))
         roles = tuple(sorted(_string_set(config.get("roles"), field="roles", api_key=api_key)))
@@ -54,7 +47,6 @@ def load_api_key_principals(raw: Optional[str] = None) -> Dict[str, ApiPrincipal
             raise ValueError(f"Principal admin for {api_key!r} must be boolean")
         if not admin and not tenant_ids:
             raise ValueError(f"Principal {api_key!r} must declare tenant_ids or admin=true")
-
         principals[api_key] = ApiPrincipal(
             tenant_ids=frozenset(tenant_ids),
             user_id=user_id.strip() if isinstance(user_id, str) else None,
@@ -68,9 +60,8 @@ def load_api_key_principals(raw: Optional[str] = None) -> Dict[str, ApiPrincipal
 def get_api_principal(api_key: Optional[str]) -> Optional[ApiPrincipal]:
     principals = load_api_key_principals()
     if not principals:
-        # Backward-compatible development mode: an unscoped API key retains the
-        # historical request-supplied tenant/user semantics. Production startup
-        # validation forbids this mode.
+        # Backward-compatible development mode. Production startup validation
+        # requires scoped principals and therefore never enters this branch.
         return None
     if not api_key or api_key not in principals:
         raise HTTPException(status_code=403, detail="API key has no authorized principal")
@@ -106,6 +97,13 @@ def allowed_tenants(api_key: Optional[str]) -> Optional[frozenset[str]]:
     return principal.tenant_ids
 
 
+def require_admin(api_key: Optional[str]) -> None:
+    """Protect global operational endpoints when scoped principals are enabled."""
+    principal = get_api_principal(api_key)
+    if principal is not None and not principal.admin:
+        raise HTTPException(status_code=403, detail="Admin API principal required")
+
+
 def validate_principal_coverage(api_keys: Iterable[str]) -> None:
     principals = load_api_key_principals()
     missing = sorted(key for key in api_keys if key not in principals)
@@ -115,11 +113,8 @@ def validate_principal_coverage(api_keys: Iterable[str]) -> None:
             f"missing {len(missing)} key(s)"
         )
     for api_key in api_keys:
-        principal = principals[api_key]
-        if not principal.user_id:
-            raise ValueError(
-                "Production API principals require a stable user_id for ACL evaluation"
-            )
+        if not principals[api_key].user_id:
+            raise ValueError("Production API principals require a stable user_id for ACL evaluation")
 
 
 def _string_set(value: object, *, field: str, api_key: str) -> set[str]:
