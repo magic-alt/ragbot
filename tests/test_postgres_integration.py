@@ -8,13 +8,14 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 
 from services.api.app.retrieval.embedder import HashEmbedder
 from services.api.app.retrieval.pg_fts import fts_search
 from services.api.app.retrieval.qdrant import InMemoryQdrant
 from services.api.app.storage.migrations import apply_migrations
-from services.api.app.storage.models import ACLPolicy, Source
+from services.api.app.storage.models import ACLPolicy, IngestionJob, Source
 from services.api.app.storage.pg_repo import PostgresRepo
 from services.worker.pipeline import run_ingest_pipeline
 
@@ -108,3 +109,88 @@ class PostgresRepoIntegrationTests(unittest.TestCase):
         stored_job = repo.get_job("job-postgres-smoke")
         self.assertIsNotNone(stored_job)
         self.assertEqual(stored_job.stats["chunks_ingested"], job.chunk_count)
+
+    def test_durable_job_claim_heartbeat_and_expired_lease_recovery(self):
+        repo = PostgresRepo(self.dsn, pool_min=1, pool_max=2)
+        self.addCleanup(repo.close)
+        suffix = uuid.uuid4().hex
+        tenant_id = f"tenant-queue-{suffix}"
+        source = Source(
+            source_id=f"source-queue-{suffix}",
+            tenant_id=tenant_id,
+            source_type="local_fs",
+            name="queue smoke",
+            config={"path": "/tmp"},
+        )
+        repo.add_source(source)
+        job = IngestionJob(
+            job_id=f"job-queue-{suffix}",
+            tenant_id=tenant_id,
+            source_id=source.source_id,
+            source_type=source.source_type,
+            source_config=source.config,
+        )
+        repo.add_job(job)
+
+        claimed = repo.claim_next_job("worker-a", lease_seconds=30, max_attempts=3)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.job_id, job.job_id)
+        self.assertEqual(claimed.status, "running")
+        self.assertEqual(claimed.attempts, 1)
+        self.assertEqual(claimed.lease_owner, "worker-a")
+        self.assertTrue(repo.heartbeat_job(job.job_id, "worker-a", lease_seconds=30))
+
+        expired = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        repo.update_job(job.job_id, lease_expires_at=expired)
+        reclaimed = repo.claim_next_job("worker-b", lease_seconds=30, max_attempts=3)
+        self.assertIsNotNone(reclaimed)
+        self.assertEqual(reclaimed.job_id, job.job_id)
+        self.assertEqual(reclaimed.attempts, 2)
+        self.assertEqual(reclaimed.lease_owner, "worker-b")
+
+        repo.update_job(job.job_id, attempts=3, lease_expires_at=expired)
+        self.assertIsNone(repo.claim_next_job("worker-c", lease_seconds=30, max_attempts=3))
+        exhausted = repo.get_job(job.job_id)
+        self.assertEqual(exhausted.status, "failed")
+        self.assertIn("maximum attempts", exhausted.error)
+
+    def test_cjk_bigram_fts_retrieves_chinese_phrase(self):
+        repo = PostgresRepo(self.dsn, pool_min=1, pool_max=2)
+        self.addCleanup(repo.close)
+        suffix = uuid.uuid4().hex
+        tenant_id = f"tenant-cjk-{suffix}"
+        source = Source(
+            source_id=f"source-cjk-{suffix}",
+            tenant_id=tenant_id,
+            source_type="local_fs",
+            name="Chinese retrieval smoke",
+            config={},
+            tags=["cjk"],
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "servo.txt")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "EtherCAT总线控制伺服驱动器需要配置CiA402状态机，"
+                    "并确认同步周期和位置环控制参数。"
+                )
+            source.config = {"path": directory}
+            repo.add_source(source)
+            job = run_ingest_pipeline(
+                source,
+                repo,
+                InMemoryQdrant(dim=32),
+                job_id=f"job-cjk-{suffix}",
+                embedder=HashEmbedder(dim=32),
+            )
+
+        self.assertEqual(job.status, "completed", job.error)
+        hits = fts_search(
+            repo,
+            "伺服驱动",
+            {"tenant_id": tenant_id, "source_types": ["local_fs"]},
+            top_k=5,
+        )
+        self.assertTrue(hits)
+        self.assertIn("伺服驱动器", hits[0][0].text)
