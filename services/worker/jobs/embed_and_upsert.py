@@ -20,22 +20,22 @@ def embed_and_upsert(
     batch_size: int = DEFAULT_BATCH_SIZE,
     embedder: Optional[Embedder] = None,
 ) -> None:
-    """Persist chunks and their vectors in bounded batches.
+    """Persist chunks and vectors in bounded batches.
 
-    ``qdrant_point_id`` is kept equal to ``chunk_id`` so stale vectors can be
-    pruned deterministically after a successful re-ingestion.
+    Embedding, SQL persistence and vector upsert now share the same bounded
+    batch. Production repositories can therefore use one transaction/executemany
+    instead of one PostgreSQL round trip per chunk.
     """
     emb = embedder or HashEmbedder(dim=qdrant.dim)
-    batch: List[Tuple[str, List[float], Dict[str, Any]]] = []
+    vector_batch: List[Tuple[str, List[float], Dict[str, Any]]] = []
     chunk_list: List[Chunk] = []
     total = 0
 
     def flush() -> None:
-        nonlocal batch, chunk_list, total
+        nonlocal vector_batch, chunk_list, total
         if not chunk_list:
             return
-        texts = [c.text for c in chunk_list]
-        vectors = emb.embed_batch(texts)
+        vectors = emb.embed_batch([c.text for c in chunk_list])
         if len(vectors) != len(chunk_list):
             raise RuntimeError(
                 f"Embedder returned {len(vectors)} vectors for {len(chunk_list)} chunks"
@@ -47,14 +47,18 @@ def embed_and_upsert(
                     f"chunk={chunk.chunk_id}, vector={len(vector)}, qdrant={qdrant.dim}"
                 )
             chunk.qdrant_point_id = chunk.chunk_id
-            repo.add_chunk(chunk)
-            batch.append(
-                (chunk.chunk_id, vector, _build_payload(chunk, emb.model_name))
-            )
-        qdrant.upsert(batch)
-        total += len(batch)
-        logger.debug("Upserted batch of %d points (total: %d)", len(batch), total)
-        batch = []
+            vector_batch.append((chunk.chunk_id, vector, _build_payload(chunk, emb.model_name)))
+
+        add_chunks = getattr(repo, "add_chunks", None)
+        if callable(add_chunks):
+            add_chunks(chunk_list)
+        else:  # compatibility with third-party Repo implementations
+            for chunk in chunk_list:
+                repo.add_chunk(chunk)
+        qdrant.upsert(vector_batch)
+        total += len(vector_batch)
+        logger.debug("Upserted batch of %d points (total: %d)", len(vector_batch), total)
+        vector_batch = []
         chunk_list = []
 
     for chunk in chunks:
