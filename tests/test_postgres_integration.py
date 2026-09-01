@@ -1,7 +1,7 @@
-"""PostgreSQL integration smoke test.
+"""PostgreSQL integration smoke tests.
 
-Skipped in the normal unit-test matrix. CI provides POSTGRES_TEST_DSN in the
-postgres-smoke job after applying every migration.
+Skipped in the normal unit-test matrix. CI provides POSTGRES_TEST_DSN and uses
+the same migration runner as Docker/Helm before executing this file.
 """
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ import unittest
 from datetime import datetime, timezone
 
 from services.api.app.retrieval.embedder import HashEmbedder
+from services.api.app.retrieval.pg_fts import fts_search
 from services.api.app.retrieval.qdrant import InMemoryQdrant
+from services.api.app.storage.migrations import apply_migrations
 from services.api.app.storage.models import ACLPolicy, Source
 from services.api.app.storage.pg_repo import PostgresRepo
 from services.worker.pipeline import run_ingest_pipeline
@@ -19,10 +21,16 @@ from services.worker.pipeline import run_ingest_pipeline
 
 @unittest.skipUnless(os.getenv("POSTGRES_TEST_DSN"), "POSTGRES_TEST_DSN not configured")
 class PostgresRepoIntegrationTests(unittest.TestCase):
-    def test_local_fs_ingestion_round_trip(self):
-        dsn = os.environ["POSTGRES_TEST_DSN"]
-        repo = PostgresRepo(dsn, pool_min=1, pool_max=2)
+    def setUp(self):
+        self.dsn = os.environ["POSTGRES_TEST_DSN"]
+
+    def test_migration_runner_is_idempotent_after_ci_bootstrap(self):
+        self.assertEqual(apply_migrations(self.dsn), [])
+
+    def test_local_fs_ingestion_round_trip_and_native_fts(self):
+        repo = PostgresRepo(self.dsn, pool_min=1, pool_max=2)
         self.addCleanup(repo.close)
+        self.assertTrue(repo.healthcheck())
 
         now = datetime.now(timezone.utc).isoformat()
         source = Source(
@@ -48,7 +56,7 @@ class PostgresRepoIntegrationTests(unittest.TestCase):
             for filename in ("alpha.txt", "beta.md"):
                 path = os.path.join(directory, filename)
                 with open(path, "w", encoding="utf-8") as handle:
-                    handle.write(f"{filename} durable RAG knowledge. " * 30)
+                    handle.write(f"{filename} durable searchable RAG knowledge. " * 30)
 
             source.config = {"path": directory}
             source.acl_policy_id = policy.acl_policy_id
@@ -82,6 +90,20 @@ class PostgresRepoIntegrationTests(unittest.TestCase):
             document = repo.get_document(doc_id)
             self.assertIsNotNone(document)
             self.assertEqual(document.tags, ["smoke", "local"])
+
+        fts_hits = fts_search(
+            repo,
+            "durable searchable",
+            {
+                "tenant_id": source.tenant_id,
+                "source_types": ["local_fs"],
+                "tags": ["smoke"],
+                "security_scope": [policy.policy_hash],
+            },
+            top_k=10,
+        )
+        self.assertGreaterEqual(len(fts_hits), 2)
+        self.assertTrue(all(chunk.tenant_id == source.tenant_id for chunk, _ in fts_hits))
 
         stored_job = repo.get_job("job-postgres-smoke")
         self.assertIsNotNone(stored_job)
