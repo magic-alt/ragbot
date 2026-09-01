@@ -29,12 +29,16 @@ _LLM_ROUTE_SCHEMA = {
 
 async def route_node(state: AgentState, services: Any) -> AgentState:
     query = state.query.lower()
-    policies = services.repo.list_policies(state.tenant_id)
-    acl_hashes = compute_security_scope(state.user_id, policies)
-    state.constraints.security_scope = {
-        "tenant_id": state.tenant_id,
-        "acl_hashes": acl_hashes,
-    }
+
+    # HTTP entrypoints can precompute a trusted scope from an API-key principal,
+    # including group/role claims. Preserve it instead of recomputing from the
+    # caller-supplied user_id. Direct/library callers retain historical behavior.
+    if not state.constraints.security_scope:
+        policies = services.repo.list_policies(state.tenant_id)
+        state.constraints.security_scope = {
+            "tenant_id": state.tenant_id,
+            "acl_hashes": compute_security_scope(state.user_id, policies),
+        }
 
     llm = getattr(services, "llm", None)
     if llm and getattr(llm, "enabled", False):
@@ -100,4 +104,3 @@ def _build_plan(route: Optional[str]) -> list[str]:
     if route == ROUTE_DOC_RAG:
         return ["retrieve(doc)", "synthesize", "verify", "finalize"]
     return ["retrieve(doc)", "verify", "retrieve/sql/code if needed", "finalize"]
-

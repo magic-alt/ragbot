@@ -6,6 +6,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
+from ..auth.acl import compute_security_scope
+from ..auth.principal import authorize_identity
+
 router = APIRouter(tags=["search"])
 
 
@@ -22,8 +25,8 @@ class SearchFilters(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1)
-    tenant_id: str
-    user_id: str
+    tenant_id: str = Field(min_length=1)
+    user_id: str = Field(min_length=1)
     top_k: int = Field(default=20, ge=1, le=100)
     filters: Optional[SearchFilters] = None
 
@@ -46,14 +49,19 @@ class SearchResponse(BaseModel):
 def _build_retrieval_filters(
     tenant_id: str,
     user_id: str,
+    groups: tuple[str, ...],
+    roles: tuple[str, ...],
     filters: Optional[SearchFilters],
     services: Any,
 ) -> Dict[str, Any]:
-    from ..auth.acl import compute_security_scope
-
     result: Dict[str, Any] = {"tenant_id": tenant_id}
     policies = services.repo.list_policies(tenant_id)
-    acl_hashes = compute_security_scope(user_id, policies)
+    acl_hashes = compute_security_scope(
+        user_id,
+        policies,
+        groups=list(groups),
+        roles=list(roles),
+    )
     if acl_hashes:
         result["security_scope"] = acl_hashes
     if not filters:
@@ -74,25 +82,24 @@ def _build_retrieval_filters(
 
 
 def create_search_endpoint(get_services, verify_api_key):
-    """Register the /search endpoint on the router."""
-
     @router.post("/search", response_model=SearchResponse)
     async def search_endpoint(
         payload: SearchRequest,
-        _key: str = Depends(verify_api_key),
+        _key: Optional[str] = Depends(verify_api_key),
     ) -> SearchResponse:
         services = get_services()
+        trusted_user_id, groups, roles = authorize_identity(
+            _key, payload.tenant_id, payload.user_id
+        )
         retrieval_filters = _build_retrieval_filters(
             payload.tenant_id,
-            payload.user_id,
+            trusted_user_id,
+            groups,
+            roles,
             payload.filters,
             services,
         )
-        chunks = services.retriever.retrieve(
-            payload.query,
-            retrieval_filters,
-            top_k=payload.top_k,
-        )
+        chunks = services.retriever.retrieve(payload.query, retrieval_filters, top_k=payload.top_k)
         chunk_results = [
             ChunkResult(
                 chunk_id=c.chunk_id,

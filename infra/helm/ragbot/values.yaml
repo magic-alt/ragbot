@@ -1,6 +1,6 @@
 # Default values for ragbot Helm chart.
-# The default is a single replica because empty external-service URLs select
-# in-memory storage. Configure Postgres + Qdrant before scaling horizontally.
+# Defaults remain development-friendly. Production must set RAGBOT_ENV=production,
+# external PostgreSQL/Qdrant, semantic embeddings and scoped API principals.
 
 replicaCount: 1
 
@@ -40,11 +40,14 @@ autoscaling:
 env:
   LOG_LEVEL: INFO
   LOG_FORMAT: json
+  RAGBOT_ENV: development
   RAGBOT_LLM_PROVIDER: openai
   RAGBOT_TRACING_ENABLED: "true"
   RAGBOT_CACHE_ENABLED: "true"
   RAGBOT_CACHE_TTL_SECONDS: "300"
   RAGBOT_MODEL_ROUTING: "false"
+  RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS: /data
+  RAGBOT_ALLOW_PRIVATE_SOURCE_NETWORKS: "false"
   OTEL_SERVICE_NAME: ragbot-api
 
 # External services. Production/multi-replica deployments should configure both.
@@ -57,9 +60,28 @@ qdrant:
 otel:
   endpoint: ""
 
-# Optional existing Secret keys:
-#   POSTGRES_DSN, QDRANT_API_KEY, OPENAI_API_KEY, RAGBOT_API_KEYS, ...
+# Optional existing Secret keys used by the chart:
+#   postgres-dsn
+#   openai-api-key
+#   api-keys
+#   api-key-principals
+#   qdrant-api-key
 existingSecret: ""
+
+# Optional data/config mounts for local_fs/local PDF/local Git sources. Production
+# paths must remain inside RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS.
+extraVolumes: []
+# Example:
+# extraVolumes:
+#   - name: knowledge
+#     persistentVolumeClaim:
+#       claimName: ragbot-knowledge
+extraVolumeMounts: []
+# Example:
+# extraVolumeMounts:
+#   - name: knowledge
+#     mountPath: /data
+#     readOnly: true
 
 livenessProbe:
   httpGet:

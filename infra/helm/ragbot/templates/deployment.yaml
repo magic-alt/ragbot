@@ -88,6 +88,12 @@ spec:
                   name: {{ .Values.existingSecret }}
                   key: api-keys
                   optional: true
+            - name: RAGBOT_API_KEY_PRINCIPALS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: api-key-principals
+                  optional: true
             - name: QDRANT_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -98,6 +104,10 @@ spec:
             - name: POSTGRES_DSN
               value: {{ .Values.postgres.dsn | quote }}
             {{- end }}
+          {{- with .Values.extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           livenessProbe:
             httpGet:
               path: {{ .Values.livenessProbe.httpGet.path }}
@@ -112,3 +122,7 @@ spec:
             periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

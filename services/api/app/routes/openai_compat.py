@@ -15,6 +15,9 @@ from pydantic import BaseModel, Field
 
 from ..agent.callbacks import AsyncQueueCallback
 from ..agent.graph import run_agent
+from ..agent.state import Constraints
+from ..auth.acl import compute_security_scope
+from ..auth.principal import authorize_identity
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["openai-compat"])
@@ -34,30 +37,34 @@ class OpenAIChatRequest(BaseModel):
 
 
 def _estimate_tokens(text: str) -> int:
-    """Return a conservative tokenizer-independent usage estimate.
-
-    Ragbot's provider abstraction does not currently expose authoritative token
-    accounting. Keeping an integer usage object preserves OpenAI-client
-    compatibility while the ``estimated`` extension makes that limitation
-    explicit instead of reporting character counts as exact tokens.
-    """
     if not text:
         return 0
     return max(1, (len(text) + 3) // 4)
 
 
 def create_openai_compat_endpoint(get_services, verify_api_key):
-    """Register the /v1/chat/completions endpoint on the router."""
-
     @router.post("/v1/chat/completions")
     async def openai_chat_completions(
         payload: OpenAIChatRequest,
         request: Request,
-        _key: str = Depends(verify_api_key),
+        _key: Optional[str] = Depends(verify_api_key),
     ):
         services = get_services()
         tenant_id = request.headers.get("X-Tenant-ID", "default").strip() or "default"
-        user_id = request.headers.get("X-User-ID", "anonymous").strip() or "anonymous"
+        requested_user_id = request.headers.get("X-User-ID", "anonymous").strip() or "anonymous"
+        user_id, groups, roles = authorize_identity(_key, tenant_id, requested_user_id)
+        policies = services.repo.list_policies(tenant_id)
+        constraints = Constraints(
+            security_scope={
+                "tenant_id": tenant_id,
+                "acl_hashes": compute_security_scope(
+                    user_id,
+                    policies,
+                    groups=list(groups),
+                    roles=list(roles),
+                ),
+            }
+        )
 
         query = ""
         for msg in reversed(payload.messages):
@@ -70,7 +77,6 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
             raise HTTPException(status_code=400, detail="At least one non-empty message is required")
 
         request_id = uuid.uuid4().hex
-
         if payload.stream:
             return StreamingResponse(
                 _stream_response(
@@ -80,6 +86,7 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
                     services,
                     request_id,
                     payload.model,
+                    constraints,
                 ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -91,12 +98,12 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
             user_id=user_id,
             services=services,
             request_id=request_id,
+            constraints=constraints,
         )
         answer = state.final.answer if state.final else ""
         citations = [asdict(c) for c in state.final.citations] if state.final else []
         prompt_tokens = _estimate_tokens(query)
         completion_tokens = _estimate_tokens(answer)
-
         return {
             "id": f"chatcmpl-{request_id}",
             "object": "chat.completion",
@@ -125,6 +132,7 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
         services: Any,
         request_id: str,
         model: str,
+        constraints: Constraints,
     ) -> AsyncIterator[str]:
         cb = AsyncQueueCallback()
 
@@ -136,6 +144,7 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
                 services=services,
                 request_id=request_id,
                 callback=cb,
+                constraints=constraints,
             )
 
         task = asyncio.create_task(_run())
@@ -155,7 +164,6 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
                 elif event.event_type == "final":
                     answer = event.data.get("answer", "")
                     for i in range(0, len(answer), 8):
-                        chunk = answer[i:i + 8]
                         data = {
                             "id": f"chatcmpl-{request_id}",
                             "object": "chat.completion.chunk",
@@ -164,7 +172,7 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
                             "choices": [
                                 {
                                     "index": 0,
-                                    "delta": {"content": chunk},
+                                    "delta": {"content": answer[i:i + 8]},
                                     "finish_reason": None,
                                 }
                             ],
