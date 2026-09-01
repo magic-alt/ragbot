@@ -46,7 +46,7 @@ jobs:
         run: python -m pytest -q
 
   postgres-smoke:
-    name: PostgreSQL migration + FTS smoke
+    name: PostgreSQL queue + FTS smoke
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -88,6 +88,11 @@ jobs:
           POSTGRES_TEST_DSN: postgresql://ragbot:ragbot@127.0.0.1:5432/ragbot
         run: python -m pytest -q tests/test_postgres_integration.py
 
+      - name: Run CJK lexical retrieval benchmark
+        env:
+          POSTGRES_TEST_DSN: postgresql://ragbot:ragbot@127.0.0.1:5432/ragbot
+        run: python -m eval.cjk_retrieval
+
   node-client:
     name: Node client typecheck
     runs-on: ubuntu-latest
@@ -126,3 +131,23 @@ jobs:
 
       - name: Render Helm defaults
         run: helm template ragbot infra/helm/ragbot >/dev/null
+
+      - name: Render production Helm with durable worker
+        run: >-
+          helm template ragbot infra/helm/ragbot
+          --set env.RAGBOT_ENV=production
+          --set worker.enabled=true
+          --set postgres.dsn=postgresql://ragbot:ragbot@postgres/ragbot
+          --set qdrant.url=http://qdrant:6333
+          >/dev/null
+
+      - name: Reject production Helm without worker
+        run: |
+          if helm template ragbot infra/helm/ragbot \
+            --set env.RAGBOT_ENV=production \
+            --set postgres.dsn=postgresql://ragbot:ragbot@postgres/ragbot \
+            --set qdrant.url=http://qdrant:6333 \
+            >/dev/null 2>&1; then
+            echo "production chart unexpectedly rendered without durable worker" >&2
+            exit 1
+          fi
