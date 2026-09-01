@@ -1,21 +1,14 @@
 """Schema-aligned PostgreSQL repository used by the runtime factory.
 
-The original repository implementation predates several schema migrations.
-This compatibility layer keeps the public repository surface while making the
-PostgreSQL path safe for the current schema:
-
-- connections use ``dict_row`` so decoding is independent of physical column
-  order after ALTER TABLE migrations;
-- JSONB values use psycopg's ``Jsonb`` adapter rather than text serialization;
-- PostgreSQL ``TEXT[]`` tag columns receive Python lists;
-- nullable dataclass timestamps allow PostgreSQL defaults to apply;
-- mapping rows are handled for scalar/RETURNING helpers and debug export.
+This adapter keeps SQL types aligned with the current migrations and adds the
+production-only operations that should execute in PostgreSQL rather than in
+application memory (bulk lifecycle cleanup and full-text search).
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .models import ACLPolicy, Chunk, Document, IngestionJob, Source
 from .postgres_repo import PostgresRepo as _LegacyPostgresRepo
@@ -54,6 +47,17 @@ class PostgresRepo(_LegacyPostgresRepo):
 
         return Jsonb(value)
 
+    def healthcheck(self) -> bool:
+        try:
+            with self._pool.connection() as conn:
+                row = conn.execute("SELECT 1 AS ok").fetchone()
+            return bool(row and row.get("ok") == 1)
+        except Exception:
+            logger.exception("PostgreSQL repository healthcheck failed")
+            return False
+
+    # ── Documents ──────────────────────────────────────────────────────
+
     def add_document(self, doc: Document) -> None:
         sql = """
             INSERT INTO documents (
@@ -65,7 +69,10 @@ class PostgresRepo(_LegacyPostgresRepo):
                 %(tags)s, %(acl_policy_id)s, %(status)s
             )
             ON CONFLICT (doc_id) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
+                source_type = EXCLUDED.source_type,
                 title = EXCLUDED.title,
+                uri = EXCLUDED.uri,
                 version = EXCLUDED.version,
                 doc_updated_at = EXCLUDED.doc_updated_at,
                 ingested_at = EXCLUDED.ingested_at,
@@ -77,6 +84,14 @@ class PostgresRepo(_LegacyPostgresRepo):
         params["tags"] = list(params["tags"])
         with self._pool.connection() as conn:
             conn.execute(sql, params)
+
+    def delete_documents(self, doc_ids: Iterable[str]) -> int:
+        ids = list(dict.fromkeys(doc_ids))
+        if not ids:
+            return 0
+        with self._pool.connection() as conn:
+            result = conn.execute("DELETE FROM documents WHERE doc_id = ANY(%s)", (ids,))
+            return result.rowcount or 0
 
     def delete_documents_by_source(self, source_id: str) -> List[str]:
         pattern = f"source://{source_id}%"
@@ -90,6 +105,8 @@ class PostgresRepo(_LegacyPostgresRepo):
             rows = conn.execute(sql, (pattern, local_fs_pattern)).fetchall()
             return [row["doc_id"] if isinstance(row, dict) else row[0] for row in rows]
 
+    # ── Chunks ─────────────────────────────────────────────────────────
+
     def add_chunk(self, chunk: Chunk) -> None:
         sql = """
             INSERT INTO chunks (
@@ -102,6 +119,9 @@ class PostgresRepo(_LegacyPostgresRepo):
                 %(qdrant_point_id)s, COALESCE(%(created_at)s, NOW()), %(metadata)s
             )
             ON CONFLICT (chunk_id) DO UPDATE SET
+                doc_id = EXCLUDED.doc_id,
+                tenant_id = EXCLUDED.tenant_id,
+                chunk_index = EXCLUDED.chunk_index,
                 text = EXCLUDED.text,
                 path = EXCLUDED.path,
                 url = EXCLUDED.url,
@@ -115,6 +135,89 @@ class PostgresRepo(_LegacyPostgresRepo):
         params["metadata"] = self._jsonb(params["metadata"])
         with self._pool.connection() as conn:
             conn.execute(sql, params)
+
+    def delete_chunks(self, chunk_ids: Iterable[str]) -> int:
+        ids = list(dict.fromkeys(chunk_ids))
+        if not ids:
+            return 0
+        with self._pool.connection() as conn:
+            result = conn.execute("DELETE FROM chunks WHERE chunk_id = ANY(%s)", (ids,))
+            return result.rowcount or 0
+
+    def search_chunks_fts(
+        self,
+        query: str,
+        filters: Dict[str, Any],
+        top_k: int,
+    ) -> List[Tuple[Chunk, float]]:
+        """Use PostgreSQL's GIN-backed FTS index for lexical retrieval."""
+        conditions = [
+            "to_tsvector('simple', c.text) @@ plainto_tsquery('simple', %(query)s)"
+        ]
+        params: Dict[str, Any] = {"query": query, "limit": top_k}
+
+        tenant_id = filters.get("tenant_id")
+        if tenant_id:
+            conditions.append("c.tenant_id = %(tenant_id)s")
+            params["tenant_id"] = tenant_id
+
+        source_types = filters.get("source_types")
+        if source_types:
+            conditions.append("c.metadata->>'source_type' = ANY(%(source_types)s)")
+            params["source_types"] = list(source_types)
+
+        doc_ids = filters.get("doc_ids")
+        if doc_ids:
+            conditions.append("c.doc_id = ANY(%(doc_ids)s)")
+            params["doc_ids"] = list(doc_ids)
+
+        tags = filters.get("tags")
+        if tags:
+            conditions.append("COALESCE(c.metadata->'tags', '[]'::jsonb) ?| %(tags)s")
+            params["tags"] = list(tags)
+
+        path_prefix = filters.get("path_prefix")
+        if path_prefix:
+            conditions.append("LEFT(COALESCE(c.path, ''), LENGTH(%(path_prefix)s)) = %(path_prefix)s")
+            params["path_prefix"] = path_prefix
+
+        url_prefix = filters.get("url_prefix")
+        if url_prefix:
+            conditions.append("LEFT(COALESCE(c.url, ''), LENGTH(%(url_prefix)s)) = %(url_prefix)s")
+            params["url_prefix"] = url_prefix
+
+        time_range = filters.get("time_range") or {}
+        if time_range.get("start"):
+            conditions.append("c.created_at >= %(time_start)s::timestamptz")
+            params["time_start"] = time_range["start"]
+        if time_range.get("end"):
+            conditions.append("c.created_at <= %(time_end)s::timestamptz")
+            params["time_end"] = time_range["end"]
+
+        security_scope = filters.get("security_scope")
+        if security_scope:
+            conditions.append("COALESCE(c.metadata->>'acl_hash', 'public') = ANY(%(security_scope)s)")
+            params["security_scope"] = list(security_scope)
+
+        sql = f"""
+            SELECT c.*,
+                   ts_rank_cd(
+                       to_tsvector('simple', c.text),
+                       plainto_tsquery('simple', %(query)s)
+                   ) AS fts_score
+            FROM chunks AS c
+            WHERE {' AND '.join(conditions)}
+            ORDER BY fts_score DESC, c.chunk_id
+            LIMIT %(limit)s
+        """
+        with self._pool.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [
+            (self._row_to_chunk(row, None), float(row.get("fts_score") or 0.0))
+            for row in rows
+        ]
+
+    # ── Policies ───────────────────────────────────────────────────────
 
     def add_policy(self, policy: ACLPolicy) -> None:
         sql = """
@@ -140,6 +243,8 @@ class PostgresRepo(_LegacyPostgresRepo):
                 return None
             return row["policy_hash"] if isinstance(row, dict) else row[0]
 
+    # ── Sources ────────────────────────────────────────────────────────
+
     def add_source(self, source: Source) -> None:
         sql = """
             INSERT INTO sources (
@@ -151,6 +256,8 @@ class PostgresRepo(_LegacyPostgresRepo):
                 COALESCE(%(created_at)s, NOW()), COALESCE(%(updated_at)s, NOW())
             )
             ON CONFLICT (source_id) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
+                source_type = EXCLUDED.source_type,
                 name = EXCLUDED.name,
                 config = EXCLUDED.config,
                 status = EXCLUDED.status,
@@ -186,6 +293,8 @@ class PostgresRepo(_LegacyPostgresRepo):
         with self._pool.connection() as conn:
             conn.execute(sql, params)
         return self.get_source(source_id)
+
+    # ── Jobs ───────────────────────────────────────────────────────────
 
     def add_job(self, job: IngestionJob) -> None:
         sql = """
@@ -239,6 +348,8 @@ class PostgresRepo(_LegacyPostgresRepo):
         with self._pool.connection() as conn:
             conn.execute(sql, params)
         return self.get_job(job_id)
+
+    # ── Debug ──────────────────────────────────────────────────────────
 
     def export_state(self) -> Dict[str, List[dict]]:
         result: Dict[str, List[dict]] = {}
