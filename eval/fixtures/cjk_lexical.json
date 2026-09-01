@@ -1,0 +1,48 @@
+{
+  "documents": [
+    {
+      "doc_id": "servo-ethercat",
+      "text": "EtherCAT总线控制伺服驱动器需要配置CiA402状态机，并校验DC同步周期、位置环参数和故障恢复流程。"
+    },
+    {
+      "doc_id": "rag-hybrid",
+      "text": "混合检索同时使用Qdrant向量搜索、PostgreSQL全文检索和RRF排序，以提高企业知识库的召回率。"
+    },
+    {
+      "doc_id": "embedding-contract",
+      "text": "Embedding模型、向量维度和Qdrant collection构成索引契约，模型变更后必须重新索引。"
+    },
+    {
+      "doc_id": "pdf-ingestion",
+      "text": "PDF知识摄取包括文本提取、分块、去重、向量化以及写入向量数据库。"
+    },
+    {
+      "doc_id": "acl-security",
+      "text": "多租户知识服务必须在检索前应用ACL过滤，并且API Key不能允许客户端伪造tenant和user身份。"
+    },
+    {
+      "doc_id": "worker-queue",
+      "text": "持久化摄取队列通过PostgreSQL租约、心跳和失败重试保证Worker重启后任务可以恢复。"
+    },
+    {
+      "doc_id": "robot-motion",
+      "text": "机器人运动控制常见方法包括轨迹规划、前馈补偿、模型预测控制以及关节力矩控制。"
+    },
+    {
+      "doc_id": "observability",
+      "text": "生产环境需要结构化日志、指标、Tracing、健康检查和就绪检查来定位RAG服务故障。"
+    }
+  ],
+  "queries": [
+    {"query": "伺服驱动", "relevant": ["servo-ethercat"]},
+    {"query": "DC同步周期", "relevant": ["servo-ethercat"]},
+    {"query": "混合检索", "relevant": ["rag-hybrid"]},
+    {"query": "向量维度", "relevant": ["embedding-contract"]},
+    {"query": "PDF知识摄取", "relevant": ["pdf-ingestion"]},
+    {"query": "多租户ACL过滤", "relevant": ["acl-security"]},
+    {"query": "摄取队列心跳", "relevant": ["worker-queue"]},
+    {"query": "结构化日志Tracing", "relevant": ["observability"]},
+    {"query": "机器人轨迹规划", "relevant": ["robot-motion"]},
+    {"query": "PostgreSQL全文检索", "relevant": ["rag-hybrid"]}
+  ]
+}
