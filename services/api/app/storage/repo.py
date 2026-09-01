@@ -18,8 +18,6 @@ class InMemoryRepo:
         self._sources: Dict[str, Source] = {}
         self._tables: Dict[str, TableData] = {}
 
-    # ── Documents ──────────────────────────────────────────────────────
-
     def add_document(self, doc: Document) -> None:
         with self._lock:
             self._documents[doc.doc_id] = doc
@@ -62,11 +60,17 @@ class InMemoryRepo:
                 del self._chunks[chunk_id]
             return to_delete
 
-    # ── Chunks ─────────────────────────────────────────────────────────
-
     def add_chunk(self, chunk: Chunk) -> None:
+        self.add_chunks([chunk])
+
+    def add_chunks(self, chunks: Iterable[Chunk]) -> int:
+        items = list(chunks)
+        if not items:
+            return 0
         with self._lock:
-            self._chunks[chunk.chunk_id] = chunk
+            for chunk in items:
+                self._chunks[chunk.chunk_id] = chunk
+        return len(items)
 
     def list_chunks(self, doc_id: Optional[str] = None) -> List[Chunk]:
         with self._lock:
@@ -100,8 +104,6 @@ class InMemoryRepo:
         with self._lock:
             return list(self._chunks.values())
 
-    # ── Policies ───────────────────────────────────────────────────────
-
     def add_policy(self, policy: ACLPolicy) -> None:
         with self._lock:
             self._policies[policy.acl_policy_id] = policy
@@ -118,8 +120,6 @@ class InMemoryRepo:
             if tenant_id is None:
                 return list(self._policies.values())
             return [policy for policy in self._policies.values() if policy.tenant_id == tenant_id]
-
-    # ── Sources ────────────────────────────────────────────────────────
 
     def add_source(self, source: Source) -> None:
         with self._lock:
@@ -151,8 +151,6 @@ class InMemoryRepo:
                 self._sources[source_id].status = "deleted"
                 return True
             return False
-
-    # ── Jobs ───────────────────────────────────────────────────────────
 
     def add_job(self, job: IngestionJob) -> None:
         with self._lock:
@@ -196,12 +194,10 @@ class InMemoryRepo:
                     job.status = "pending"
                     job.lease_owner = None
                     job.lease_expires_at = None
-
                 if job.status != "pending" or job.attempts >= max_attempts:
                     continue
                 if job.available_at and _parse_time(job.available_at) > now:
                     continue
-
                 job.status = "running"
                 job.attempts += 1
                 job.started_at = job.started_at or now.isoformat()
@@ -230,8 +226,6 @@ class InMemoryRepo:
             job.lease_expires_at = None
             return True
 
-    # ── Tables ─────────────────────────────────────────────────────────
-
     def register_table(self, table: TableData) -> None:
         with self._lock:
             self._tables[table.name] = table
@@ -239,8 +233,6 @@ class InMemoryRepo:
     def get_table(self, name: str) -> Optional[TableData]:
         with self._lock:
             return self._tables.get(name)
-
-    # ── Runtime / export ───────────────────────────────────────────────
 
     def healthcheck(self) -> bool:
         return True
