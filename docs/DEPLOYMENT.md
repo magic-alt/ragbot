@@ -2,34 +2,40 @@
 
 ## 1. Deployment modes
 
-### Local Python
+### Local Python development
 
-Use in-memory storage when `POSTGRES_DSN`/`QDRANT_URL` are unset. This mode is useful for tests and single-process development only; state is lost on restart and cannot be shared across replicas.
+When `POSTGRES_DSN`/`QDRANT_URL` are unset, Ragbot can use in-memory stores and inline ingestion. This mode is for tests and single-process development only; state is process-local.
 
 ### Docker Compose
 
-The root `docker-compose.yml` and `infra/docker/docker-compose.yml` start API, PostgreSQL and Qdrant. Optional profiles add Ollama and Jaeger.
+Root `docker-compose.yml` and `infra/docker/docker-compose.yml` start:
 
-Copy `.env.example` to `.env`, configure model credentials, then run:
+- API;
+- independent ingestion worker;
+- one-shot migration service;
+- PostgreSQL;
+- Qdrant.
+
+Optional profiles add Ollama and Jaeger.
 
 ```bash
+cp .env.example .env
+# configure provider credentials
 docker compose up -d --build
 ```
 
-The API now depends on a one-shot `migrate` service. The migration container waits for PostgreSQL health, runs `python -m services.api.app.storage.migrations`, and only after successful migration may the API start. This works for both fresh and existing PostgreSQL volumes.
-
-Do not reintroduce `/docker-entrypoint-initdb.d` as the upgrade mechanism: PostgreSQL executes that directory only during first cluster initialization.
+Compose sets `RAGBOT_INGESTION_MODE=worker`, so `/ingest/jobs` persists a pending job and returns; the worker owns execution.
 
 ## 2. Database migration lifecycle
 
-Migrations live in `infra/migrations/` and are applied in filename order. The runner creates `schema_migrations`, acquires a PostgreSQL advisory lock, and records each applied filename. Multiple deployment instances can therefore attempt migration safely without racing each other.
+Migrations live in `infra/migrations/` and are applied in filename order. The runner creates `schema_migrations`, acquires a PostgreSQL advisory lock and records each applied filename. Multiple deployment instances can therefore attempt migration safely.
 
 Rules:
 
 1. Released migration files are immutable.
 2. Schema changes use a new ordered migration.
-3. CI must prove a clean database can apply the complete chain.
-4. CI also re-runs the migration runner to prove it becomes a no-op.
+3. CI proves a clean database can apply the complete chain.
+4. CI re-runs the migration runner to prove it becomes a no-op.
 5. Back up PostgreSQL before destructive migrations.
 
 Manual execution:
@@ -38,96 +44,189 @@ Manual execution:
 POSTGRES_DSN='postgresql://...' python -m services.api.app.storage.migrations
 ```
 
-## 3. Kubernetes / Helm
+Migration 006 adds durable ingestion leases/attempts and CJK `fts_text` support.
+
+## 3. Durable ingestion worker
+
+Worker entry point:
+
+```bash
+python -m services.worker.main
+```
+
+Execution model:
+
+```text
+POST /ingest/jobs
+      │
+      ▼
+PostgreSQL pending job
+      │
+      ▼
+worker claim: FOR UPDATE SKIP LOCKED
+      │
+      ├─ lease_owner
+      ├─ lease_expires_at
+      ├─ heartbeat_at
+      └─ attempts
+      │
+      ▼
+ingestion pipeline → PostgreSQL chunks + Qdrant vectors
+```
+
+If a worker crashes, its running job remains durable. Once the lease expires another worker changes eligible work back to pending and reclaims it. When attempts reach `RAGBOT_WORKER_MAX_ATTEMPTS`, the job is marked failed instead of retrying forever.
+
+Important properties:
+
+- API restart does not delete pending jobs;
+- worker replicas can safely compete for work;
+- leases prevent one healthy job from being concurrently claimed by multiple workers;
+- heartbeat protects long-running ingestion from premature reclaim;
+- retry API creates a new job rather than mutating historical failed execution evidence.
+
+This is an **at-least-once execution model**. Connector/upsert paths therefore need to remain idempotent; Ragbot's replacement/dedup semantics are designed around that assumption.
+
+## 4. Kubernetes / Helm
 
 Chart: `infra/helm/ragbot`.
-
-Render/lint locally:
 
 ```bash
 helm lint infra/helm/ragbot
 helm template ragbot infra/helm/ragbot
 ```
 
-### Single-replica development
+### Development render
 
-The chart defaults to one replica. With empty `postgres.dsn` and `qdrant.url`, Ragbot falls back to process-local stores. This is not a production topology.
+The default chart remains development-friendly: one API replica, worker disabled, empty external-store URLs allowed.
 
-### Production / horizontal scale
+### Production render
 
-Before setting `replicaCount > 1` or enabling HPA, configure both:
+Set at minimum:
 
-- a shared PostgreSQL DSN (`postgres.dsn` or `existingSecret`), and
-- a shared `qdrant.url`.
+```yaml
+env:
+  RAGBOT_ENV: production
 
-The deployment template fails rendering for multi-replica/autoscaled configurations that would otherwise use process-local persistence/vector state.
+worker:
+  enabled: true
+  replicaCount: 1
 
-When a PostgreSQL DSN is configured, each Pod runs the same migration command in an initContainer. The advisory lock + `schema_migrations` table serializes concurrent migration attempts.
+postgres:
+  dsn: postgresql://...
+
+qdrant:
+  url: http://qdrant:6333
+```
+
+Production chart rendering fails when:
+
+- worker is disabled;
+- PostgreSQL is absent;
+- Qdrant is absent.
+
+Multi-replica/HPA additionally requires shared PostgreSQL and Qdrant.
+
+The worker has its own Deployment and can be scaled independently from API replicas. All workers share the same PostgreSQL lease queue.
 
 ### Existing Secret
 
-Current template expects these keys in `existingSecret`:
+Current chart can reference these keys:
 
-- `postgres-dsn` (required when using the Secret for PostgreSQL)
+- `postgres-dsn`
 - `openai-api-key`
-- `api-keys` (optional)
-- `qdrant-api-key` (optional)
+- `embedding-api-key` (worker optional)
+- `api-keys`
+- `api-key-principals`
+- `qdrant-api-key`
 
 Do not place credentials directly in committed `values.yaml`.
 
-### Ingress and HPA
+### Source mounts
 
-`values.yaml` ingress and autoscaling settings now have actual templates (`templates/ingress.yaml`, `templates/hpa.yaml`). Enable them only after the shared-store requirement above is satisfied.
+`extraVolumes` / `extraVolumeMounts` are applied to both API and worker so a local Source path has identical meaning in both components. Prefer read-only mounts under `RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS`.
 
-## 4. Health and readiness
+### Ingress / HPA
 
-- `/admin/health`: liveness only; answers when the API process is alive.
-- `/admin/ready`: checks configured repository and vector-store readiness and returns `503` when a dependency is unavailable/misconfigured.
+Ingress and API HPA have chart templates. Worker scaling is currently explicit via `worker.replicaCount`; backlog-based worker autoscaling is a v1.x improvement.
 
-Kubernetes uses `/admin/health` for liveness and `/admin/ready` for readiness. This prevents a process from receiving traffic merely because the Python event loop is alive while PostgreSQL/Qdrant are unavailable.
+## 5. Health / readiness
 
-## 5. Embedding/Qdrant upgrades
+- `/admin/health`: liveness only.
+- `/admin/ready`: checks repository and vector-store readiness; returns `503` on failure.
 
-`QDRANT_DIM` must equal the active embedder dimension and the existing collection vector size. Ragbot validates an existing collection and fails fast on a detectable mismatch.
+API readiness deliberately does not imply that a worker is available. Production operations should additionally monitor queue depth/oldest pending age and worker health/logs; dedicated queue metrics are a follow-up observability improvement.
 
-Changing embedding model or vector dimension is a data migration, not a config-only deployment. Recommended procedure:
+## 6. Embedding / Qdrant upgrades
 
-1. provision a new collection with the target dimension;
-2. deploy an ingestion/reindex process using the new embedder;
-3. validate retrieval quality and coverage;
-4. cut query traffic to the new collection;
-5. retain the old collection for rollback until the change is accepted.
+`QDRANT_DIM` must equal the actual embedder dimension and collection vector size. Changing embedding model or dimension is a data migration:
+
+1. provision a new collection;
+2. deploy the target embedder;
+3. re-ingest sources;
+4. validate retrieval quality and ACL/citation coverage;
+5. cut query traffic;
+6. retain old collection for rollback;
+7. clean up after acceptance.
 
 Do not point a new-dimension embedder at an old collection.
 
-## 6. Source data mounts
+## 7. CJK lexical upgrade behavior
 
-Compose mounts `RAGBOT_DATA_DIR` read-only at `/data`. `local_fs`, PDF and local repository Source configs should reference paths visible inside the API container (for example `/data/knowledge`). Keep source data outside the image and do not commit customer/private documents to the repository.
+Migration 006 initially backfills `fts_text=text`. New writes generate CJK bigram lexemes. Chunk metadata includes `lexical_version`; after upgrading, a normal re-ingest treats the prior representation as stale and rewrites it once. Subsequent unchanged re-ingests reuse the new representation normally.
 
-## 7. Upgrade procedure
+Before large production re-indexes, validate disk growth, GIN index build time and query latency on a staging-sized corpus.
+
+## 8. Source/network boundaries
+
+Compose mounts `RAGBOT_DATA_DIR` read-only at `/data` for both API and worker. Production local sources must remain inside `RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS`.
+
+Remote Web/PDF/Git source policy is application-enforced, but production should also use VPC/firewall/service-mesh egress controls. Do not expose PostgreSQL or Qdrant admin endpoints to the public Internet.
+
+## 9. Real-provider staging gate
+
+`.github/workflows/staging-smoke.yml` is intentionally manual because it consumes a real model credential. Configure GitHub environment `staging` with `STAGING_OPENAI_API_KEY` and optional provider variables, then dispatch **Staging Smoke**.
+
+The workflow starts production-mode API + durable worker against real PostgreSQL/Qdrant and executes:
+
+- local_fs ingestion;
+- Web ingestion;
+- PDF ingestion;
+- Git ingestion;
+- hybrid `/search`;
+- Agentic `/chat`;
+- ACL negative isolation.
+
+A green ordinary PR CI is not a substitute for this gate.
+
+## 10. Upgrade procedure
 
 For a normal release:
 
-1. back up PostgreSQL and confirm Qdrant snapshot/backup policy;
-2. build/pull the new immutable application image;
-3. inspect release notes for schema or embedding changes;
-4. run/apply migrations before API readiness;
-5. roll out API instances;
-6. confirm `/admin/ready` and CI-equivalent smoke tests;
-7. trigger re-ingestion only when a connector/embedding/index change requires it;
-8. monitor retrieval/tool error metrics and rollback if needed.
+1. back up PostgreSQL and verify Qdrant snapshot availability;
+2. build/pull an immutable application image;
+3. inspect schema/embedding/lexical release notes;
+4. run migrations;
+5. deploy workers and API with compatible configuration;
+6. confirm API readiness and worker queue consumption;
+7. trigger controlled re-ingestion when index/lexical representation changed;
+8. run staging/equivalent smoke;
+9. monitor queue age, retrieval errors, tool errors and latency;
+10. rollback application and/or collection according to runbook if needed.
 
-## 8. Production checklist
+## 11. v1 production checklist
 
-- non-empty service authentication or a trusted gateway;
-- tenant/user identity bound upstream rather than trusted from arbitrary client JSON;
-- external PostgreSQL and Qdrant for any multi-replica deployment;
-- TLS at ingress/load balancer;
-- PostgreSQL backup/restore test;
-- Qdrant snapshot/restore plan;
-- pinned container image versions/digests for controlled releases;
-- resource limits and HPA tuned from load tests;
-- structured logs/traces exported to a durable backend;
-- `RAGBOT_TRACING_ENABLED` only when an OTLP collector is reachable;
+- production mode enabled;
+- scoped service authentication/principals;
+- durable worker enabled and consuming jobs;
+- external PostgreSQL/Qdrant;
+- TLS + rate limiting + upstream authentication policy;
+- egress policy/source allowlists;
+- PostgreSQL backup/restore test completed;
+- Qdrant snapshot/restore test completed;
+- pinned application image tag/digest;
+- resource limits/load test evidence;
+- logs/traces exported to a durable backend;
 - embedding collection/model/dimension recorded as release metadata;
-- durable ingestion worker/queue before relying on ingestion across rolling restarts.
+- CJK retrieval baseline captured for the deployment corpus;
+- real-provider staging smoke green;
+- rollback/migration/reindex runbook reviewed.
