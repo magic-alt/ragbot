@@ -37,16 +37,19 @@ class Retriever:
         qdrant_hits = self._qdrant.search(query_vector, filters, top_k * 2)
         fts_hits = fts_search(self._repo, query, filters, top_k * 2)
 
-        qdrant_ranked = [(point_id, score) for point_id, score, _payload in qdrant_hits]
+        # Qdrant point IDs are storage UUIDs; ranking/fusion operates on Ragbot's
+        # logical chunk IDs so the same hit from vector and lexical retrieval is
+        # fused instead of appearing as two unrelated candidates.
+        qdrant_ranked = []
+        payload_map: Dict[str, Dict[str, Any]] = {}
+        for point_id, score, payload in qdrant_hits:
+            logical_id = str(payload.get("chunk_id") or point_id)
+            qdrant_ranked.append((logical_id, score))
+            payload_map[logical_id] = payload
+
         fts_ranked = [(chunk.chunk_id, score) for chunk, score in fts_hits]
         fused = rrf_fuse(qdrant_ranked, fts_ranked)
 
-        payload_map: Dict[str, Dict[str, Any]] = {
-            point_id: payload for point_id, _score, payload in qdrant_hits
-        }
-
-        # Reranking is an optional quality layer. A Cohere/local endpoint outage
-        # must not take down otherwise healthy vector + lexical retrieval.
         if self._reranker and hasattr(self._reranker, "enabled") and self._reranker.enabled:
             candidates = fused[:top_k * 2]
             candidate_texts = []
@@ -75,13 +78,14 @@ class Retriever:
                 payload = payload_map.get(chunk_id, {})
                 if not payload:
                     continue
+                logical_id = str(payload.get("chunk_id") or chunk_id)
                 results.append(
                     RetrievalChunk(
-                        chunk_id=chunk_id,
+                        chunk_id=logical_id,
                         doc_id=payload.get("doc_id", "unknown"),
                         text=payload.get("text", ""),
                         score=fused_score,
-                        citations=[payload.get("citation", chunk_id)],
+                        citations=[payload.get("citation", logical_id)],
                         metadata=payload,
                     )
                 )
@@ -96,6 +100,7 @@ class Retriever:
                     "url": chunk.url,
                     "page": chunk.page,
                     "section": chunk.section,
+                    "qdrant_point_id": chunk.qdrant_point_id,
                 }
             )
             results.append(
