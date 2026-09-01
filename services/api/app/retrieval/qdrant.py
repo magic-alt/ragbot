@@ -1,10 +1,37 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Stable forever: changing this namespace would orphan every existing vector.
+_QDRANT_POINT_NAMESPACE = uuid.UUID("b7a573f1-d7ec-4d1d-9797-f067b5d42c7d")
+
+
+def point_id_for_chunk(chunk_id: str) -> str:
+    """Return a deterministic Qdrant-compatible UUID for a logical chunk id."""
+    return str(uuid.uuid5(_QDRANT_POINT_NAMESPACE, str(chunk_id)))
+
+
+def normalize_qdrant_point_id(point_id: Optional[str], chunk_id: str) -> str:
+    """Normalize a persisted point id or derive the canonical deterministic UUID.
+
+    Historical Ragbot versions persisted arbitrary logical chunk IDs as
+    ``qdrant_point_id``. Real Qdrant accepts only unsigned integers or UUIDs, so
+    arbitrary legacy strings must not be reused for deletes/re-ingestion.
+    """
+    if point_id is not None:
+        raw = str(point_id).strip()
+        if raw.isdigit():
+            return raw
+        try:
+            return str(uuid.UUID(raw))
+        except (ValueError, AttributeError):
+            pass
+    return point_id_for_chunk(chunk_id)
 
 
 class InMemoryQdrant:
@@ -20,11 +47,11 @@ class InMemoryQdrant:
         for point_id, vector, payload in points:
             if len(vector) != self._dim:
                 raise ValueError(f"Vector dimension mismatch: got {len(vector)}, expected {self._dim}")
-            self._points[point_id] = (vector, payload)
+            self._points[str(point_id)] = (vector, payload)
 
     def delete_points(self, point_ids: Iterable[str]) -> int:
         deleted = 0
-        for point_id in set(point_ids):
+        for point_id in set(str(item) for item in point_ids):
             if self._points.pop(point_id, None) is not None:
                 deleted += 1
         return deleted
@@ -93,7 +120,7 @@ class QdrantClientAdapter:
             self._client.upsert(collection_name=self._collection, points=payload_points, wait=True)
 
     def delete_points(self, point_ids: Iterable[str]) -> int:
-        ids = list(dict.fromkeys(point_ids))
+        ids = list(dict.fromkeys(str(item) for item in point_ids))
         if not ids:
             return 0
         self._client.delete(
@@ -140,7 +167,7 @@ class QdrantClientAdapter:
                 with_vectors=False,
                 query_filter=qfilter,
             )
-        else:  # qdrant-client newer query API
+        else:
             response = self._client.query_points(
                 collection_name=self._collection,
                 query=query_vector,
@@ -171,12 +198,12 @@ class QdrantClientAdapter:
         )
 
     def _ensure_payload_indexes(self) -> None:
-        """Index high-cardinality filter fields used on every enterprise query."""
         rest = self._rest
         schemas = {
             "tenant_id": rest.PayloadSchemaType.KEYWORD,
             "source_type": rest.PayloadSchemaType.KEYWORD,
             "doc_id": rest.PayloadSchemaType.KEYWORD,
+            "chunk_id": rest.PayloadSchemaType.KEYWORD,
             "acl_hash": rest.PayloadSchemaType.KEYWORD,
             "tags": rest.PayloadSchemaType.KEYWORD,
             "ingested_at_ts": rest.PayloadSchemaType.FLOAT,
@@ -187,16 +214,12 @@ class QdrantClientAdapter:
         for field_name, schema in schemas.items():
             if field_name in existing:
                 continue
-            try:
-                self._client.create_payload_index(
-                    collection_name=self._collection,
-                    field_name=field_name,
-                    field_schema=schema,
-                    wait=True,
-                )
-            except Exception:
-                logger.exception("Unable to create Qdrant payload index: %s", field_name)
-                raise
+            self._client.create_payload_index(
+                collection_name=self._collection,
+                field_name=field_name,
+                field_schema=schema,
+                wait=True,
+            )
 
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
