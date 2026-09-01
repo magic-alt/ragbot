@@ -8,6 +8,7 @@ services:
       - "${RAGBOT_API_PORT:-8000}:8000"
     environment:
       RAGBOT_ENV: ${RAGBOT_ENV:-development}
+      RAGBOT_INGESTION_MODE: worker
       RAGBOT_API_KEYS: ${RAGBOT_API_KEYS:-}
       RAGBOT_API_KEY_PRINCIPALS: ${RAGBOT_API_KEY_PRINCIPALS:-}
       RAGBOT_LLM_PROVIDER: ${RAGBOT_LLM_PROVIDER:-openai}
@@ -60,6 +61,55 @@ services:
       qdrant:
         condition: service_started
     restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ragbot:local
+    command: ["python", "-m", "services.worker.main"]
+    environment:
+      RAGBOT_ENV: ${RAGBOT_ENV:-development}
+      RAGBOT_INGESTION_MODE: worker
+      RAGBOT_WORKER_POLL_SECONDS: ${RAGBOT_WORKER_POLL_SECONDS:-1}
+      RAGBOT_WORKER_LEASE_SECONDS: ${RAGBOT_WORKER_LEASE_SECONDS:-120}
+      RAGBOT_WORKER_MAX_ATTEMPTS: ${RAGBOT_WORKER_MAX_ATTEMPTS:-3}
+      RAGBOT_LLM_PROVIDER: ${RAGBOT_LLM_PROVIDER:-openai}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.openai.com}
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-rag_chunks}
+      QDRANT_DIM: ${QDRANT_DIM:-1536}
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-ragbot}:${POSTGRES_PASSWORD:-ragbot}@postgres:5432/${POSTGRES_DB:-ragbot}
+      POSTGRES_ALLOWED_SCHEMAS: ${POSTGRES_ALLOWED_SCHEMAS:-}
+      RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS: /data
+      RAGBOT_WEB_ALLOWED_HOSTS: ${RAGBOT_WEB_ALLOWED_HOSTS:-}
+      RAGBOT_PDF_ALLOWED_HOSTS: ${RAGBOT_PDF_ALLOWED_HOSTS:-}
+      RAGBOT_GIT_ALLOWED_HOSTS: ${RAGBOT_GIT_ALLOWED_HOSTS:-}
+      RAGBOT_ALLOW_PRIVATE_SOURCE_NETWORKS: ${RAGBOT_ALLOW_PRIVATE_SOURCE_NETWORKS:-false}
+      RAGBOT_WEB_MAX_REDIRECTS: ${RAGBOT_WEB_MAX_REDIRECTS:-5}
+      RAGBOT_PDF_MAX_REDIRECTS: ${RAGBOT_PDF_MAX_REDIRECTS:-5}
+      RAGBOT_PDF_MAX_BYTES: ${RAGBOT_PDF_MAX_BYTES:-26214400}
+      CODE_REPO_ROOT: /app
+    volumes:
+      - type: bind
+        source: ${RAGBOT_DATA_DIR:-./data}
+        target: /data
+        read_only: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_started
+    restart: unless-stopped
+    stop_grace_period: 30s
 
   migrate:
     build:

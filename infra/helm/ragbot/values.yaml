@@ -1,6 +1,7 @@
 # Default values for ragbot Helm chart.
 # Defaults remain development-friendly. Production must set RAGBOT_ENV=production,
-# external PostgreSQL/Qdrant, semantic embeddings and scoped API principals.
+# external PostgreSQL/Qdrant, semantic embeddings, scoped API principals and the
+# durable ingestion worker.
 
 replicaCount: 1
 
@@ -37,6 +38,22 @@ autoscaling:
   maxReplicas: 10
   targetCPUUtilizationPercentage: 70
 
+worker:
+  # Development can keep this disabled and run API ingestion inline. Production
+  # rendering fails unless the durable worker is enabled.
+  enabled: false
+  replicaCount: 1
+  pollSeconds: "1"
+  leaseSeconds: "120"
+  maxAttempts: "3"
+  resources:
+    limits:
+      cpu: "2"
+      memory: 2Gi
+    requests:
+      cpu: 250m
+      memory: 256Mi
+
 env:
   LOG_LEVEL: INFO
   LOG_FORMAT: json
@@ -69,7 +86,8 @@ otel:
 existingSecret: ""
 
 # Optional data/config mounts for local_fs/local PDF/local Git sources. Production
-# paths must remain inside RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS.
+# paths must remain inside RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS. These mounts are
+# shared by the API and ingestion worker so source paths have identical meaning.
 extraVolumes: []
 # Example:
 # extraVolumes:

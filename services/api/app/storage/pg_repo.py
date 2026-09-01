@@ -2,14 +2,17 @@
 
 This adapter keeps SQL types aligned with the current migrations and adds the
 production-only operations that should execute in PostgreSQL rather than in
-application memory (bulk lifecycle cleanup and full-text search).
+application memory (bulk lifecycle cleanup, durable job leasing and full-text
+search).
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import asdict
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from ..retrieval.lexical import build_or_tsquery, contains_cjk, lexicalize
 from .models import ACLPolicy, Chunk, Document, IngestionJob, Source
 from .postgres_repo import PostgresRepo as _LegacyPostgresRepo
 
@@ -44,7 +47,6 @@ class PostgresRepo(_LegacyPostgresRepo):
     @staticmethod
     def _jsonb(value: Any) -> Any:
         from psycopg.types.json import Jsonb
-
         return Jsonb(value)
 
     def healthcheck(self) -> bool:
@@ -112,11 +114,12 @@ class PostgresRepo(_LegacyPostgresRepo):
             INSERT INTO chunks (
                 chunk_id, doc_id, tenant_id, chunk_index, text,
                 path, url, page, section, checksum, qdrant_point_id,
-                created_at, metadata
+                created_at, metadata, fts_text
             ) VALUES (
                 %(chunk_id)s, %(doc_id)s, %(tenant_id)s, %(chunk_index)s, %(text)s,
                 %(path)s, %(url)s, %(page)s, %(section)s, %(checksum)s,
-                %(qdrant_point_id)s, COALESCE(%(created_at)s, NOW()), %(metadata)s
+                %(qdrant_point_id)s, COALESCE(%(created_at)s, NOW()), %(metadata)s,
+                %(fts_text)s
             )
             ON CONFLICT (chunk_id) DO UPDATE SET
                 doc_id = EXCLUDED.doc_id,
@@ -129,10 +132,12 @@ class PostgresRepo(_LegacyPostgresRepo):
                 section = EXCLUDED.section,
                 checksum = EXCLUDED.checksum,
                 qdrant_point_id = EXCLUDED.qdrant_point_id,
-                metadata = EXCLUDED.metadata
+                metadata = EXCLUDED.metadata,
+                fts_text = EXCLUDED.fts_text
         """
         params = asdict(chunk)
         params["metadata"] = self._jsonb(params["metadata"])
+        params["fts_text"] = lexicalize(chunk.text) if contains_cjk(chunk.text) else chunk.text
         with self._pool.connection() as conn:
             conn.execute(sql, params)
 
@@ -150,11 +155,20 @@ class PostgresRepo(_LegacyPostgresRepo):
         filters: Dict[str, Any],
         top_k: int,
     ) -> List[Tuple[Chunk, float]]:
-        """Use PostgreSQL's GIN-backed FTS index for lexical retrieval."""
-        conditions = [
-            "to_tsvector('simple', c.text) @@ plainto_tsquery('simple', %(query)s)"
-        ]
+        """Use PostgreSQL GIN-backed lexical retrieval with CJK bigram support."""
+        cjk = contains_cjk(query)
         params: Dict[str, Any] = {"query": query, "limit": top_k}
+        vector_expr = "to_tsvector('simple', COALESCE(NULLIF(c.fts_text, ''), c.text))"
+        if cjk:
+            fts_query = build_or_tsquery(query)
+            if not fts_query:
+                return []
+            params["fts_query"] = fts_query
+            query_expr = "to_tsquery('simple', %(fts_query)s)"
+        else:
+            query_expr = "plainto_tsquery('simple', %(query)s)"
+
+        conditions = [f"{vector_expr} @@ {query_expr}"]
 
         tenant_id = filters.get("tenant_id")
         if tenant_id:
@@ -201,10 +215,7 @@ class PostgresRepo(_LegacyPostgresRepo):
 
         sql = f"""
             SELECT c.*,
-                   ts_rank_cd(
-                       to_tsvector('simple', c.text),
-                       plainto_tsquery('simple', %(query)s)
-                   ) AS fts_score
+                   ts_rank_cd({vector_expr}, {query_expr}) AS fts_score
             FROM chunks AS c
             WHERE {' AND '.join(conditions)}
             ORDER BY fts_score DESC, c.chunk_id
@@ -301,12 +312,15 @@ class PostgresRepo(_LegacyPostgresRepo):
             INSERT INTO ingestion_jobs (
                 job_id, tenant_id, source_id, source_type, source_config,
                 status, doc_count, chunk_count, error,
-                started_at, completed_at, created_at, stats
+                started_at, completed_at, created_at, stats,
+                attempts, available_at, lease_owner, lease_expires_at, heartbeat_at
             ) VALUES (
                 %(job_id)s, %(tenant_id)s, %(source_id)s, %(source_type)s,
                 %(source_config)s, %(status)s, %(doc_count)s, %(chunk_count)s,
                 %(error)s, %(started_at)s, %(completed_at)s,
-                COALESCE(%(created_at)s, NOW()), %(stats)s
+                COALESCE(%(created_at)s, NOW()), %(stats)s,
+                %(attempts)s, COALESCE(%(available_at)s, NOW()), %(lease_owner)s,
+                %(lease_expires_at)s, %(heartbeat_at)s
             )
             ON CONFLICT (job_id) DO UPDATE SET
                 status = EXCLUDED.status,
@@ -315,7 +329,12 @@ class PostgresRepo(_LegacyPostgresRepo):
                 error = EXCLUDED.error,
                 started_at = EXCLUDED.started_at,
                 completed_at = EXCLUDED.completed_at,
-                stats = EXCLUDED.stats
+                stats = EXCLUDED.stats,
+                attempts = EXCLUDED.attempts,
+                available_at = EXCLUDED.available_at,
+                lease_owner = EXCLUDED.lease_owner,
+                lease_expires_at = EXCLUDED.lease_expires_at,
+                heartbeat_at = EXCLUDED.heartbeat_at
         """
         params = asdict(job)
         params["source_config"] = self._jsonb(params["source_config"])
@@ -327,13 +346,9 @@ class PostgresRepo(_LegacyPostgresRepo):
         if not kwargs:
             return self.get_job(job_id)
         allowed = {
-            "status",
-            "doc_count",
-            "chunk_count",
-            "error",
-            "started_at",
-            "completed_at",
-            "stats",
+            "status", "doc_count", "chunk_count", "error", "started_at",
+            "completed_at", "stats", "attempts", "available_at", "lease_owner",
+            "lease_expires_at", "heartbeat_at",
         }
         unknown = set(kwargs) - allowed
         if unknown:
@@ -348,6 +363,135 @@ class PostgresRepo(_LegacyPostgresRepo):
         with self._pool.connection() as conn:
             conn.execute(sql, params)
         return self.get_job(job_id)
+
+    def claim_next_job(
+        self,
+        worker_id: str,
+        lease_seconds: int = 120,
+        max_attempts: int = 3,
+    ) -> Optional[IngestionJob]:
+        """Atomically recover expired leases and claim one pending job."""
+        with self._pool.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """
+                    UPDATE ingestion_jobs
+                    SET status = 'failed',
+                        error = 'Worker lease expired and maximum attempts were exhausted',
+                        completed_at = NOW(),
+                        lease_owner = NULL,
+                        lease_expires_at = NULL
+                    WHERE status = 'running'
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at <= NOW()
+                      AND attempts >= %s
+                    """,
+                    (max_attempts,),
+                )
+                conn.execute(
+                    """
+                    UPDATE ingestion_jobs
+                    SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL
+                    WHERE status = 'running'
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at <= NOW()
+                      AND attempts < %s
+                    """,
+                    (max_attempts,),
+                )
+                row = conn.execute(
+                    """
+                    WITH candidate AS (
+                        SELECT job_id
+                        FROM ingestion_jobs
+                        WHERE status = 'pending'
+                          AND available_at <= NOW()
+                          AND attempts < %s
+                        ORDER BY available_at, created_at
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                    )
+                    UPDATE ingestion_jobs AS j
+                    SET status = 'running',
+                        attempts = j.attempts + 1,
+                        started_at = COALESCE(j.started_at, NOW()),
+                        lease_owner = %s,
+                        heartbeat_at = NOW(),
+                        lease_expires_at = NOW() + (%s * INTERVAL '1 second'),
+                        error = NULL
+                    FROM candidate
+                    WHERE j.job_id = candidate.job_id
+                    RETURNING j.*
+                    """,
+                    (max_attempts, worker_id, lease_seconds),
+                ).fetchone()
+        return self._row_to_job(row, None) if row else None
+
+    def heartbeat_job(self, job_id: str, worker_id: str, lease_seconds: int = 120) -> bool:
+        with self._pool.connection() as conn:
+            result = conn.execute(
+                """
+                UPDATE ingestion_jobs
+                SET heartbeat_at = NOW(),
+                    lease_expires_at = NOW() + (%s * INTERVAL '1 second')
+                WHERE job_id = %s AND status = 'running' AND lease_owner = %s
+                """,
+                (lease_seconds, job_id, worker_id),
+            )
+            return (result.rowcount or 0) > 0
+
+    def release_job_lease(self, job_id: str, worker_id: str) -> bool:
+        with self._pool.connection() as conn:
+            result = conn.execute(
+                """
+                UPDATE ingestion_jobs
+                SET lease_owner = NULL, lease_expires_at = NULL
+                WHERE job_id = %s AND lease_owner = %s
+                """,
+                (job_id, worker_id),
+            )
+            return (result.rowcount or 0) > 0
+
+    @staticmethod
+    def _row_to_job(row: Any, conn: Any) -> IngestionJob:
+        if hasattr(row, "keys"):
+            d = dict(row)
+        elif hasattr(row, "_asdict"):
+            d = row._asdict()
+        else:
+            cols = [
+                "job_id", "tenant_id", "source_id", "source_type", "source_config",
+                "status", "doc_count", "chunk_count", "error", "started_at",
+                "completed_at", "created_at", "stats", "attempts", "available_at",
+                "lease_owner", "lease_expires_at", "heartbeat_at",
+            ]
+            d = dict(zip(cols, row))
+        source_config = d.get("source_config", {})
+        if isinstance(source_config, str):
+            source_config = json.loads(source_config)
+        stats = d.get("stats", {})
+        if isinstance(stats, str):
+            stats = json.loads(stats)
+        return IngestionJob(
+            job_id=d["job_id"],
+            tenant_id=d["tenant_id"],
+            source_id=d["source_id"],
+            source_type=d["source_type"],
+            source_config=source_config,
+            status=d.get("status", "pending"),
+            doc_count=d.get("doc_count", 0),
+            chunk_count=d.get("chunk_count", 0),
+            error=d.get("error"),
+            started_at=d.get("started_at"),
+            completed_at=d.get("completed_at"),
+            created_at=d.get("created_at"),
+            stats=stats,
+            attempts=d.get("attempts", 0),
+            available_at=d.get("available_at"),
+            lease_owner=d.get("lease_owner"),
+            lease_expires_at=d.get("lease_expires_at"),
+            heartbeat_at=d.get("heartbeat_at"),
+        )
 
     # ── Debug ──────────────────────────────────────────────────────────
 

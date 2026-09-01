@@ -1,19 +1,23 @@
 """Ingestion jobs API routes.
 
-Jobs currently execute in the API process executor. This remains intentionally
-non-durable until an external worker queue owns job execution.
+With PostgreSQL, jobs are persisted first and consumed by the independent
+``services.worker.main`` process. In-memory development keeps the historical
+executor path so a one-process local setup remains convenient.
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from ..auth.principal import allowed_tenants, authorize_tenant
+from ..storage.models import IngestionJob
 
 
 class TriggerJobRequest(BaseModel):
@@ -37,6 +41,36 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
                 detail=f"Source is not active: {source.source_id} ({source.status})",
             )
 
+    def _enqueue(source, services, job_id: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        services.repo.add_job(
+            IngestionJob(
+                job_id=job_id,
+                tenant_id=source.tenant_id,
+                source_id=source.source_id,
+                source_type=source.source_type,
+                source_config=source.config,
+                status="pending",
+                created_at=now,
+                available_at=now,
+            )
+        )
+
+        if not _use_durable_worker():
+            from services.worker.pipeline import run_ingest_pipeline
+
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(
+                None,
+                run_ingest_pipeline,
+                source,
+                services.repo,
+                services.qdrant,
+                job_id,
+                services.embedder,
+                True,
+            )
+
     @router.post("/jobs", status_code=202, response_model=TriggerJobResponse)
     async def trigger_job(
         payload: TriggerJobRequest,
@@ -52,18 +86,7 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         _assert_source_ingestible(source)
 
         job_id = uuid.uuid4().hex
-        from services.worker.pipeline import run_ingest_pipeline
-
-        loop = asyncio.get_running_loop()
-        loop.run_in_executor(
-            None,
-            run_ingest_pipeline,
-            source,
-            services.repo,
-            services.qdrant,
-            job_id,
-            services.embedder,
-        )
+        _enqueue(source, services, job_id)
         return TriggerJobResponse(status="accepted", job_id=job_id, source_id=source.source_id)
 
     @router.get("/jobs")
@@ -107,18 +130,18 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         _assert_source_ingestible(source)
 
         new_job_id = uuid.uuid4().hex
-        from services.worker.pipeline import run_ingest_pipeline
-
-        loop = asyncio.get_running_loop()
-        loop.run_in_executor(
-            None,
-            run_ingest_pipeline,
-            source,
-            services.repo,
-            services.qdrant,
-            new_job_id,
-            services.embedder,
-        )
+        _enqueue(source, services, new_job_id)
         return {"status": "accepted", "job_id": new_job_id, "retried_from": job_id}
 
     return router
+
+
+def _use_durable_worker() -> bool:
+    mode = os.getenv("RAGBOT_INGESTION_MODE", "auto").strip().lower()
+    if mode not in {"auto", "inline", "worker"}:
+        raise RuntimeError("RAGBOT_INGESTION_MODE must be one of: auto, inline, worker")
+    if mode == "worker":
+        return True
+    if mode == "inline":
+        return False
+    return bool(os.getenv("POSTGRES_DSN"))

@@ -16,19 +16,28 @@ All notable project changes intended for release are recorded here. Ragbot still
 - API-key principal model for tenant/user/group/role scoped service identities;
 - production runtime validation through `RAGBOT_ENV=production`;
 - Web/PDF/Git network-source policy and local source-root policy;
-- v1 release/security regression tests.
+- Apache License 2.0;
+- PostgreSQL-backed durable ingestion queue with atomic worker claims, leases, heartbeat, crash recovery and bounded attempts;
+- independent ingestion worker deployments for Docker Compose and Helm;
+- CJK bigram lexical representation on top of PostgreSQL `simple` FTS;
+- deterministic PostgreSQL CJK retrieval regression corpus with Recall@5/MRR release floors;
+- manual production-style staging smoke workflow for real LLM/embedding provider credentials, PostgreSQL and Qdrant;
+- v1 release/security/queue/CJK regression tests.
 
 ### Changed
 
 - FastAPI `/openapi.json` is the canonical HTTP API schema instead of a separately maintained static OpenAPI file;
 - ingestion/query paths share one embedding contract and reject incompatible vector dimensions;
 - PostgreSQL migrations are executed explicitly during Compose/Helm deployment rather than only on first database-volume creation;
+- PostgreSQL-backed deployments enqueue ingestion jobs for independent workers instead of executing them in the API process;
+- production mode rejects inline ingestion and Helm production renders require the durable worker;
 - Source and Ingest APIs enforce tenant authorization when API-key principals are configured;
 - `/search`, `/chat` and `/v1/chat/completions` derive ACL scope from trusted API-key principals;
 - optional reranker failures fall back to RRF ordering instead of failing retrieval;
 - Web/PDF downloads are bounded and redirects are revalidated;
 - local source paths are constrained to configured roots in production;
-- global metrics/cost/cache endpoints require an admin principal when scoped principals are enabled.
+- global metrics/cost/cache endpoints require an admin principal when scoped principals are enabled;
+- unchanged chunks carry a lexical representation version so retrieval-format upgrades trigger one controlled rewrite/reindex pass.
 
 ### Fixed
 
@@ -42,16 +51,23 @@ All notable project changes intended for release are recorded here. Ragbot still
 - previously advertised unsupported source types and contract drift;
 - unsafe remote-source SSRF exposure to loopback/private/link-local destinations;
 - silent embedding vector truncation/zero-padding;
-- cross-tenant Source/Ingest access possible with service-level API keys.
+- cross-tenant Source/Ingest access possible with service-level API keys;
+- ingestion jobs being lost when an API process restarted mid-execution;
+- poor Chinese lexical recall caused by treating long CJK strings as unsplit `simple`-FTS tokens.
 
-### Known limitations before v1.0
+### Remaining release gates
 
-- ingestion jobs still execute in the API process and are not backed by a durable worker queue;
-- PostgreSQL FTS currently uses `simple` text search and is not specialized for Chinese segmentation;
-- API-key principals are service-to-service authorization, not full OIDC/SAML enterprise IAM;
-- OpenAI-compatible `usage` is estimated until provider token accounting is propagated;
-- repository currently has no LICENSE; the owner must choose one before an intended open-source v1 release.
+- run the manual `Staging Smoke` workflow successfully with the intended production-compatible LLM/embedding credential;
+- record staging evidence for backup/restore, network policy and any reranker that will be enabled in production;
+- create a release-only change for `0.5.0 -> 1.0.0`, synchronize Python/FastAPI/Helm/image metadata, and publish the tag/release only from the exact CI-validated release commit.
+
+### Non-blocking v1.x roadmap
+
+- OIDC/OAuth2/SAML and centrally managed enterprise IAM beyond service-to-service API-key principals;
+- larger customer/domain CJK corpora and optional PGroonga/pg_jieba/external lexical-index comparison when they outperform the built-in bigram baseline materially enough to justify operational complexity;
+- stronger PostgreSQL/Qdrant cross-store activation semantics such as outbox/reconciler or staged source versions;
+- authoritative provider token accounting for the OpenAI-compatible `usage` object.
 
 ## Release policy
 
-A future `1.0.0` release should move the accepted Unreleased entries into a dated `## [1.0.0] - YYYY-MM-DD` section, update package/Helm/application metadata together, pass the full CI matrix on that exact commit, and only then create the `v1.0.0` tag and GitHub Release.
+A future `1.0.0` release should move the accepted Unreleased entries into a dated `## [1.0.0] - YYYY-MM-DD` section, update package/Helm/application metadata together, pass the full CI matrix on that exact commit, complete the real-provider staging gate, and only then create the `v1.0.0` tag and GitHub Release.
