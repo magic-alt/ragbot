@@ -17,8 +17,9 @@ def validate_production_environment() -> None:
     """Fail fast when a production deployment would silently degrade.
 
     Development keeps the convenient in-memory/hash fallbacks. Production must
-    explicitly configure durable state, semantic embeddings and scoped caller
-    identities before the API is allowed to serve requests.
+    explicitly configure durable state, semantic embeddings, scoped caller
+    identities and the durable ingestion worker path before the API is allowed
+    to serve requests.
     """
     if not is_production():
         return
@@ -30,7 +31,11 @@ def validate_production_environment() -> None:
         "RAGBOT_API_KEYS": "authenticated API access",
         "RAGBOT_API_KEY_PRINCIPALS": "tenant/user-bound caller identity",
     }
-    missing = [f"{name} ({reason})" for name, reason in required.items() if not os.getenv(name, "").strip()]
+    missing = [
+        f"{name} ({reason})"
+        for name, reason in required.items()
+        if not os.getenv(name, "").strip()
+    ]
 
     if not (os.getenv("EMBEDDING_API_KEY", "").strip() or os.getenv("OPENAI_API_KEY", "").strip()):
         missing.append("EMBEDDING_API_KEY or OPENAI_API_KEY (embedding authentication)")
@@ -39,6 +44,13 @@ def validate_production_environment() -> None:
         raise RuntimeError(
             "Production configuration is incomplete; refusing unsafe fallback: "
             + "; ".join(missing)
+        )
+
+    ingestion_mode = os.getenv("RAGBOT_INGESTION_MODE", "auto").strip().lower()
+    if ingestion_mode not in {"auto", "worker"}:
+        raise RuntimeError(
+            "Production ingestion must use the durable worker path; "
+            "set RAGBOT_INGESTION_MODE=worker or leave it as auto"
         )
 
     api_keys = {key.strip() for key in os.environ["RAGBOT_API_KEYS"].split(",") if key.strip()}
