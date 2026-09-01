@@ -1,9 +1,20 @@
 {{- $scaled := or (gt (int .Values.replicaCount) 1) .Values.autoscaling.enabled -}}
+{{- $environment := default "development" (index .Values.env "RAGBOT_ENV") -}}
+{{- $production := or (eq $environment "production") (eq $environment "prod") -}}
 {{- if and $scaled (not .Values.qdrant.url) -}}
 {{- fail "multi-replica/autoscaled Ragbot requires qdrant.url; in-memory vectors are process-local" -}}
 {{- end -}}
 {{- if and $scaled (not .Values.existingSecret) (not .Values.postgres.dsn) -}}
 {{- fail "multi-replica/autoscaled Ragbot requires postgres.dsn or existingSecret; in-memory metadata is process-local" -}}
+{{- end -}}
+{{- if and $production (not .Values.worker.enabled) -}}
+{{- fail "production Ragbot requires worker.enabled=true for durable ingestion" -}}
+{{- end -}}
+{{- if and $production (not .Values.qdrant.url) -}}
+{{- fail "production Ragbot requires qdrant.url" -}}
+{{- end -}}
+{{- if and $production (not .Values.existingSecret) (not .Values.postgres.dsn) -}}
+{{- fail "production Ragbot requires postgres.dsn or existingSecret" -}}
 {{- end -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -61,6 +72,8 @@ spec:
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
+            - name: RAGBOT_INGESTION_MODE
+              value: {{ ternary "worker" "inline" .Values.worker.enabled | quote }}
             - name: QDRANT_URL
               value: {{ .Values.qdrant.url | quote }}
             - name: QDRANT_COLLECTION
