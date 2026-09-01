@@ -30,11 +30,15 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
             repo = InMemoryRepo()
             logger.info("Using InMemoryRepo")
 
-    # ── Qdrant ────────────────────────────────────────────────────────
+    # ── Qdrant + Embedder ─────────────────────────────────────────────
+    # The vector-store dimension is a single source of truth for both
+    # ingestion and query embeddings.  Keep the in-memory default lightweight,
+    # while retaining the historical 1536 production default for Qdrant.
     qdrant_url = os.getenv("QDRANT_URL")
     qdrant_api_key = os.getenv("QDRANT_API_KEY")
     qdrant_collection = os.getenv("QDRANT_COLLECTION", "rag_chunks")
-    qdrant_dim = int(os.getenv("QDRANT_DIM", "1536"))
+    qdrant_dim_raw = os.getenv("QDRANT_DIM")
+    qdrant_dim = int(qdrant_dim_raw) if qdrant_dim_raw else (1536 if qdrant_url else 64)
 
     if qdrant_url:
         qdrant = QdrantClientAdapter(
@@ -44,10 +48,17 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
             dim=qdrant_dim,
         )
     else:
-        qdrant = InMemoryQdrant()
+        qdrant = InMemoryQdrant(dim=qdrant_dim)
 
-    # ── Embedder + Reranker ───────────────────────────────────────────
-    embedder = build_embedder()
+    embedder = build_embedder(dimension=qdrant_dim)
+    if embedder.dimension != qdrant.dim:
+        raise RuntimeError(
+            "Embedding dimension does not match vector store: "
+            f"embedder={embedder.dimension}, qdrant={qdrant.dim}. "
+            "Set QDRANT_DIM consistently and reindex after changing embedding models."
+        )
+
+    # ── Reranker ──────────────────────────────────────────────────────
     reranker = build_reranker()
     retriever = Retriever(repo, qdrant, embedder=embedder, reranker=reranker)
 

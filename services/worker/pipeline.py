@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional
 
+from services.api.app.retrieval.embedder import Embedder
 from services.api.app.storage.models import Chunk, Document, IngestionJob, Source
 from services.api.app.storage.repo import InMemoryRepo
 from services.worker.dedup.hashing import content_hash
@@ -24,11 +25,14 @@ def run_ingest_pipeline(
     repo: InMemoryRepo,
     qdrant: object,
     job_id: Optional[str] = None,
+    embedder: Optional[Embedder] = None,
 ) -> IngestionJob:
     """Execute the full ingestion pipeline for a source.
 
-    Creates an IngestionJob, runs the appropriate connector + chunker,
-    performs dedup, embeds, and upserts. Updates job status throughout.
+    The caller-provided embedder is the same instance used by retrieval.  This
+    prevents documents from being indexed in a different vector space from
+    query embeddings.  The optional default is retained for direct unit-test
+    and backwards-compatible callers.
     """
     now = datetime.now(timezone.utc).isoformat()
     job_id = job_id or uuid.uuid4().hex
@@ -51,12 +55,12 @@ def run_ingest_pipeline(
         # Dedup: skip chunks whose checksum already exists
         chunk_list = _dedup_chunks(chunk_list, repo)
 
-        # Create or update document record
+        # Create or update document record before persisting chunks.
         doc = _ensure_document(source, repo, chunk_count=len(chunk_list))
 
-        # Embed and upsert to vector store
+        # Embed and upsert to vector store using the query-time embedder.
         if chunk_list:
-            embed_and_upsert(repo, qdrant, chunk_list)
+            embed_and_upsert(repo, qdrant, chunk_list, embedder=embedder)
 
         repo.update_job(
             job_id,
@@ -85,7 +89,10 @@ def _run_connector(source: Source, repo: InMemoryRepo) -> Iterable[Chunk]:
     source_type = source.source_type
     config = source.config
     tenant_id = source.tenant_id
-    doc_id = config.get("doc_id") or uuid.uuid4().hex
+    # Keep chunk/document identity deterministic and identical.  Previously a
+    # random chunk doc_id was generated while _ensure_document() used
+    # ``doc-{source_id}``, creating orphaned metadata (and FK failures in PG).
+    doc_id = config.get("doc_id") or f"doc-{source.source_id}"
     version = config.get("version", "1.0")
     tags = source.tags
     acl_hash = _resolve_acl_hash(source, repo)

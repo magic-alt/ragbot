@@ -127,7 +127,6 @@ class APIEmbedder:
             )
             response.raise_for_status()
             data = response.json()
-            # Sort by index to maintain order
             items = sorted(data["data"], key=lambda x: x["index"])
             vectors = []
             for item in items:
@@ -147,16 +146,22 @@ class APIEmbedder:
         return vec + [0.0] * (self._dimension - len(vec))
 
 
-def build_embedder() -> Embedder:
-    """Factory: build an Embedder from environment variables.
+def build_embedder(dimension: Optional[int] = None) -> Embedder:
+    """Build an Embedder from environment variables.
+
+    ``dimension`` is the vector-store dimension selected by the caller.  It is
+    deliberately shared by both the API and hash embedders so ingestion and
+    retrieval cannot silently use incompatible vector sizes.
 
     Environment variables:
-        EMBEDDING_MODEL: Model name (e.g., 'text-embedding-3-small')
-        EMBEDDING_API_KEY: API key (falls back to OPENAI_API_KEY)
-        EMBEDDING_BASE_URL: API base URL (falls back to OPENAI_BASE_URL)
-        QDRANT_DIM: Override dimension (optional)
+        EMBEDDING_MODEL: Model name (e.g. ``text-embedding-3-small``)
+        EMBEDDING_API_KEY: API key (falls back to ``OPENAI_API_KEY``)
+        EMBEDDING_BASE_URL: API base URL (falls back to ``OPENAI_BASE_URL``)
+        QDRANT_DIM: Explicit dimension override
 
-    Returns HashEmbedder if EMBEDDING_MODEL is not set.
+    Returns a HashEmbedder for development when no usable embedding API is
+    configured.  Production semantic retrieval should configure an embedding
+    model and API key.
     """
     model = os.getenv("EMBEDDING_MODEL", "")
     api_key = os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY", "")
@@ -165,19 +170,22 @@ def build_embedder() -> Embedder:
         or os.getenv("OPENAI_BASE_URL")
         or "https://api.openai.com"
     )
+    dim_override = os.getenv("QDRANT_DIM")
+    effective_dimension = int(dim_override) if dim_override else dimension
 
     if model and api_key:
-        dim_override = os.getenv("QDRANT_DIM")
-        dimension = int(dim_override) if dim_override else None
         logger.info("Using API embedder: model=%s, base_url=%s", model, base_url)
         return APIEmbedder(
             api_key=api_key,
             base_url=base_url,
             model=model,
-            dimension=dimension,
+            dimension=effective_dimension,
         )
 
+    fallback_dimension = effective_dimension or 64
     logger.info(
-        "Using hash-based embedder (set EMBEDDING_MODEL + EMBEDDING_API_KEY for real embeddings)"
+        "Using hash-based embedder (dimension=%d); set EMBEDDING_MODEL + "
+        "EMBEDDING_API_KEY/OPENAI_API_KEY for semantic embeddings",
+        fallback_dimension,
     )
-    return HashEmbedder()
+    return HashEmbedder(dim=fallback_dimension)
