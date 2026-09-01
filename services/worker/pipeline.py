@@ -19,6 +19,7 @@ from services.worker.dedup.versioning import next_version
 from services.worker.jobs.embed_and_upsert import embed_and_upsert
 
 logger = logging.getLogger(__name__)
+LEXICAL_VERSION = 2
 
 
 def run_ingest_pipeline(
@@ -234,6 +235,7 @@ def _normalize_chunk_metadata(source: Source, chunks: list[Chunk], now: str) -> 
         metadata["source_type"] = source.source_type
         metadata["tags"] = list(source.tags)
         metadata.setdefault("version", source.config.get("version", "1.0"))
+        metadata["lexical_version"] = LEXICAL_VERSION
         metadata["ingested_at"] = now
         metadata["doc_updated_at"] = now
         chunk.metadata = metadata
@@ -299,6 +301,7 @@ def _reuse_key(chunk: Chunk) -> tuple:
         tuple(metadata.get("tags") or []),
         metadata.get("acl_hash") or "public",
         metadata.get("version"),
+        metadata.get("lexical_version"),
     )
 
 
