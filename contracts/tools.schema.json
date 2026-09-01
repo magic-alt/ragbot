@@ -6,15 +6,15 @@
     "retrieve": {
       "type": "object",
       "properties": {
-        "query": {"type": "string"},
-        "top_k": {"type": "integer", "minimum": 1, "default": 20},
+        "query": {"type": "string", "minLength": 1},
+        "top_k": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
         "filters": {
           "type": "object",
           "properties": {
-            "tenant_id": {"type": "string"},
+            "tenant_id": {"type": "string", "minLength": 1},
             "source_types": {
               "type": "array",
-              "items": {"enum": ["pdf", "web", "repo", "db_doc"]}
+              "items": {"enum": ["pdf", "web", "repo", "local_fs"]}
             },
             "doc_ids": {"type": "array", "items": {"type": "string"}},
             "tags": {"type": "array", "items": {"type": "string"}},
@@ -23,16 +23,22 @@
             "time_range": {
               "type": "object",
               "properties": {
-                "start": {"type": "string"},
-                "end": {"type": "string"}
-              }
+                "start": {"type": ["string", "null"]},
+                "end": {"type": ["string", "null"]}
+              },
+              "additionalProperties": false
             },
-            "security_scope": {"type": "string"}
+            "security_scope": {
+              "type": "array",
+              "items": {"type": "string"}
+            }
           },
-          "required": ["tenant_id", "security_scope"]
+          "required": ["tenant_id"],
+          "additionalProperties": false
         }
       },
-      "required": ["query", "filters"]
+      "required": ["query", "filters"],
+      "additionalProperties": false
     },
     "sql_query": {
       "type": "object",
@@ -43,7 +49,8 @@
         "limit": {"type": "integer", "minimum": 1, "maximum": 200},
         "timeout_ms": {"type": "integer", "minimum": 100}
       },
-      "required": ["dialect", "query"]
+      "required": ["dialect", "query"],
+      "additionalProperties": false
     },
     "code_search": {
       "type": "object",
@@ -54,7 +61,8 @@
         "path_glob": {"type": "string"},
         "max_hits": {"type": "integer", "minimum": 1}
       },
-      "required": ["query", "repo"]
+      "required": ["query", "repo"],
+      "additionalProperties": false
     },
     "web_search": {
       "type": "object",
@@ -63,14 +71,16 @@
         "recency_days": {"type": "integer", "minimum": 1},
         "domains": {"type": "array", "items": {"type": "string"}}
       },
-      "required": ["query"]
+      "required": ["query"],
+      "additionalProperties": false
     },
     "web_fetch": {
       "type": "object",
       "properties": {
         "url": {"type": "string"}
       },
-      "required": ["url"]
+      "required": ["url"],
+      "additionalProperties": false
     },
     "respond": {
       "type": "object",
@@ -80,7 +90,9 @@
         "confidence": {"enum": ["high", "medium", "low"]},
         "followups": {"type": "array", "items": {"type": "string"}}
       },
-      "required": ["answer", "citations", "confidence"]
+      "required": ["answer", "citations", "confidence"],
+      "additionalProperties": false
     }
-  }
+  },
+  "additionalProperties": false
 }
