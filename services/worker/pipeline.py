@@ -30,12 +30,7 @@ def run_ingest_pipeline(
     embedder: Optional[Embedder] = None,
     existing_job: bool = False,
 ) -> IngestionJob:
-    """Execute one replacement-oriented ingestion run for ``source``.
-
-    ``existing_job=True`` is used by the durable worker after it atomically
-    claims a queued job. Direct/local callers retain the historical behavior of
-    creating the job record inside the pipeline.
-    """
+    """Execute one replacement-oriented ingestion run for ``source``."""
     now = datetime.now(timezone.utc).isoformat()
     job_id = job_id or uuid.uuid4().hex
     if existing_job:
@@ -69,16 +64,10 @@ def run_ingest_pipeline(
         _normalize_chunk_metadata(source, candidate_chunks, now)
         candidate_chunks = _dedup_chunks(candidate_chunks)
         current_chunks, chunks_to_write, chunks_reused = _reuse_unchanged_chunks(
-            candidate_chunks,
-            previous_chunks.values(),
+            candidate_chunks, previous_chunks.values()
         )
 
-        # Documents must exist before new chunks to satisfy PostgreSQL FKs.
         documents = _ensure_documents(source, repo, current_chunks)
-
-        # Only changed/new chunks are re-embedded. Unchanged chunks keep their
-        # point IDs and vector payloads, preserving the historical dedup contract
-        # while avoiding repository-wide checksum data loss.
         if chunks_to_write:
             embed_and_upsert(repo, qdrant, chunks_to_write, embedder=embedder)
 
@@ -89,9 +78,6 @@ def run_ingest_pipeline(
 
         vector_chunks_removed = _delete_qdrant_points(qdrant, stale_chunk_ids)
         chunks_removed = repo.delete_chunks(stale_chunk_ids)
-
-        # Also delete by document to clean vector orphans from historical
-        # partial failures that may no longer have a matching SQL chunk row.
         _delete_qdrant_documents(qdrant, removed_doc_ids)
         documents_removed = repo.delete_documents(removed_doc_ids)
 
@@ -128,7 +114,6 @@ def run_ingest_pipeline(
             chunks_reused,
             chunks_removed,
         )
-
     except Exception as exc:
         logger.exception("Pipeline failed: job=%s source=%s", job_id, source.source_id)
         repo.update_job(
@@ -141,28 +126,38 @@ def run_ingest_pipeline(
         )
 
     result = repo.get_job(job_id)
-    if result is None:  # pragma: no cover - repository contract guard
+    if result is None:  # pragma: no cover
         raise RuntimeError(f"Ingestion job disappeared after execution: {job_id}")
     return result
 
 
 def source_documents(source: Source, repo: Repo) -> list[Document]:
-    """Return documents currently owned by ``source`` within its tenant."""
+    """Return documents owned by ``source`` without unnecessary tenant scans.
+
+    PDF/Web/Git sources own one deterministic document and can use an indexed
+    primary-key lookup. ``local_fs`` remains a multi-document source and scans
+    the tenant's documents for its source-specific prefix.
+    """
     base_doc_id = source.config.get("doc_id") or f"doc-{source.source_id}"
-    documents = repo.list_documents(source.tenant_id)
-    if source.source_type == "local_fs":
-        prefix = f"{base_doc_id}:"
-        return [doc for doc in documents if doc.doc_id.startswith(prefix)]
+    if source.source_type != "local_fs":
+        document = repo.get_document(base_doc_id)
+        if document and document.tenant_id == source.tenant_id:
+            return [document]
+        # Legacy documents may have source ownership only in their URI.
+        return [
+            doc
+            for doc in repo.list_documents(source.tenant_id)
+            if doc.uri and doc.uri.startswith(f"source://{source.source_id}")
+        ]
+
+    prefix = f"{base_doc_id}:"
     return [
-        doc
-        for doc in documents
-        if doc.doc_id == base_doc_id
-        or (doc.uri and doc.uri.startswith(f"source://{source.source_id}"))
+        doc for doc in repo.list_documents(source.tenant_id)
+        if doc.doc_id.startswith(prefix)
     ]
 
 
 def purge_source_knowledge(source: Source, repo: Repo, qdrant: object) -> dict[str, int]:
-    """Remove all indexed knowledge owned by a source before tombstoning it."""
     doc_ids = {doc.doc_id for doc in source_documents(source, repo)}
     vector_documents = _delete_qdrant_documents(qdrant, doc_ids)
     documents = repo.delete_documents(doc_ids)
@@ -203,7 +198,12 @@ def _run_connector(source: Source, repo: Repo) -> Iterable[Chunk]:
 
     if source_type == "pdf":
         from services.worker.jobs.ingest_pdf import ingest_pdf
-        return ingest_pdf(path=config["path"], **common)
+        return ingest_pdf(
+            path=config["path"],
+            chunk_size=int(config.get("chunk_size", 800)),
+            chunk_overlap=int(config.get("chunk_overlap", 100)),
+            **common,
+        )
     if source_type == "web":
         from services.worker.jobs.ingest_web import ingest_web
         return ingest_web(url=config["url"], **common)
@@ -229,7 +229,6 @@ def _resolve_acl_hash(source: Source, repo: Repo) -> str:
 
 
 def _normalize_chunk_metadata(source: Source, chunks: list[Chunk], now: str) -> None:
-    """Enforce connector-independent metadata used by both retrieval backends."""
     for chunk in chunks:
         metadata = dict(chunk.metadata or {})
         metadata["source_type"] = source.source_type
@@ -242,7 +241,6 @@ def _normalize_chunk_metadata(source: Source, chunks: list[Chunk], now: str) -> 
 
 
 def _dedup_chunks(chunks: list[Chunk]) -> list[Chunk]:
-    """Deduplicate only within one logical document in the current ingest run."""
     seen: set[tuple[str, str]] = set()
     deduped: list[Chunk] = []
     for chunk in chunks:
@@ -262,28 +260,22 @@ def _reuse_unchanged_chunks(
     candidates: list[Chunk],
     previous: Iterable[Chunk],
 ) -> tuple[list[Chunk], list[Chunk], int]:
-    """Reuse stable point IDs when content and retrieval metadata are unchanged."""
     previous_by_key = {_reuse_key(chunk): chunk for chunk in previous}
     current: list[Chunk] = []
     to_write: list[Chunk] = []
     reused = 0
-
     for candidate in candidates:
         old = previous_by_key.get(_reuse_key(candidate))
         if old is None:
             current.append(candidate)
             to_write.append(candidate)
             continue
-
         candidate.chunk_id = old.chunk_id
         candidate.qdrant_point_id = old.qdrant_point_id or old.chunk_id
         candidate.created_at = old.created_at
-        # Keep persisted metadata exactly aligned with the unchanged Qdrant
-        # payload. Ingestion timestamps describe the chunk version, not the job.
         candidate.metadata = dict(old.metadata or {})
         current.append(candidate)
         reused += 1
-
     return current, to_write, reused
 
 
@@ -314,7 +306,6 @@ def _ensure_documents(source: Source, repo: Repo, chunks: list[Chunk]) -> list[D
     first_chunk_by_doc_id: dict[str, Chunk] = {}
     for chunk in chunks:
         first_chunk_by_doc_id.setdefault(chunk.doc_id, chunk)
-
     documents: list[Document] = []
     for doc_id, chunk in first_chunk_by_doc_id.items():
         file_path = Path(chunk.path) if chunk.path else None
@@ -335,7 +326,6 @@ def _ensure_document(
     now = datetime.now(timezone.utc).isoformat()
     resolved_doc_id = doc_id or source.config.get("doc_id") or f"doc-{source.source_id}"
     existing = repo.get_document(resolved_doc_id)
-
     if existing:
         existing.version = next_version(existing.version)
         existing.ingested_at = now
