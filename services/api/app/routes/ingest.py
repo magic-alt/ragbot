@@ -39,7 +39,8 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
 
         job_id = uuid.uuid4().hex
 
-        # Run pipeline in background thread to avoid blocking
+        # Run pipeline in background thread to avoid blocking.  Pass the same
+        # embedder used by query retrieval so index/query vectors stay aligned.
         from services.worker.pipeline import run_ingest_pipeline
         loop = asyncio.get_event_loop()
         loop.run_in_executor(
@@ -49,6 +50,7 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
             services.repo,
             services.qdrant,
             job_id,
+            services.embedder,
         )
 
         return TriggerJobResponse(status="accepted", job_id=job_id, source_id=source.source_id)
@@ -94,6 +96,7 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
             services.repo,
             services.qdrant,
             new_job_id,
+            services.embedder,
         )
 
         return {"status": "accepted", "job_id": new_job_id, "retried_from": job_id}

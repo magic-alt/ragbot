@@ -1,8 +1,35 @@
-.pytest_cache
-__pycache__
-*.pyc
-tmpclaude*
-.env
-*.egg-info
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
 dist/
 build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Local data / runtime state
+data/
+logs/
+tmp/
+tmpclaude*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

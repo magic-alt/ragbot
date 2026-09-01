@@ -13,7 +13,7 @@ from ..storage.models import Source
 
 class CreateSourceRequest(BaseModel):
     tenant_id: str
-    source_type: str = Field(description="local_fs | pdf | web | repo | email | database")
+    source_type: str = Field(description="local_fs | pdf | web | repo | database")
     name: str
     config: Dict[str, Any] = Field(default_factory=dict)
     acl_policy_id: Optional[str] = None
@@ -28,7 +28,9 @@ class UpdateSourceRequest(BaseModel):
     tags: Optional[List[str]] = None
 
 
-VALID_SOURCE_TYPES = {"local_fs", "pdf", "web", "repo", "email", "database"}
+# Keep advertised API source types aligned with worker.pipeline. Reserved
+# connectors (for example email) belong in the roadmap until implemented.
+VALID_SOURCE_TYPES = {"local_fs", "pdf", "web", "repo", "database"}
 
 
 def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
@@ -74,7 +76,11 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         source = services.repo.get_source(source_id)
         if not source or source.status == "deleted":
             raise HTTPException(404, "Source not found")
-        updates = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
+        updates = {
+            key: value
+            for key, value in payload.model_dump(exclude_unset=True).items()
+            if value is not None
+        }
         updates["updated_at"] = datetime.now(timezone.utc).isoformat()
         updated = services.repo.update_source(source_id, **updates)
         return asdict(updated)

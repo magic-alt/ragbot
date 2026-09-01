@@ -1,24 +1,71 @@
-version: "3.9"
-
 services:
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "${RAGBOT_API_PORT:-8000}:8000"
     environment:
-      - LOG_LEVEL=INFO
-      - LOG_FORMAT=json
-      - RAGBOT_API_KEYS=
-      - OPENAI_API_KEY=
-      - OPENAI_MODEL=gpt-4o-mini
-      - EMBEDDING_MODEL=
-      - EMBEDDING_API_KEY=
-      - QDRANT_URL=http://qdrant:6333
-      - QDRANT_COLLECTION=rag_chunks
-      - QDRANT_DIM=1536
-      - POSTGRES_DSN=
+      RAGBOT_API_KEYS: ${RAGBOT_API_KEYS:-}
+      RAGBOT_LLM_PROVIDER: ${RAGBOT_LLM_PROVIDER:-openai}
+      RAGBOT_CORS_ORIGINS: ${RAGBOT_CORS_ORIGINS:-http://localhost:3000}
+      RAGBOT_CACHE_ENABLED: ${RAGBOT_CACHE_ENABLED:-true}
+      RAGBOT_CACHE_TTL_SECONDS: ${RAGBOT_CACHE_TTL_SECONDS:-300}
+      RAGBOT_CACHE_MAX_ENTRIES: ${RAGBOT_CACHE_MAX_ENTRIES:-1000}
+      RAGBOT_TRACING_ENABLED: ${RAGBOT_TRACING_ENABLED:-false}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      OPENAI_WEB_MODEL: ${OPENAI_WEB_MODEL:-gpt-4o-mini}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.openai.com}
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-rag_chunks}
+      QDRANT_DIM: ${QDRANT_DIM:-1536}
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-ragbot}:${POSTGRES_PASSWORD:-ragbot}@postgres:5432/${POSTGRES_DB:-ragbot}
+      POSTGRES_ALLOWED_SCHEMAS: ${POSTGRES_ALLOWED_SCHEMAS:-}
+      POSTGRES_SQL_LIMIT: ${POSTGRES_SQL_LIMIT:-200}
+      POSTGRES_SQL_TIMEOUT_MS: ${POSTGRES_SQL_TIMEOUT_MS:-3000}
+      RAGBOT_RERANK_ENABLED: ${RAGBOT_RERANK_ENABLED:-false}
+      RAGBOT_RERANK_PROVIDER: ${RAGBOT_RERANK_PROVIDER:-cohere}
+      RAGBOT_RERANK_MODEL: ${RAGBOT_RERANK_MODEL:-rerank-v3.5}
+      RAGBOT_RERANK_API_KEY: ${RAGBOT_RERANK_API_KEY:-}
+      RAGBOT_RERANK_BASE_URL: ${RAGBOT_RERANK_BASE_URL:-}
+      RAGBOT_RERANK_TOP_K: ${RAGBOT_RERANK_TOP_K:-10}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      CODE_REPO_ROOT: /app
+    volumes:
+      - type: bind
+        source: ${RAGBOT_DATA_DIR:-./data}
+        target: /data
+        read_only: true
     depends_on:
-      - qdrant
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ragbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ragbot}
+      POSTGRES_DB: ${POSTGRES_DB:-ragbot}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ragbot} -d ${POSTGRES_DB:-ragbot}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   qdrant:
@@ -29,5 +76,27 @@ services:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
 
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    profiles: [observability]
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    profiles: [ollama]
+    restart: unless-stopped
+
 volumes:
+  postgres_data:
   qdrant_data:
+  ollama_data:

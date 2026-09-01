@@ -74,7 +74,12 @@ def ingest_local_fs(
     tags: Optional[list] = None,
     acl_hash: Optional[str] = None,
 ) -> Iterable[Chunk]:
-    """Scan a directory and ingest all matching text files."""
+    """Scan a directory and ingest all matching text files.
+
+    Each file gets a deterministic document ID derived from the Source-level
+    base ID. This preserves file-level document semantics while allowing the
+    pipeline to create matching Document rows before persistence.
+    """
     logger.info("Ingesting local_fs directory: %s (doc_id=%s)", directory, doc_id)
     ext_set: Optional[Set[str]] = None
     if extensions:
