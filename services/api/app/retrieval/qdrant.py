@@ -19,9 +19,7 @@ class InMemoryQdrant:
     def upsert(self, points: Iterable[Tuple[str, List[float], Dict[str, Any]]]) -> None:
         for point_id, vector, payload in points:
             if len(vector) != self._dim:
-                raise ValueError(
-                    f"Vector dimension mismatch: got {len(vector)}, expected {self._dim}"
-                )
+                raise ValueError(f"Vector dimension mismatch: got {len(vector)}, expected {self._dim}")
             self._points[point_id] = (vector, payload)
 
     def delete_points(self, point_ids: Iterable[str]) -> int:
@@ -35,12 +33,14 @@ class InMemoryQdrant:
         ids = set(doc_ids)
         if not ids:
             return 0
-        to_delete = [
+        return self.delete_points(
             point_id
             for point_id, (_vector, payload) in self._points.items()
             if payload.get("doc_id") in ids
-        ]
-        return self.delete_points(to_delete)
+        )
+
+    def count(self) -> int:
+        return len(self._points)
 
     def healthcheck(self) -> bool:
         return True
@@ -50,15 +50,11 @@ class InMemoryQdrant:
 
     def search(self, query_vector: List[float], filters: Dict[str, Any], top_k: int) -> List[Tuple[str, float, Dict[str, Any]]]:
         if len(query_vector) != self._dim:
-            raise ValueError(
-                f"Query vector dimension mismatch: got {len(query_vector)}, expected {self._dim}"
-            )
+            raise ValueError(f"Query vector dimension mismatch: got {len(query_vector)}, expected {self._dim}")
         results: List[Tuple[str, float, Dict[str, Any]]] = []
         for point_id, (vector, payload) in self._points.items():
-            if not _match_filters(payload, filters):
-                continue
-            score = _cosine_similarity(query_vector, vector)
-            results.append((point_id, score, payload))
+            if _match_filters(payload, filters):
+                results.append((point_id, _cosine_similarity(query_vector, vector), payload))
         results.sort(key=lambda item: item[1], reverse=True)
         return results[:top_k]
 
@@ -74,35 +70,27 @@ class QdrantClientAdapter:
         try:
             from qdrant_client import QdrantClient
             from qdrant_client.http import models as rest
-        except ImportError as exc:  # pragma: no cover - optional dependency
+        except ImportError as exc:  # pragma: no cover
             raise RuntimeError("qdrant-client is required for QdrantClientAdapter") from exc
-
         self._rest = rest
         self._client = QdrantClient(url=url, api_key=api_key)
         self._collection = collection_name
         self._dim = dim
         self._ensure_collection()
+        self._ensure_payload_indexes()
 
     @property
     def dim(self) -> int:
         return self._dim
 
     def upsert(self, points: Iterable[Tuple[str, List[float], Dict[str, Any]]]) -> None:
-        rest = self._rest
         payload_points = []
         for point_id, vector, payload in points:
             if len(vector) != self._dim:
-                raise ValueError(
-                    f"Vector dimension mismatch: got {len(vector)}, expected {self._dim}"
-                )
-            payload_points.append(rest.PointStruct(id=point_id, vector=vector, payload=payload))
-        if not payload_points:
-            return
-        self._client.upsert(
-            collection_name=self._collection,
-            points=payload_points,
-            wait=True,
-        )
+                raise ValueError(f"Vector dimension mismatch: got {len(vector)}, expected {self._dim}")
+            payload_points.append(self._rest.PointStruct(id=point_id, vector=vector, payload=payload))
+        if payload_points:
+            self._client.upsert(collection_name=self._collection, points=payload_points, wait=True)
 
     def delete_points(self, point_ids: Iterable[str]) -> int:
         ids = list(dict.fromkeys(point_ids))
@@ -121,20 +109,14 @@ class QdrantClientAdapter:
             return 0
         selector = self._rest.FilterSelector(
             filter=self._rest.Filter(
-                must=[
-                    self._rest.FieldCondition(
-                        key="doc_id",
-                        match=self._rest.MatchAny(any=ids),
-                    )
-                ]
+                must=[self._rest.FieldCondition(key="doc_id", match=self._rest.MatchAny(any=ids))]
             )
         )
-        self._client.delete(
-            collection_name=self._collection,
-            points_selector=selector,
-            wait=True,
-        )
+        self._client.delete(collection_name=self._collection, points_selector=selector, wait=True)
         return len(ids)
+
+    def count(self) -> int:
+        return int(self._client.count(collection_name=self._collection, exact=True).count)
 
     def healthcheck(self) -> bool:
         return bool(self._client.collection_exists(self._collection))
@@ -146,19 +128,29 @@ class QdrantClientAdapter:
 
     def search(self, query_vector: List[float], filters: Dict[str, Any], top_k: int) -> List[Tuple[str, float, Dict[str, Any]]]:
         if len(query_vector) != self._dim:
-            raise ValueError(
-                f"Query vector dimension mismatch: got {len(query_vector)}, expected {self._dim}"
-            )
+            raise ValueError(f"Query vector dimension mismatch: got {len(query_vector)}, expected {self._dim}")
         qfilter = _build_qdrant_filter(filters, self._rest)
-        results = self._client.search(
-            collection_name=self._collection,
-            query_vector=query_vector,
-            limit=top_k,
-            with_payload=True,
-            with_vectors=False,
-            query_filter=qfilter,
-        )
-        return [(str(hit.id), hit.score, hit.payload or {}) for hit in results]
+        search = getattr(self._client, "search", None)
+        if callable(search):
+            results = search(
+                collection_name=self._collection,
+                query_vector=query_vector,
+                limit=top_k,
+                with_payload=True,
+                with_vectors=False,
+                query_filter=qfilter,
+            )
+        else:  # qdrant-client newer query API
+            response = self._client.query_points(
+                collection_name=self._collection,
+                query=query_vector,
+                limit=top_k,
+                with_payload=True,
+                with_vectors=False,
+                query_filter=qfilter,
+            )
+            results = response.points
+        return [(str(hit.id), float(hit.score), hit.payload or {}) for hit in results]
 
     def _ensure_collection(self) -> None:
         rest = self._rest
@@ -177,6 +169,34 @@ class QdrantClientAdapter:
             collection_name=self._collection,
             vectors_config=rest.VectorParams(size=self._dim, distance=rest.Distance.COSINE),
         )
+
+    def _ensure_payload_indexes(self) -> None:
+        """Index high-cardinality filter fields used on every enterprise query."""
+        rest = self._rest
+        schemas = {
+            "tenant_id": rest.PayloadSchemaType.KEYWORD,
+            "source_type": rest.PayloadSchemaType.KEYWORD,
+            "doc_id": rest.PayloadSchemaType.KEYWORD,
+            "acl_hash": rest.PayloadSchemaType.KEYWORD,
+            "tags": rest.PayloadSchemaType.KEYWORD,
+            "ingested_at_ts": rest.PayloadSchemaType.FLOAT,
+            "doc_updated_at_ts": rest.PayloadSchemaType.FLOAT,
+        }
+        info = self._client.get_collection(self._collection)
+        existing = set((getattr(info, "payload_schema", None) or {}).keys())
+        for field_name, schema in schemas.items():
+            if field_name in existing:
+                continue
+            try:
+                self._client.create_payload_index(
+                    collection_name=self._collection,
+                    field_name=field_name,
+                    field_schema=schema,
+                    wait=True,
+                )
+            except Exception:
+                logger.exception("Unable to create Qdrant payload index: %s", field_name)
+                raise
 
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
@@ -200,29 +220,21 @@ def _match_filters(payload: Dict[str, Any], filters: Dict[str, Any]) -> bool:
     if doc_ids and payload.get("doc_id") not in doc_ids:
         return False
     tags = filters.get("tags")
-    if tags:
-        payload_tags = payload.get("tags") or []
-        if not any(tag in payload_tags for tag in tags):
-            return False
+    if tags and not any(tag in (payload.get("tags") or []) for tag in tags):
+        return False
     path_prefix = filters.get("path_prefix")
-    if path_prefix:
-        path = payload.get("path") or ""
-        if not path.startswith(path_prefix):
-            return False
+    if path_prefix and not (payload.get("path") or "").startswith(path_prefix):
+        return False
     url_prefix = filters.get("url_prefix")
-    if url_prefix:
-        url = payload.get("url") or ""
-        if not url.startswith(url_prefix):
-            return False
+    if url_prefix and not (payload.get("url") or "").startswith(url_prefix):
+        return False
     time_range = filters.get("time_range")
     if time_range:
         start = to_epoch(time_range.get("start"))
         end = to_epoch(time_range.get("end"))
         timestamp = to_epoch(
-            payload.get("ingested_at_ts")
-            or payload.get("doc_updated_at_ts")
-            or payload.get("ingested_at")
-            or payload.get("doc_updated_at")
+            payload.get("ingested_at_ts") or payload.get("doc_updated_at_ts")
+            or payload.get("ingested_at") or payload.get("doc_updated_at")
         )
         if timestamp is not None:
             if start is not None and timestamp < start:
@@ -231,11 +243,10 @@ def _match_filters(payload: Dict[str, Any], filters: Dict[str, Any]) -> bool:
                 return False
     security_scope = filters.get("security_scope")
     if security_scope:
-        allowed = set(security_scope)
         acl_hash = payload.get("acl_hash")
         if acl_hash is None:
-            return "public" in allowed
-        if acl_hash not in allowed:
+            return "public" in set(security_scope)
+        if acl_hash not in set(security_scope):
             return False
     return True
 
@@ -245,24 +256,18 @@ def _build_qdrant_filter(filters: Dict[str, Any], rest: Any) -> Optional[Any]:
         return None
     must = []
     should = []
-    tenant_id = filters.get("tenant_id")
-    if tenant_id:
-        must.append(rest.FieldCondition(key="tenant_id", match=rest.MatchValue(value=tenant_id)))
-    source_types = filters.get("source_types")
-    if source_types:
-        must.append(rest.FieldCondition(key="source_type", match=rest.MatchAny(any=source_types)))
-    doc_ids = filters.get("doc_ids")
-    if doc_ids:
-        must.append(rest.FieldCondition(key="doc_id", match=rest.MatchAny(any=doc_ids)))
-    tags = filters.get("tags")
-    if tags:
-        must.append(rest.FieldCondition(key="tags", match=rest.MatchAny(any=tags)))
-    path_prefix = filters.get("path_prefix")
-    if path_prefix:
-        must.append(rest.FieldCondition(key="path", match=rest.MatchText(text=path_prefix)))
-    url_prefix = filters.get("url_prefix")
-    if url_prefix:
-        must.append(rest.FieldCondition(key="url", match=rest.MatchText(text=url_prefix)))
+    if filters.get("tenant_id"):
+        must.append(rest.FieldCondition(key="tenant_id", match=rest.MatchValue(value=filters["tenant_id"])))
+    if filters.get("source_types"):
+        must.append(rest.FieldCondition(key="source_type", match=rest.MatchAny(any=filters["source_types"])))
+    if filters.get("doc_ids"):
+        must.append(rest.FieldCondition(key="doc_id", match=rest.MatchAny(any=filters["doc_ids"])))
+    if filters.get("tags"):
+        must.append(rest.FieldCondition(key="tags", match=rest.MatchAny(any=filters["tags"])))
+    if filters.get("path_prefix"):
+        must.append(rest.FieldCondition(key="path", match=rest.MatchText(text=filters["path_prefix"])))
+    if filters.get("url_prefix"):
+        must.append(rest.FieldCondition(key="url", match=rest.MatchText(text=filters["url_prefix"])))
     time_range = filters.get("time_range")
     if time_range:
         start = to_epoch(time_range.get("start"))
@@ -271,9 +276,8 @@ def _build_qdrant_filter(filters: Dict[str, Any], rest: Any) -> Optional[Any]:
             range_clause = rest.Range(gte=start, lte=end)
             should.append(rest.FieldCondition(key="ingested_at_ts", range=range_clause))
             should.append(rest.FieldCondition(key="doc_updated_at_ts", range=range_clause))
-    security_scope = filters.get("security_scope")
-    if security_scope:
-        must.append(rest.FieldCondition(key="acl_hash", match=rest.MatchAny(any=security_scope)))
+    if filters.get("security_scope"):
+        must.append(rest.FieldCondition(key="acl_hash", match=rest.MatchAny(any=filters["security_scope"])))
     if not must and not should:
         return None
     return rest.Filter(must=must or None, should=should or None)
