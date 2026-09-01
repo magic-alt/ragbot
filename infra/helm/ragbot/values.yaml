@@ -1,6 +1,8 @@
-# Default values for ragbot Helm chart
+# Default values for ragbot Helm chart.
+# The default is a single replica because empty external-service URLs select
+# in-memory storage. Configure Postgres + Qdrant before scaling horizontally.
 
-replicaCount: 2
+replicaCount: 1
 
 image:
   repository: ragbot
@@ -45,9 +47,9 @@ env:
   RAGBOT_MODEL_ROUTING: "false"
   OTEL_SERVICE_NAME: ragbot-api
 
-# External services
+# External services. Production/multi-replica deployments should configure both.
 postgres:
-  dsn: ""  # Set via secret
+  dsn: ""
 qdrant:
   url: ""
   collection: rag_chunks
@@ -55,10 +57,10 @@ qdrant:
 otel:
   endpoint: ""
 
-# Secrets (reference existing k8s secrets)
+# Optional existing Secret keys:
+#   POSTGRES_DSN, QDRANT_API_KEY, OPENAI_API_KEY, RAGBOT_API_KEYS, ...
 existingSecret: ""
 
-# Health check
 livenessProbe:
   httpGet:
     path: /admin/health
@@ -67,12 +69,11 @@ livenessProbe:
   periodSeconds: 30
 readinessProbe:
   httpGet:
-    path: /admin/health
+    path: /admin/ready
     port: 8000
   initialDelaySeconds: 5
   periodSeconds: 10
 
-# Rolling update strategy
 strategy:
   type: RollingUpdate
   rollingUpdate:
