@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional
 
 from .models import ACLPolicy, Chunk, Document, IngestionJob, Source, TableData
@@ -180,6 +181,55 @@ class InMemoryRepo:
                     setattr(job, key, value)
             return job
 
+    def claim_next_job(self, worker_id: str, lease_seconds: int = 120, max_attempts: int = 3) -> Optional[IngestionJob]:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            for job in sorted(self._jobs.values(), key=lambda item: item.created_at or ""):
+                if job.status == "running" and _is_expired(job.lease_expires_at, now):
+                    if job.attempts >= max_attempts:
+                        job.status = "failed"
+                        job.error = "Worker lease expired and maximum attempts were exhausted"
+                        job.completed_at = now.isoformat()
+                        job.lease_owner = None
+                        job.lease_expires_at = None
+                        continue
+                    job.status = "pending"
+                    job.lease_owner = None
+                    job.lease_expires_at = None
+
+                if job.status != "pending" or job.attempts >= max_attempts:
+                    continue
+                if job.available_at and _parse_time(job.available_at) > now:
+                    continue
+
+                job.status = "running"
+                job.attempts += 1
+                job.started_at = job.started_at or now.isoformat()
+                job.lease_owner = worker_id
+                job.heartbeat_at = now.isoformat()
+                job.lease_expires_at = (now + timedelta(seconds=lease_seconds)).isoformat()
+                return job
+        return None
+
+    def heartbeat_job(self, job_id: str, worker_id: str, lease_seconds: int = 120) -> bool:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job or job.status != "running" or job.lease_owner != worker_id:
+                return False
+            job.heartbeat_at = now.isoformat()
+            job.lease_expires_at = (now + timedelta(seconds=lease_seconds)).isoformat()
+            return True
+
+    def release_job_lease(self, job_id: str, worker_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job or job.lease_owner != worker_id:
+                return False
+            job.lease_owner = None
+            job.lease_expires_at = None
+            return True
+
     # ── Tables ─────────────────────────────────────────────────────────
 
     def register_table(self, table: TableData) -> None:
@@ -205,3 +255,11 @@ class InMemoryRepo:
                 "jobs": [asdict(job) for job in self._jobs.values()],
                 "tables": [asdict(table) for table in self._tables.values()],
             }
+
+
+def _parse_time(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _is_expired(value: Optional[str], now: datetime) -> bool:
+    return bool(value and _parse_time(value) <= now)
