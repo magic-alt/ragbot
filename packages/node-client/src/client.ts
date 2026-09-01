@@ -1,4 +1,4 @@
-import type { Citation } from "./types";
+import type { Citation, SourceType } from "./types";
 
 export interface ChatRequest {
   query: string;
@@ -7,7 +7,7 @@ export interface ChatRequest {
   session_id?: string;
   stream?: boolean;
   constraints?: {
-    source_types?: Array<"pdf" | "web" | "repo" | "db_doc">;
+    source_types?: SourceType[];
     doc_ids?: string[];
     tags?: string[];
     repo?: string;
@@ -17,6 +17,7 @@ export interface ChatRequest {
     time_from?: string;
     time_to?: string;
   };
+  client_context?: Record<string, unknown>;
 }
 
 export interface ChatResponse {
@@ -60,12 +61,18 @@ export interface SSEFinalEvent {
   followups: string[];
 }
 
+export interface SSEErrorEvent {
+  request_id?: string;
+  error: string;
+}
+
 export type SSEEvent =
   | { event: "tool_call"; data: SSEToolCallEvent }
   | { event: "tool_result"; data: SSEToolResultEvent }
   | { event: "token"; data: SSETokenEvent }
   | { event: "citation"; data: SSECitationEvent }
-  | { event: "final"; data: SSEFinalEvent };
+  | { event: "final"; data: SSEFinalEvent }
+  | { event: "error"; data: SSEErrorEvent };
 
 export type SSEEventHandler = (event: SSEEvent) => void;
 
@@ -117,6 +124,21 @@ export async function chatStream(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let currentEvent = "";
+
+  const consumeLine = (line: string) => {
+    if (line.startsWith("event: ")) {
+      currentEvent = line.slice(7).trim();
+    } else if (line.startsWith("data: ") && currentEvent) {
+      try {
+        const data = JSON.parse(line.slice(6));
+        onEvent({ event: currentEvent, data } as SSEEvent);
+      } catch {
+        // Ignore malformed event payloads without terminating the stream.
+      }
+      currentEvent = "";
+    }
+  };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -125,20 +147,11 @@ export async function chatStream(
 
     const lines = buffer.split("\n");
     buffer = lines.pop() ?? "";
+    for (const line of lines) consumeLine(line.replace(/\r$/, ""));
+  }
 
-    let currentEvent = "";
-    for (const line of lines) {
-      if (line.startsWith("event: ")) {
-        currentEvent = line.slice(7).trim();
-      } else if (line.startsWith("data: ") && currentEvent) {
-        try {
-          const data = JSON.parse(line.slice(6));
-          onEvent({ event: currentEvent, data } as SSEEvent);
-        } catch {
-          // skip malformed JSON
-        }
-        currentEvent = "";
-      }
-    }
+  buffer += decoder.decode();
+  if (buffer) {
+    for (const line of buffer.split("\n")) consumeLine(line.replace(/\r$/, ""));
   }
 }
