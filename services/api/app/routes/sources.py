@@ -8,15 +8,20 @@ from typing import Any, Callable, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from contracts.types import SourceType
 from services.worker.pipeline import purge_source_knowledge
 
 from ..storage.models import Source
 
 
+SOURCE_TYPE_VALUES = ("local_fs", "pdf", "web", "repo")
+VALID_SOURCE_TYPES = set(SOURCE_TYPE_VALUES)
+
+
 class CreateSourceRequest(BaseModel):
     tenant_id: str = Field(min_length=1)
-    source_type: SourceType
+    # Keep runtime validation explicit so unsupported types retain the existing
+    # 400 API contract, while still publishing the supported values in OpenAPI.
+    source_type: str = Field(json_schema_extra={"enum": list(SOURCE_TYPE_VALUES)})
     name: str = Field(min_length=1)
     config: Dict[str, Any] = Field(default_factory=dict)
     acl_policy_id: Optional[str] = None
@@ -31,7 +36,9 @@ class UpdateSourceRequest(BaseModel):
     tags: Optional[List[str]] = None
 
 
-VALID_SOURCE_TYPES = {"local_fs", "pdf", "web", "repo"}
+def _validate_source_type(source_type: str) -> None:
+    if source_type not in VALID_SOURCE_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid source_type: {source_type}")
 
 
 def _validate_source_config(source_type: str, config: Dict[str, Any]) -> None:
@@ -49,6 +56,7 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
 
     @router.post("", status_code=201)
     async def create_source(payload: CreateSourceRequest, _key=Depends(auth_dep)):
+        _validate_source_type(payload.source_type)
         _validate_source_config(payload.source_type, payload.config)
         services = get_services()
         now = datetime.now(timezone.utc).isoformat()
