@@ -4,7 +4,7 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from services.api.app.retrieval.embedder import Embedder, HashEmbedder
-from services.api.app.retrieval.qdrant import to_epoch
+from services.api.app.retrieval.qdrant import point_id_for_chunk, to_epoch
 from services.api.app.storage.models import Chunk
 from services.api.app.storage.protocol import Repo
 
@@ -22,9 +22,10 @@ def embed_and_upsert(
 ) -> None:
     """Persist chunks and vectors in bounded batches.
 
-    Embedding, SQL persistence and vector upsert now share the same bounded
-    batch. Production repositories can therefore use one transaction/executemany
-    instead of one PostgreSQL round trip per chunk.
+    SQL keeps Ragbot's logical ``chunk_id`` while Qdrant receives a stable UUID
+    derived from it. The logical ID is also stored in the vector payload so
+    retrieval can fuse vector and lexical rankings without coupling SQL primary
+    keys to Qdrant's restricted point-ID type.
     """
     emb = embedder or HashEmbedder(dim=qdrant.dim)
     vector_batch: List[Tuple[str, List[float], Dict[str, Any]]] = []
@@ -46,8 +47,9 @@ def embed_and_upsert(
                     "Embedding dimension does not match vector store: "
                     f"chunk={chunk.chunk_id}, vector={len(vector)}, qdrant={qdrant.dim}"
                 )
-            chunk.qdrant_point_id = chunk.chunk_id
-            vector_batch.append((chunk.chunk_id, vector, _build_payload(chunk, emb.model_name)))
+            point_id = point_id_for_chunk(chunk.chunk_id)
+            chunk.qdrant_point_id = point_id
+            vector_batch.append((point_id, vector, _build_payload(chunk, emb.model_name)))
 
         add_chunks = getattr(repo, "add_chunks", None)
         if callable(add_chunks):
@@ -73,6 +75,7 @@ def _build_payload(chunk: Chunk, embedding_model: str = "hash-64") -> Dict[str, 
     doc_updated_at = chunk.metadata.get("doc_updated_at")
     acl_hash = chunk.metadata.get("acl_hash") or "public"
     return {
+        "chunk_id": chunk.chunk_id,
         "tenant_id": chunk.tenant_id,
         "source_type": chunk.metadata.get("source_type"),
         "doc_id": chunk.doc_id,
