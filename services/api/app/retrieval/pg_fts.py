@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import re
-from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,49 +9,24 @@ from ..storage.models import Chunk
 from ..storage.protocol import Repo
 
 
-class InvertedIndex:
-    """Simple in-memory inverted index for FTS acceleration."""
-
-    def __init__(self) -> None:
-        self._index: Dict[str, set] = defaultdict(set)
-        self._indexed_ids: set = set()
-
-    def add(self, chunk_id: str, text: str) -> None:
-        if chunk_id in self._indexed_ids:
-            return
-        self._indexed_ids.add(chunk_id)
-        for tok in _tokenize(text):
-            self._index[tok].add(chunk_id)
-
-    def candidates(self, tokens: List[str]) -> set:
-        if not tokens:
-            return set()
-        result: set = set()
-        for tok in tokens:
-            result |= self._index.get(tok, set())
-        return result
-
-    @property
-    def size(self) -> int:
-        return len(self._indexed_ids)
-
-
-_global_index = InvertedIndex()
-
-
 def fts_search(repo: Repo, query: str, filters: Dict[str, Any], top_k: int) -> List[Tuple[Chunk, float]]:
+    """Run lexical retrieval using the repository's native backend when available.
+
+    Production PostgresRepo exposes ``search_chunks_fts`` and uses the GIN index
+    created by migration 001. In-memory repositories intentionally use a small
+    scan implementation with no process-global cache, avoiding stale/cross-repo
+    index state during tests and local development.
+    """
+    native = getattr(repo, "search_chunks_fts", None)
+    if callable(native):
+        return native(query, filters, top_k)
+
     tokens = _tokenize(query)
     if not tokens:
         return []
 
-    _ensure_indexed(repo)
-
-    candidate_ids = _global_index.candidates(tokens)
     results: List[Tuple[Chunk, float]] = []
-    for chunk_id in candidate_ids:
-        chunk = repo.get_chunk(chunk_id)
-        if not chunk:
-            continue
+    for chunk in repo.iter_chunks():
         if not _match_filters(chunk, filters):
             continue
         score = _tf_score(tokens, chunk.text)
@@ -60,11 +34,6 @@ def fts_search(repo: Repo, query: str, filters: Dict[str, Any], top_k: int) -> L
             results.append((chunk, score))
     results.sort(key=lambda item: item[1], reverse=True)
     return results[:top_k]
-
-
-def _ensure_indexed(repo: Repo) -> None:
-    for chunk in repo.iter_chunks():
-        _global_index.add(chunk.chunk_id, chunk.text)
 
 
 def _tokenize(text: str) -> List[str]:
@@ -117,7 +86,10 @@ def _match_filters(chunk: Chunk, filters: Dict[str, Any]) -> bool:
     if time_range:
         start = _to_epoch(time_range.get("start"))
         end = _to_epoch(time_range.get("end"))
-        raw_ts = chunk.metadata.get("ingested_at") if chunk.metadata else None
+        raw_ts = None
+        if chunk.metadata:
+            raw_ts = chunk.metadata.get("ingested_at") or chunk.metadata.get("doc_updated_at")
+        raw_ts = raw_ts or chunk.created_at
         timestamp = _to_epoch(raw_ts)
         if timestamp is not None:
             if start is not None and timestamp < start:
@@ -140,6 +112,8 @@ def _to_epoch(value: Any) -> Optional[float]:
         return None
     if isinstance(value, (int, float)):
         return float(value)
+    if isinstance(value, datetime):
+        return value.timestamp()
     if isinstance(value, str):
         try:
             return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()

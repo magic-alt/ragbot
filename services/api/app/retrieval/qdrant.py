@@ -18,9 +18,41 @@ class InMemoryQdrant:
 
     def upsert(self, points: Iterable[Tuple[str, List[float], Dict[str, Any]]]) -> None:
         for point_id, vector, payload in points:
+            if len(vector) != self._dim:
+                raise ValueError(
+                    f"Vector dimension mismatch: got {len(vector)}, expected {self._dim}"
+                )
             self._points[point_id] = (vector, payload)
 
+    def delete_points(self, point_ids: Iterable[str]) -> int:
+        deleted = 0
+        for point_id in set(point_ids):
+            if self._points.pop(point_id, None) is not None:
+                deleted += 1
+        return deleted
+
+    def delete_by_doc_ids(self, doc_ids: Iterable[str]) -> int:
+        ids = set(doc_ids)
+        if not ids:
+            return 0
+        to_delete = [
+            point_id
+            for point_id, (_vector, payload) in self._points.items()
+            if payload.get("doc_id") in ids
+        ]
+        return self.delete_points(to_delete)
+
+    def healthcheck(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        return None
+
     def search(self, query_vector: List[float], filters: Dict[str, Any], top_k: int) -> List[Tuple[str, float, Dict[str, Any]]]:
+        if len(query_vector) != self._dim:
+            raise ValueError(
+                f"Query vector dimension mismatch: got {len(query_vector)}, expected {self._dim}"
+            )
         results: List[Tuple[str, float, Dict[str, Any]]] = []
         for point_id, (vector, payload) in self._points.items():
             if not _match_filters(payload, filters):
@@ -57,15 +89,66 @@ class QdrantClientAdapter:
 
     def upsert(self, points: Iterable[Tuple[str, List[float], Dict[str, Any]]]) -> None:
         rest = self._rest
-        payload_points = [
-            rest.PointStruct(id=point_id, vector=vector, payload=payload)
-            for point_id, vector, payload in points
-        ]
+        payload_points = []
+        for point_id, vector, payload in points:
+            if len(vector) != self._dim:
+                raise ValueError(
+                    f"Vector dimension mismatch: got {len(vector)}, expected {self._dim}"
+                )
+            payload_points.append(rest.PointStruct(id=point_id, vector=vector, payload=payload))
         if not payload_points:
             return
-        self._client.upsert(collection_name=self._collection, points=payload_points)
+        self._client.upsert(
+            collection_name=self._collection,
+            points=payload_points,
+            wait=True,
+        )
+
+    def delete_points(self, point_ids: Iterable[str]) -> int:
+        ids = list(dict.fromkeys(point_ids))
+        if not ids:
+            return 0
+        self._client.delete(
+            collection_name=self._collection,
+            points_selector=self._rest.PointIdsList(points=ids),
+            wait=True,
+        )
+        return len(ids)
+
+    def delete_by_doc_ids(self, doc_ids: Iterable[str]) -> int:
+        ids = list(dict.fromkeys(doc_ids))
+        if not ids:
+            return 0
+        selector = self._rest.FilterSelector(
+            filter=self._rest.Filter(
+                must=[
+                    self._rest.FieldCondition(
+                        key="doc_id",
+                        match=self._rest.MatchAny(any=ids),
+                    )
+                ]
+            )
+        )
+        self._client.delete(
+            collection_name=self._collection,
+            points_selector=selector,
+            wait=True,
+        )
+        return len(ids)
+
+    def healthcheck(self) -> bool:
+        return bool(self._client.collection_exists(self._collection))
+
+    def close(self) -> None:
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            close()
 
     def search(self, query_vector: List[float], filters: Dict[str, Any], top_k: int) -> List[Tuple[str, float, Dict[str, Any]]]:
+        if len(query_vector) != self._dim:
+            raise ValueError(
+                f"Query vector dimension mismatch: got {len(query_vector)}, expected {self._dim}"
+            )
         qfilter = _build_qdrant_filter(filters, self._rest)
         results = self._client.search(
             collection_name=self._collection,
@@ -80,6 +163,15 @@ class QdrantClientAdapter:
     def _ensure_collection(self) -> None:
         rest = self._rest
         if self._client.collection_exists(self._collection):
+            info = self._client.get_collection(self._collection)
+            vectors = getattr(getattr(getattr(info, "config", None), "params", None), "vectors", None)
+            actual_dim = getattr(vectors, "size", None)
+            if actual_dim is not None and int(actual_dim) != self._dim:
+                raise RuntimeError(
+                    "Existing Qdrant collection dimension does not match configuration: "
+                    f"collection={self._collection}, actual={actual_dim}, configured={self._dim}. "
+                    "Use a compatible collection or reindex after changing embedding dimensions."
+                )
             return
         self._client.create_collection(
             collection_name=self._collection,
@@ -90,6 +182,8 @@ class QdrantClientAdapter:
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
     if not a or not b:
         return 0.0
+    if len(a) != len(b):
+        raise ValueError(f"Vector dimension mismatch: {len(a)} != {len(b)}")
     return sum(x * y for x, y in zip(a, b))
 
 
@@ -196,4 +290,3 @@ def to_epoch(value: Any) -> Optional[float]:
         except ValueError:
             return None
     return None
-

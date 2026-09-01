@@ -17,6 +17,7 @@ COPY contracts/ contracts/
 COPY services/ services/
 COPY eval/ eval/
 COPY cli/ cli/
+COPY infra/migrations/ infra/migrations/
 COPY pyproject.toml .
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

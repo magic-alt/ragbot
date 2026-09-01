@@ -1,7 +1,8 @@
 """Ingestion jobs API routes.
 
-Provides endpoints for triggering ingestion jobs, listing jobs, and
-checking job status.
+Jobs currently execute in the API process executor. This is intentionally
+non-durable and documented as a deployment limitation until an external worker
+queue owns job execution.
 """
 from __future__ import annotations
 
@@ -11,12 +12,12 @@ from dataclasses import asdict
 from typing import Any, Callable, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class TriggerJobRequest(BaseModel):
-    source_id: str
-    tenant_id: str
+    source_id: str = Field(min_length=1)
+    tenant_id: str = Field(min_length=1)
 
 
 class TriggerJobResponse(BaseModel):
@@ -28,6 +29,13 @@ class TriggerJobResponse(BaseModel):
 def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
     router = APIRouter(prefix="/ingest", tags=["ingest"])
 
+    def _assert_source_ingestible(source) -> None:
+        if source.status != "active":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Source is not active: {source.source_id} ({source.status})",
+            )
+
     @router.post("/jobs", status_code=202, response_model=TriggerJobResponse)
     async def trigger_job(payload: TriggerJobRequest, _key=Depends(auth_dep)):
         services = get_services()
@@ -36,13 +44,12 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
             raise HTTPException(404, f"Source not found: {payload.source_id}")
         if source.tenant_id != payload.tenant_id:
             raise HTTPException(403, "Tenant mismatch")
+        _assert_source_ingestible(source)
 
         job_id = uuid.uuid4().hex
-
-        # Run pipeline in background thread to avoid blocking.  Pass the same
-        # embedder used by query retrieval so index/query vectors stay aligned.
         from services.worker.pipeline import run_ingest_pipeline
-        loop = asyncio.get_event_loop()
+
+        loop = asyncio.get_running_loop()
         loop.run_in_executor(
             None,
             run_ingest_pipeline,
@@ -83,12 +90,14 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
             raise HTTPException(400, "Only failed jobs can be retried")
 
         source = services.repo.get_source(old_job.source_id)
-        if not source:
+        if not source or source.status == "deleted":
             raise HTTPException(404, f"Source not found: {old_job.source_id}")
+        _assert_source_ingestible(source)
 
         new_job_id = uuid.uuid4().hex
         from services.worker.pipeline import run_ingest_pipeline
-        loop = asyncio.get_event_loop()
+
+        loop = asyncio.get_running_loop()
         loop.run_in_executor(
             None,
             run_ingest_pipeline,

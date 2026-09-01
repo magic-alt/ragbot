@@ -33,14 +33,32 @@ class InMemoryRepo:
                 return list(self._documents.values())
             return [doc for doc in self._documents.values() if doc.tenant_id == tenant_id]
 
+    def delete_documents(self, doc_ids: Iterable[str]) -> int:
+        ids = set(doc_ids)
+        if not ids:
+            return 0
+        with self._lock:
+            deleted = 0
+            for doc_id in ids:
+                if self._documents.pop(doc_id, None) is not None:
+                    deleted += 1
+            stale_chunks = [cid for cid, chunk in self._chunks.items() if chunk.doc_id in ids]
+            for chunk_id in stale_chunks:
+                del self._chunks[chunk_id]
+            return deleted
+
     def delete_documents_by_source(self, source_id: str) -> List[str]:
         with self._lock:
             to_delete = [
                 doc_id for doc_id, doc in self._documents.items()
-                if doc.uri and doc.uri.startswith(f"source://{source_id}")
+                if (doc.uri and doc.uri.startswith(f"source://{source_id}"))
+                or doc_id.startswith(f"doc-{source_id}:")
             ]
             for doc_id in to_delete:
                 del self._documents[doc_id]
+            stale_chunks = [cid for cid, chunk in self._chunks.items() if chunk.doc_id in set(to_delete)]
+            for chunk_id in stale_chunks:
+                del self._chunks[chunk_id]
             return to_delete
 
     # ── Chunks ─────────────────────────────────────────────────────────
@@ -58,6 +76,17 @@ class InMemoryRepo:
     def get_chunk(self, chunk_id: str) -> Optional[Chunk]:
         with self._lock:
             return self._chunks.get(chunk_id)
+
+    def delete_chunks(self, chunk_ids: Iterable[str]) -> int:
+        ids = set(chunk_ids)
+        if not ids:
+            return 0
+        with self._lock:
+            deleted = 0
+            for chunk_id in ids:
+                if self._chunks.pop(chunk_id, None) is not None:
+                    deleted += 1
+            return deleted
 
     def delete_chunks_by_doc(self, doc_id: str) -> int:
         with self._lock:
@@ -117,7 +146,7 @@ class InMemoryRepo:
 
     def delete_source(self, source_id: str) -> bool:
         with self._lock:
-            if source_id in self._sources:
+            if source_id in self._sources and self._sources[source_id].status != "deleted":
                 self._sources[source_id].status = "deleted"
                 return True
             return False
@@ -161,7 +190,10 @@ class InMemoryRepo:
         with self._lock:
             return self._tables.get(name)
 
-    # ── Export ─────────────────────────────────────────────────────────
+    # ── Runtime / export ───────────────────────────────────────────────
+
+    def healthcheck(self) -> bool:
+        return True
 
     def export_state(self) -> Dict[str, List[dict]]:
         with self._lock:

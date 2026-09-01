@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple, runtime_checkable
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, runtime_checkable
 
-from typing import Protocol
+from contracts.types import SqlResult
 
 from ..llm.provider import ModelProvider, build_model_provider
-from ..observability.tracing import RequestTracer
 from ..observability.metrics import build_request_metrics, get_metrics_collector
+from ..observability.tracing import RequestTracer
 from ..retrieval.cross_encoder import NoOpReranker, Reranker
 from ..retrieval.embedder import Embedder, HashEmbedder
 from ..retrieval.qdrant import InMemoryQdrant
@@ -15,7 +15,7 @@ from ..retrieval.service import Retriever
 from ..storage.protocol import Repo
 from ..storage.repo import InMemoryRepo
 from .callbacks import AgentEvent, EventCallback, NullCallback
-from .nodes.code import CodeSearch, code_node, open_file_node, apply_patch_node, explain_error_node
+from .nodes.code import CodeSearch, apply_patch_node, code_node, explain_error_node, open_file_node
 from .nodes.finalize import finalize_node
 from .nodes.retrieve import retrieve_node
 from .nodes.route import route_node
@@ -33,16 +33,16 @@ from .state import (
     ROUTE_WEB,
     build_initial_state,
 )
-from contracts.types import SqlResult
 
 
 @runtime_checkable
 class QdrantInterface(Protocol):
     @property
     def dim(self) -> int: ...
-
     def upsert(self, points: Iterable[Tuple[str, List[float], Dict[str, Any]]]) -> None: ...
-
+    def delete_points(self, point_ids: Iterable[str]) -> int: ...
+    def delete_by_doc_ids(self, doc_ids: Iterable[str]) -> int: ...
+    def healthcheck(self) -> bool: ...
     def search(self, query_vector: List[float], filters: Dict[str, Any], top_k: int) -> List[Tuple[str, float, Dict[str, Any]]]: ...
 
 
@@ -95,6 +95,12 @@ async def run_agent(
     callback: Optional[EventCallback] = None,
     initial_evidence: Optional[list] = None,
 ) -> AgentState:
+    """Run the agent graph and always terminate the event stream.
+
+    Event callbacks are closed in ``finally`` so SSE consumers cannot hang if a
+    provider/tool raises before finalization. Error events intentionally expose
+    only a stable public message; the original exception remains server-side.
+    """
     cb = callback or NullCallback()
     state = build_initial_state(
         query=query,
@@ -106,77 +112,89 @@ async def run_agent(
     )
     tracer = RequestTracer(request_id=state.request_id)
 
-    # Inject initial evidence from client_context
-    if initial_evidence:
-        state.evidence.extend(initial_evidence)
+    try:
+        if initial_evidence:
+            state.evidence.extend(initial_evidence)
 
-    with tracer.span("route") as s:
-        state = await route_node(state, services)
-        s.attributes["route"] = state.route or ""
-    cb.emit(AgentEvent("route", {"route": state.route, "request_id": state.request_id}))
+        with tracer.span("route") as span:
+            state = await route_node(state, services)
+            span.attributes["route"] = state.route or ""
+        cb.emit(AgentEvent("route", {"route": state.route, "request_id": state.request_id}))
 
-    action = _initial_action(state)
-    while True:
-        state.iteration += 1
-        prev_calls = len(state.tool_calls)
+        action = _initial_action(state)
+        while True:
+            state.iteration += 1
+            prev_calls = len(state.tool_calls)
 
-        with tracer.span(action, iteration=state.iteration) as s:
-            if action == "sql_query":
-                state = await sql_node(state, services)
-            elif action == "code_search":
-                state = await code_node(state, services)
-            elif action == "open_file":
-                state = await open_file_node(state, services)
-            elif action == "apply_patch":
-                state = await apply_patch_node(state, services)
-            elif action == "explain_error":
-                state = await explain_error_node(state, services)
-            elif action == "retrieve":
-                state = await retrieve_node(state, services)
-            elif action == "web_search":
-                state = await web_node(state, services)
+            with tracer.span(action, iteration=state.iteration) as span:
+                if action == "sql_query":
+                    state = await sql_node(state, services)
+                elif action == "code_search":
+                    state = await code_node(state, services)
+                elif action == "open_file":
+                    state = await open_file_node(state, services)
+                elif action == "apply_patch":
+                    state = await apply_patch_node(state, services)
+                elif action == "explain_error":
+                    state = await explain_error_node(state, services)
+                elif action == "retrieve":
+                    state = await retrieve_node(state, services)
+                elif action == "web_search":
+                    state = await web_node(state, services)
 
-            new_calls = state.tool_calls[prev_calls:]
-            s.attributes["tool_calls"] = len(new_calls)
-            s.attributes["evidence_total"] = len(state.evidence)
-            for nc in new_calls:
-                if not nc.ok:
-                    s.attributes["has_failure"] = True
+                new_calls = state.tool_calls[prev_calls:]
+                span.attributes["tool_calls"] = len(new_calls)
+                span.attributes["evidence_total"] = len(state.evidence)
+                for call in new_calls:
+                    if not call.ok:
+                        span.attributes["has_failure"] = True
 
-        # Emit events for any new tool calls
-        for call in state.tool_calls[prev_calls:]:
-            cb.emit(AgentEvent("tool_call", {"name": call.name, "args": call.args, "request_id": state.request_id}))
-            cb.emit(AgentEvent("tool_result", {
-                "name": call.name, "ok": call.ok,
-                "meta": call.result_preview, "error": call.error,
+            for call in state.tool_calls[prev_calls:]:
+                cb.emit(AgentEvent("tool_call", {
+                    "name": call.name,
+                    "args": call.args,
+                    "request_id": state.request_id,
+                }))
+                cb.emit(AgentEvent("tool_result", {
+                    "name": call.name,
+                    "ok": call.ok,
+                    "meta": call.result_preview,
+                    "error": call.error,
+                    "request_id": state.request_id,
+                }))
+
+            with tracer.span("synthesize", iteration=state.iteration):
+                state = await synthesize_node(state, services)
+            with tracer.span("verify", iteration=state.iteration):
+                state = await verify_node(state, services)
+            if not _should_continue(state):
+                break
+            action = _next_step(state)
+
+        with tracer.span("finalize"):
+            state = await finalize_node(state, services)
+
+        trace_record = tracer.finish()
+        metrics = build_request_metrics(state, trace_record)
+        get_metrics_collector().record(metrics)
+
+        if state.final:
+            cb.emit(AgentEvent("final", {
                 "request_id": state.request_id,
+                "answer": state.final.answer,
+                "citations": [asdict(citation) for citation in state.final.citations],
+                "confidence": state.final.confidence,
+                "followups": list(state.final.followups),
             }))
-
-        with tracer.span("synthesize", iteration=state.iteration):
-            state = await synthesize_node(state, services)
-        with tracer.span("verify", iteration=state.iteration):
-            state = await verify_node(state, services)
-        if not _should_continue(state):
-            break
-        action = _next_step(state)
-
-    with tracer.span("finalize"):
-        state = await finalize_node(state, services)
-
-    if state.final:
-        cb.emit(AgentEvent("final", {
+        return state
+    except Exception:
+        cb.emit(AgentEvent("error", {
             "request_id": state.request_id,
-            "answer": state.final.answer,
-            "confidence": state.final.confidence,
+            "error": "Agent execution failed",
         }))
-    cb.close()
-
-    # Collect metrics
-    trace_record = tracer.finish()
-    metrics = build_request_metrics(state, trace_record)
-    get_metrics_collector().record(metrics)
-
-    return state
+        raise
+    finally:
+        cb.close()
 
 
 def _initial_action(state: AgentState) -> str:
@@ -209,4 +227,3 @@ def _next_step(state: AgentState) -> str:
     if state.verification and state.verification.next_action:
         return state.verification.next_action
     return "retrieve"
-

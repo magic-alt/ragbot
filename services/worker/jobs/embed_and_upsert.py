@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Iterable, List, Tuple, Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from services.api.app.retrieval.qdrant import to_epoch
 from services.api.app.retrieval.embedder import Embedder, HashEmbedder
+from services.api.app.retrieval.qdrant import to_epoch
 from services.api.app.storage.models import Chunk
-from services.api.app.storage.repo import InMemoryRepo
+from services.api.app.storage.protocol import Repo
 
 logger = logging.getLogger(__name__)
 
@@ -14,39 +14,54 @@ DEFAULT_BATCH_SIZE = 100
 
 
 def embed_and_upsert(
-    repo: InMemoryRepo,
+    repo: Repo,
     qdrant: object,
     chunks: Iterable[Chunk],
     batch_size: int = DEFAULT_BATCH_SIZE,
     embedder: Optional[Embedder] = None,
 ) -> None:
+    """Persist chunks and their vectors in bounded batches.
+
+    ``qdrant_point_id`` is kept equal to ``chunk_id`` so stale vectors can be
+    pruned deterministically after a successful re-ingestion.
+    """
     emb = embedder or HashEmbedder(dim=qdrant.dim)
     batch: List[Tuple[str, List[float], Dict[str, Any]]] = []
     chunk_list: List[Chunk] = []
     total = 0
 
-    for chunk in chunks:
-        chunk_list.append(chunk)
-        repo.add_chunk(chunk)
-        if len(chunk_list) >= batch_size:
-            texts = [c.text for c in chunk_list]
-            vectors = emb.embed_batch(texts)
-            for c, vec in zip(chunk_list, vectors):
-                batch.append((c.chunk_id, vec, _build_payload(c, emb.model_name)))
-            qdrant.upsert(batch)
-            total += len(batch)
-            logger.debug("Upserted batch of %d points (total: %d)", len(batch), total)
-            batch = []
-            chunk_list = []
-
-    if chunk_list:
+    def flush() -> None:
+        nonlocal batch, chunk_list, total
+        if not chunk_list:
+            return
         texts = [c.text for c in chunk_list]
         vectors = emb.embed_batch(texts)
-        for c, vec in zip(chunk_list, vectors):
-            batch.append((c.chunk_id, vec, _build_payload(c, emb.model_name)))
+        if len(vectors) != len(chunk_list):
+            raise RuntimeError(
+                f"Embedder returned {len(vectors)} vectors for {len(chunk_list)} chunks"
+            )
+        for chunk, vector in zip(chunk_list, vectors):
+            if len(vector) != qdrant.dim:
+                raise RuntimeError(
+                    "Embedding dimension does not match vector store: "
+                    f"chunk={chunk.chunk_id}, vector={len(vector)}, qdrant={qdrant.dim}"
+                )
+            chunk.qdrant_point_id = chunk.chunk_id
+            repo.add_chunk(chunk)
+            batch.append(
+                (chunk.chunk_id, vector, _build_payload(chunk, emb.model_name))
+            )
         qdrant.upsert(batch)
         total += len(batch)
-        logger.debug("Upserted final batch of %d points (total: %d)", len(batch), total)
+        logger.debug("Upserted batch of %d points (total: %d)", len(batch), total)
+        batch = []
+        chunk_list = []
+
+    for chunk in chunks:
+        chunk_list.append(chunk)
+        if len(chunk_list) >= batch_size:
+            flush()
+    flush()
 
 
 def _build_payload(chunk: Chunk, embedding_model: str = "hash-64") -> Dict[str, Any]:
@@ -69,7 +84,7 @@ def _build_payload(chunk: Chunk, embedding_model: str = "hash-64") -> Dict[str, 
         "version": chunk.metadata.get("version"),
         "checksum": chunk.checksum,
         "acl_hash": acl_hash,
-        "tags": chunk.metadata.get("tags"),
+        "tags": chunk.metadata.get("tags") or [],
         "embedding_model": embedding_model,
         "text": chunk.text,
     }
