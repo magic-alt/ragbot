@@ -1,12 +1,8 @@
 """Ingestion pipeline orchestrator.
 
-Coordinates the full ingest lifecycle:
-  Source config -> IngestionJob -> connector -> normalize/dedup -> embed/upsert
-  -> prune stale chunks/documents -> update job status.
-
-Re-ingestion is replacement-oriented: new chunks are written first, then stale
-vectors/chunks from the previous successful view are removed. A failed write
-therefore keeps the previous knowledge available and can be repaired by retry.
+Coordinates Source -> connector -> normalized chunks -> embedding/vector upsert ->
+stale-data pruning. Re-ingestion writes changed data first and removes the old
+view only after the new write succeeds, preserving a retryable last-good view.
 """
 from __future__ import annotations
 
@@ -56,36 +52,44 @@ def run_ingest_pipeline(
             for chunk in repo.list_chunks(doc_id)
         }
 
-        chunk_list = list(_run_connector(source, repo))
-        _normalize_chunk_metadata(source, chunk_list, now)
-        chunk_list = _dedup_chunks(chunk_list)
+        candidate_chunks = list(_run_connector(source, repo))
+        _normalize_chunk_metadata(source, candidate_chunks, now)
+        candidate_chunks = _dedup_chunks(candidate_chunks)
+        current_chunks, chunks_to_write, chunks_reused = _reuse_unchanged_chunks(
+            candidate_chunks,
+            previous_chunks.values(),
+        )
 
-        # Persist Document rows before chunks to satisfy PostgreSQL FKs.
-        documents = _ensure_documents(source, repo, chunk_list)
+        # Documents must exist before new chunks to satisfy PostgreSQL FKs.
+        documents = _ensure_documents(source, repo, current_chunks)
 
-        # Write the new view before deleting the old one. If embedding/upsert
-        # fails, the stale view remains queryable and a retry can reconcile it.
-        if chunk_list:
-            embed_and_upsert(repo, qdrant, chunk_list, embedder=embedder)
+        # Only changed/new chunks are re-embedded. Unchanged chunks keep their
+        # point IDs and vector payloads, preserving the historical dedup contract
+        # while avoiding repository-wide checksum data loss.
+        if chunks_to_write:
+            embed_and_upsert(repo, qdrant, chunks_to_write, embedder=embedder)
 
         current_doc_ids = {doc.doc_id for doc in documents}
-        current_chunk_ids = {chunk.chunk_id for chunk in chunk_list}
+        current_chunk_ids = {chunk.chunk_id for chunk in current_chunks}
         stale_chunk_ids = set(previous_chunks) - current_chunk_ids
         removed_doc_ids = previous_doc_ids - current_doc_ids
 
-        chunks_removed = _delete_qdrant_points(qdrant, stale_chunk_ids)
-        repo.delete_chunks(stale_chunk_ids)
+        vector_chunks_removed = _delete_qdrant_points(qdrant, stale_chunk_ids)
+        chunks_removed = repo.delete_chunks(stale_chunk_ids)
 
-        # Delete by document as well to clean orphan vectors that may have been
-        # left by a historical partial failure and are not represented in SQL.
+        # Also delete by document to clean vector orphans from historical
+        # partial failures that may no longer have a matching SQL chunk row.
         _delete_qdrant_documents(qdrant, removed_doc_ids)
         documents_removed = repo.delete_documents(removed_doc_ids)
 
         doc_ids = [doc.doc_id for doc in documents]
         stats = {
             "doc_ids": doc_ids,
-            "chunks_ingested": len(chunk_list),
+            "chunks_total": len(current_chunks),
+            "chunks_ingested": len(chunks_to_write),
+            "chunks_reused": chunks_reused,
             "chunks_removed": chunks_removed,
+            "vector_chunks_removed": vector_chunks_removed,
             "documents_removed": documents_removed,
         }
         if len(doc_ids) == 1:
@@ -95,18 +99,19 @@ def run_ingest_pipeline(
             job_id,
             status="completed",
             doc_count=len(documents),
-            chunk_count=len(chunk_list),
+            chunk_count=len(chunks_to_write),
             completed_at=datetime.now(timezone.utc).isoformat(),
             stats=stats,
         )
         logger.info(
-            "Pipeline completed: job=%s source=%s documents=%d chunks=%d stale_chunks=%d removed_docs=%d",
+            "Pipeline completed: job=%s source=%s documents=%d chunks_total=%d written=%d reused=%d removed=%d",
             job_id,
             source.source_id,
             len(documents),
-            len(chunk_list),
-            len(stale_chunk_ids),
-            len(removed_doc_ids),
+            len(current_chunks),
+            len(chunks_to_write),
+            chunks_reused,
+            chunks_removed,
         )
 
     except Exception as exc:
@@ -137,15 +142,11 @@ def source_documents(source: Source, repo: Repo) -> list[Document]:
 
 
 def purge_source_knowledge(source: Source, repo: Repo, qdrant: object) -> dict[str, int]:
-    """Remove all indexed knowledge owned by a source.
-
-    The Source record itself is intentionally left intact so the API can first
-    purge data and only then mark the source deleted.
-    """
+    """Remove all indexed knowledge owned by a source before tombstoning it."""
     doc_ids = {doc.doc_id for doc in source_documents(source, repo)}
-    vector_docs = _delete_qdrant_documents(qdrant, doc_ids)
+    vector_documents = _delete_qdrant_documents(qdrant, doc_ids)
     documents = repo.delete_documents(doc_ids)
-    return {"documents": documents, "vector_documents": vector_docs}
+    return {"documents": documents, "vector_documents": vector_documents}
 
 
 def _delete_qdrant_points(qdrant: object, point_ids: set[str]) -> int:
@@ -169,39 +170,26 @@ def _delete_qdrant_documents(qdrant: object, doc_ids: set[str]) -> int:
 
 
 def _run_connector(source: Source, repo: Repo) -> Iterable[Chunk]:
-    """Select and run the connector for one supported document source."""
     source_type = source.source_type
     config = source.config
-    tenant_id = source.tenant_id
     doc_id = config.get("doc_id") or f"doc-{source.source_id}"
-    version = config.get("version", "1.0")
-    tags = source.tags
-    acl_hash = _resolve_acl_hash(source, repo)
-
     common = dict(
         doc_id=doc_id,
-        tenant_id=tenant_id,
-        version=version,
-        tags=tags,
-        acl_hash=acl_hash,
+        tenant_id=source.tenant_id,
+        version=config.get("version", "1.0"),
+        tags=source.tags,
+        acl_hash=_resolve_acl_hash(source, repo),
     )
 
     if source_type == "pdf":
         from services.worker.jobs.ingest_pdf import ingest_pdf
         return ingest_pdf(path=config["path"], **common)
-
     if source_type == "web":
         from services.worker.jobs.ingest_web import ingest_web
         return ingest_web(url=config["url"], **common)
-
     if source_type == "repo":
         from services.worker.jobs.ingest_repo import ingest_repo
-        return ingest_repo(
-            url_or_path=config["path"],
-            ref=config.get("ref"),
-            **common,
-        )
-
+        return ingest_repo(url_or_path=config["path"], ref=config.get("ref"), **common)
     if source_type == "local_fs":
         from services.worker.jobs.ingest_text import ingest_local_fs
         return ingest_local_fs(
@@ -209,7 +197,6 @@ def _run_connector(source: Source, repo: Repo) -> Iterable[Chunk]:
             extensions=config.get("extensions"),
             **common,
         )
-
     raise ValueError(f"Unsupported source_type: {source_type}")
 
 
@@ -223,9 +210,6 @@ def _resolve_acl_hash(source: Source, repo: Repo) -> str:
 
 def _normalize_chunk_metadata(source: Source, chunks: list[Chunk], now: str) -> None:
     """Enforce connector-independent metadata used by both retrieval backends."""
-    acl_hash = _resolve_acl_hash(source, repo=_RepoProxy(source, chunks)) if False else None
-    # ACL is already resolved by connectors; normalize the source-level fields
-    # that filters and Qdrant payloads rely on.
     for chunk in chunks:
         metadata = dict(chunk.metadata or {})
         metadata["source_type"] = source.source_type
@@ -237,12 +221,7 @@ def _normalize_chunk_metadata(source: Source, chunks: list[Chunk], now: str) -> 
 
 
 def _dedup_chunks(chunks: list[Chunk]) -> list[Chunk]:
-    """Remove duplicate content only within the same document and ingest run.
-
-    Repository-wide checksum deduplication is unsafe: identical text can be
-    valid evidence in two documents or tenants. Cross-document dedup belongs
-    in a content-addressed storage layer, not in logical document ingestion.
-    """
+    """Deduplicate only within one logical document in the current ingest run."""
     seen: set[tuple[str, str]] = set()
     deduped: list[Chunk] = []
     for chunk in chunks:
@@ -258,11 +237,53 @@ def _dedup_chunks(chunks: list[Chunk]) -> list[Chunk]:
     return deduped
 
 
-def _ensure_documents(
-    source: Source,
-    repo: Repo,
-    chunks: list[Chunk],
-) -> list[Document]:
+def _reuse_unchanged_chunks(
+    candidates: list[Chunk],
+    previous: Iterable[Chunk],
+) -> tuple[list[Chunk], list[Chunk], int]:
+    """Reuse stable point IDs when content and retrieval metadata are unchanged."""
+    previous_by_key = {_reuse_key(chunk): chunk for chunk in previous}
+    current: list[Chunk] = []
+    to_write: list[Chunk] = []
+    reused = 0
+
+    for candidate in candidates:
+        old = previous_by_key.get(_reuse_key(candidate))
+        if old is None:
+            current.append(candidate)
+            to_write.append(candidate)
+            continue
+
+        candidate.chunk_id = old.chunk_id
+        candidate.qdrant_point_id = old.qdrant_point_id or old.chunk_id
+        candidate.created_at = old.created_at
+        # Keep persisted metadata exactly aligned with the unchanged Qdrant
+        # payload. Ingestion timestamps describe the chunk version, not the job.
+        candidate.metadata = dict(old.metadata or {})
+        current.append(candidate)
+        reused += 1
+
+    return current, to_write, reused
+
+
+def _reuse_key(chunk: Chunk) -> tuple:
+    metadata = chunk.metadata or {}
+    return (
+        chunk.doc_id,
+        chunk.chunk_index,
+        chunk.checksum,
+        chunk.path,
+        chunk.url,
+        chunk.page,
+        chunk.section,
+        metadata.get("source_type"),
+        tuple(metadata.get("tags") or []),
+        metadata.get("acl_hash") or "public",
+        metadata.get("version"),
+    )
+
+
+def _ensure_documents(source: Source, repo: Repo, chunks: list[Chunk]) -> list[Document]:
     if source.source_type != "local_fs":
         if not chunks:
             return []
@@ -278,13 +299,7 @@ def _ensure_documents(
         title = file_path.name if file_path else source.name
         uri = file_path.resolve().as_uri() if file_path else f"source://{source.source_id}"
         documents.append(
-            _ensure_document(
-                source,
-                repo,
-                doc_id=doc_id,
-                title=title,
-                uri=uri,
-            )
+            _ensure_document(source, repo, doc_id=doc_id, title=title, uri=uri)
         )
     return documents
 
