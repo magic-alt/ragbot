@@ -1,6 +1,7 @@
 """Regression tests for RAG runtime/environment consistency."""
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 import unittest
@@ -44,6 +45,14 @@ class BuildEmbedderConfigurationTests(unittest.TestCase):
         with patch.dict(os.environ, {"QDRANT_DIM": "256"}, clear=True):
             embedder = build_embedder(dimension=1536)
         self.assertEqual(embedder.dimension, 256)
+
+    def test_hash_embedder_uses_stable_digest(self):
+        embedder = HashEmbedder(dim=32)
+        vector = embedder.embed("stable-token")
+        digest = hashlib.blake2b(b"stable-token", digest_size=8).digest()
+        expected_index = int.from_bytes(digest, byteorder="big", signed=False) % 32
+        self.assertEqual(vector[expected_index], 1.0)
+        self.assertEqual(sum(1 for value in vector if value), 1)
 
 
 class IngestionConsistencyTests(unittest.TestCase):

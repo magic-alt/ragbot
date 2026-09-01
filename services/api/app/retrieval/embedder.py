@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
@@ -44,7 +45,12 @@ class Embedder(Protocol):
 
 
 class HashEmbedder:
-    """Hash-based embedder for dev/testing. Zero external dependencies."""
+    """Deterministic hash-based embedder for dev/testing.
+
+    Python's built-in ``hash()`` is intentionally randomized between interpreter
+    processes.  Persisted Qdrant vectors therefore must not depend on it: a
+    restart would otherwise change query vectors and invalidate the index.
+    """
 
     def __init__(self, dim: int = 64) -> None:
         self._dim = dim
@@ -61,7 +67,8 @@ class HashEmbedder:
         tokens = re.findall(r"[A-Za-z0-9_\-]+", text.lower())
         vec = [0.0] * self._dim
         for tok in tokens:
-            idx = (hash(tok) % self._dim + self._dim) % self._dim
+            digest = hashlib.blake2b(tok.encode("utf-8"), digest_size=8).digest()
+            idx = int.from_bytes(digest, byteorder="big", signed=False) % self._dim
             vec[idx] += 1.0
         norm = math.sqrt(sum(v * v for v in vec)) or 1.0
         return [v / norm for v in vec]
@@ -149,7 +156,7 @@ class APIEmbedder:
 def build_embedder(dimension: Optional[int] = None) -> Embedder:
     """Build an Embedder from environment variables.
 
-    ``dimension`` is the vector-store dimension selected by the caller.  It is
+    ``dimension`` is the vector-store dimension selected by the caller. It is
     deliberately shared by both the API and hash embedders so ingestion and
     retrieval cannot silently use incompatible vector sizes.
 
@@ -160,7 +167,7 @@ def build_embedder(dimension: Optional[int] = None) -> Embedder:
         QDRANT_DIM: Explicit dimension override
 
     Returns a HashEmbedder for development when no usable embedding API is
-    configured.  Production semantic retrieval should configure an embedding
+    configured. Production semantic retrieval should configure an embedding
     model and API key.
     """
     model = os.getenv("EMBEDDING_MODEL", "")
