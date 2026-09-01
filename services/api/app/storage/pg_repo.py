@@ -36,6 +36,7 @@ class PostgresRepo(_LegacyPostgresRepo):
             dsn,
             min_size=pool_min,
             max_size=pool_max,
+            open=True,
             kwargs={"row_factory": dict_row},
         )
         logger.info(
@@ -57,8 +58,6 @@ class PostgresRepo(_LegacyPostgresRepo):
         except Exception:
             logger.exception("PostgreSQL repository healthcheck failed")
             return False
-
-    # ── Documents ──────────────────────────────────────────────────────
 
     def add_document(self, doc: Document) -> None:
         sql = """
@@ -107,10 +106,9 @@ class PostgresRepo(_LegacyPostgresRepo):
             rows = conn.execute(sql, (pattern, local_fs_pattern)).fetchall()
             return [row["doc_id"] if isinstance(row, dict) else row[0] for row in rows]
 
-    # ── Chunks ─────────────────────────────────────────────────────────
-
-    def add_chunk(self, chunk: Chunk) -> None:
-        sql = """
+    @staticmethod
+    def _chunk_upsert_sql() -> str:
+        return """
             INSERT INTO chunks (
                 chunk_id, doc_id, tenant_id, chunk_index, text,
                 path, url, page, section, checksum, qdrant_point_id,
@@ -135,11 +133,25 @@ class PostgresRepo(_LegacyPostgresRepo):
                 metadata = EXCLUDED.metadata,
                 fts_text = EXCLUDED.fts_text
         """
+
+    def _chunk_params(self, chunk: Chunk) -> Dict[str, Any]:
         params = asdict(chunk)
         params["metadata"] = self._jsonb(params["metadata"])
         params["fts_text"] = lexicalize(chunk.text) if contains_cjk(chunk.text) else chunk.text
+        return params
+
+    def add_chunk(self, chunk: Chunk) -> None:
+        self.add_chunks([chunk])
+
+    def add_chunks(self, chunks: Iterable[Chunk]) -> int:
+        items = list(chunks)
+        if not items:
+            return 0
+        params = [self._chunk_params(chunk) for chunk in items]
         with self._pool.connection() as conn:
-            conn.execute(sql, params)
+            with conn.cursor() as cur:
+                cur.executemany(self._chunk_upsert_sql(), params)
+        return len(items)
 
     def delete_chunks(self, chunk_ids: Iterable[str]) -> int:
         ids = list(dict.fromkeys(chunk_ids))
@@ -155,10 +167,9 @@ class PostgresRepo(_LegacyPostgresRepo):
         filters: Dict[str, Any],
         top_k: int,
     ) -> List[Tuple[Chunk, float]]:
-        """Use PostgreSQL GIN-backed lexical retrieval with CJK bigram support."""
+        """Use the stored GIN-backed tsvector with CJK bigram support."""
         cjk = contains_cjk(query)
         params: Dict[str, Any] = {"query": query, "limit": top_k}
-        vector_expr = "to_tsvector('simple', COALESCE(NULLIF(c.fts_text, ''), c.text))"
         if cjk:
             fts_query = build_or_tsquery(query)
             if not fts_query:
@@ -168,38 +179,31 @@ class PostgresRepo(_LegacyPostgresRepo):
         else:
             query_expr = "plainto_tsquery('simple', %(query)s)"
 
-        conditions = [f"{vector_expr} @@ {query_expr}"]
-
+        conditions = [f"c.fts_document @@ {query_expr}"]
         tenant_id = filters.get("tenant_id")
         if tenant_id:
             conditions.append("c.tenant_id = %(tenant_id)s")
             params["tenant_id"] = tenant_id
-
         source_types = filters.get("source_types")
         if source_types:
             conditions.append("c.metadata->>'source_type' = ANY(%(source_types)s)")
             params["source_types"] = list(source_types)
-
         doc_ids = filters.get("doc_ids")
         if doc_ids:
             conditions.append("c.doc_id = ANY(%(doc_ids)s)")
             params["doc_ids"] = list(doc_ids)
-
         tags = filters.get("tags")
         if tags:
             conditions.append("COALESCE(c.metadata->'tags', '[]'::jsonb) ?| %(tags)s")
             params["tags"] = list(tags)
-
         path_prefix = filters.get("path_prefix")
         if path_prefix:
             conditions.append("LEFT(COALESCE(c.path, ''), LENGTH(%(path_prefix)s)) = %(path_prefix)s")
             params["path_prefix"] = path_prefix
-
         url_prefix = filters.get("url_prefix")
         if url_prefix:
             conditions.append("LEFT(COALESCE(c.url, ''), LENGTH(%(url_prefix)s)) = %(url_prefix)s")
             params["url_prefix"] = url_prefix
-
         time_range = filters.get("time_range") or {}
         if time_range.get("start"):
             conditions.append("c.created_at >= %(time_start)s::timestamptz")
@@ -207,15 +211,13 @@ class PostgresRepo(_LegacyPostgresRepo):
         if time_range.get("end"):
             conditions.append("c.created_at <= %(time_end)s::timestamptz")
             params["time_end"] = time_range["end"]
-
         security_scope = filters.get("security_scope")
         if security_scope:
             conditions.append("COALESCE(c.metadata->>'acl_hash', 'public') = ANY(%(security_scope)s)")
             params["security_scope"] = list(security_scope)
 
         sql = f"""
-            SELECT c.*,
-                   ts_rank_cd({vector_expr}, {query_expr}) AS fts_score
+            SELECT c.*, ts_rank_cd(c.fts_document, {query_expr}) AS fts_score
             FROM chunks AS c
             WHERE {' AND '.join(conditions)}
             ORDER BY fts_score DESC, c.chunk_id
@@ -227,8 +229,6 @@ class PostgresRepo(_LegacyPostgresRepo):
             (self._row_to_chunk(row, None), float(row.get("fts_score") or 0.0))
             for row in rows
         ]
-
-    # ── Policies ───────────────────────────────────────────────────────
 
     def add_policy(self, policy: ACLPolicy) -> None:
         sql = """
@@ -247,14 +247,14 @@ class PostgresRepo(_LegacyPostgresRepo):
     def get_policy_hash(self, acl_policy_id: Optional[str] = None) -> Optional[str]:
         if not acl_policy_id:
             return None
-        sql = "SELECT policy_hash FROM acl_policies WHERE acl_policy_id = %s"
         with self._pool.connection() as conn:
-            row = conn.execute(sql, (acl_policy_id,)).fetchone()
+            row = conn.execute(
+                "SELECT policy_hash FROM acl_policies WHERE acl_policy_id = %s",
+                (acl_policy_id,),
+            ).fetchone()
             if not row:
                 return None
             return row["policy_hash"] if isinstance(row, dict) else row[0]
-
-    # ── Sources ────────────────────────────────────────────────────────
 
     def add_source(self, source: Source) -> None:
         sql = """
@@ -289,7 +289,6 @@ class PostgresRepo(_LegacyPostgresRepo):
         unknown = set(kwargs) - allowed
         if unknown:
             raise ValueError(f"Unsupported source fields: {sorted(unknown)}")
-
         set_clauses = []
         params: Dict[str, Any] = {"source_id": source_id}
         for key, value in kwargs.items():
@@ -300,12 +299,12 @@ class PostgresRepo(_LegacyPostgresRepo):
                 params[key] = list(value)
             else:
                 params[key] = value
-        sql = f"UPDATE sources SET {', '.join(set_clauses)} WHERE source_id = %(source_id)s"
         with self._pool.connection() as conn:
-            conn.execute(sql, params)
+            conn.execute(
+                f"UPDATE sources SET {', '.join(set_clauses)} WHERE source_id = %(source_id)s",
+                params,
+            )
         return self.get_source(source_id)
-
-    # ── Jobs ───────────────────────────────────────────────────────────
 
     def add_job(self, job: IngestionJob) -> None:
         sql = """
@@ -353,15 +352,16 @@ class PostgresRepo(_LegacyPostgresRepo):
         unknown = set(kwargs) - allowed
         if unknown:
             raise ValueError(f"Unsupported job fields: {sorted(unknown)}")
-
         set_clauses = []
         params: Dict[str, Any] = {"job_id": job_id}
         for key, value in kwargs.items():
             set_clauses.append(f"{key} = %({key})s")
             params[key] = self._jsonb(value) if key == "stats" else value
-        sql = f"UPDATE ingestion_jobs SET {', '.join(set_clauses)} WHERE job_id = %(job_id)s"
         with self._pool.connection() as conn:
-            conn.execute(sql, params)
+            conn.execute(
+                f"UPDATE ingestion_jobs SET {', '.join(set_clauses)} WHERE job_id = %(job_id)s",
+                params,
+            )
         return self.get_job(job_id)
 
     def claim_next_job(
@@ -370,7 +370,6 @@ class PostgresRepo(_LegacyPostgresRepo):
         lease_seconds: int = 120,
         max_attempts: int = 3,
     ) -> Optional[IngestionJob]:
-        """Atomically recover expired leases and claim one pending job."""
         with self._pool.connection() as conn:
             with conn.transaction():
                 conn.execute(
@@ -378,9 +377,7 @@ class PostgresRepo(_LegacyPostgresRepo):
                     UPDATE ingestion_jobs
                     SET status = 'failed',
                         error = 'Worker lease expired and maximum attempts were exhausted',
-                        completed_at = NOW(),
-                        lease_owner = NULL,
-                        lease_expires_at = NULL
+                        completed_at = NOW(), lease_owner = NULL, lease_expires_at = NULL
                     WHERE status = 'running'
                       AND lease_expires_at IS NOT NULL
                       AND lease_expires_at <= NOW()
@@ -402,8 +399,7 @@ class PostgresRepo(_LegacyPostgresRepo):
                 row = conn.execute(
                     """
                     WITH candidate AS (
-                        SELECT job_id
-                        FROM ingestion_jobs
+                        SELECT job_id FROM ingestion_jobs
                         WHERE status = 'pending'
                           AND available_at <= NOW()
                           AND attempts < %s
@@ -412,11 +408,9 @@ class PostgresRepo(_LegacyPostgresRepo):
                         LIMIT 1
                     )
                     UPDATE ingestion_jobs AS j
-                    SET status = 'running',
-                        attempts = j.attempts + 1,
+                    SET status = 'running', attempts = j.attempts + 1,
                         started_at = COALESCE(j.started_at, NOW()),
-                        lease_owner = %s,
-                        heartbeat_at = NOW(),
+                        lease_owner = %s, heartbeat_at = NOW(),
                         lease_expires_at = NOW() + (%s * INTERVAL '1 second'),
                         error = NULL
                     FROM candidate
@@ -473,27 +467,15 @@ class PostgresRepo(_LegacyPostgresRepo):
         if isinstance(stats, str):
             stats = json.loads(stats)
         return IngestionJob(
-            job_id=d["job_id"],
-            tenant_id=d["tenant_id"],
-            source_id=d["source_id"],
-            source_type=d["source_type"],
-            source_config=source_config,
-            status=d.get("status", "pending"),
-            doc_count=d.get("doc_count", 0),
-            chunk_count=d.get("chunk_count", 0),
-            error=d.get("error"),
-            started_at=d.get("started_at"),
-            completed_at=d.get("completed_at"),
-            created_at=d.get("created_at"),
-            stats=stats,
-            attempts=d.get("attempts", 0),
-            available_at=d.get("available_at"),
-            lease_owner=d.get("lease_owner"),
-            lease_expires_at=d.get("lease_expires_at"),
-            heartbeat_at=d.get("heartbeat_at"),
+            job_id=d["job_id"], tenant_id=d["tenant_id"], source_id=d["source_id"],
+            source_type=d["source_type"], source_config=source_config,
+            status=d.get("status", "pending"), doc_count=d.get("doc_count", 0),
+            chunk_count=d.get("chunk_count", 0), error=d.get("error"),
+            started_at=d.get("started_at"), completed_at=d.get("completed_at"),
+            created_at=d.get("created_at"), stats=stats, attempts=d.get("attempts", 0),
+            available_at=d.get("available_at"), lease_owner=d.get("lease_owner"),
+            lease_expires_at=d.get("lease_expires_at"), heartbeat_at=d.get("heartbeat_at"),
         )
-
-    # ── Debug ──────────────────────────────────────────────────────────
 
     def export_state(self) -> Dict[str, List[dict]]:
         result: Dict[str, List[dict]] = {}
