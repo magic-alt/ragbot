@@ -44,3 +44,52 @@ jobs:
 
       - name: Run tests
         run: python -m pytest -q
+
+  postgres-smoke:
+    name: PostgreSQL repository smoke
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ragbot
+          POSTGRES_PASSWORD: ragbot
+          POSTGRES_DB: ragbot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ragbot -d ragbot"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Postgres test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,postgres,qdrant,worker]"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Apply migrations
+        env:
+          PGPASSWORD: ragbot
+        run: |
+          for migration in $(find infra/migrations -maxdepth 1 -name '*.sql' | sort); do
+            echo "Applying ${migration}"
+            psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U ragbot -d ragbot -f "${migration}"
+          done
+
+      - name: Run PostgreSQL integration smoke test
+        env:
+          POSTGRES_TEST_DSN: postgresql://ragbot:ragbot@127.0.0.1:5432/ragbot
+        run: python -m pytest -q tests/test_postgres_integration.py
