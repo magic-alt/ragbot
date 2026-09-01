@@ -27,21 +27,33 @@ def run_ingest_pipeline(
     qdrant: object,
     job_id: Optional[str] = None,
     embedder: Optional[Embedder] = None,
+    existing_job: bool = False,
 ) -> IngestionJob:
-    """Execute one replacement-oriented ingestion run for ``source``."""
+    """Execute one replacement-oriented ingestion run for ``source``.
+
+    ``existing_job=True`` is used by the durable worker after it atomically
+    claims a queued job. Direct/local callers retain the historical behavior of
+    creating the job record inside the pipeline.
+    """
     now = datetime.now(timezone.utc).isoformat()
     job_id = job_id or uuid.uuid4().hex
-    job = IngestionJob(
-        job_id=job_id,
-        tenant_id=source.tenant_id,
-        source_id=source.source_id,
-        source_type=source.source_type,
-        source_config=source.config,
-        status="running",
-        started_at=now,
-        created_at=now,
-    )
-    repo.add_job(job)
+    if existing_job:
+        current = repo.get_job(job_id)
+        if current is None:
+            raise ValueError(f"Existing ingestion job not found: {job_id}")
+        repo.update_job(job_id, status="running", started_at=current.started_at or now, error=None)
+    else:
+        job = IngestionJob(
+            job_id=job_id,
+            tenant_id=source.tenant_id,
+            source_id=source.source_id,
+            source_type=source.source_type,
+            source_config=source.config,
+            status="running",
+            started_at=now,
+            created_at=now,
+        )
+        repo.add_job(job)
 
     try:
         previous_documents = source_documents(source, repo)
@@ -102,6 +114,8 @@ def run_ingest_pipeline(
             chunk_count=len(chunks_to_write),
             completed_at=datetime.now(timezone.utc).isoformat(),
             stats=stats,
+            lease_owner=None,
+            lease_expires_at=None,
         )
         logger.info(
             "Pipeline completed: job=%s source=%s documents=%d chunks_total=%d written=%d reused=%d removed=%d",
@@ -121,9 +135,14 @@ def run_ingest_pipeline(
             status="failed",
             error=str(exc),
             completed_at=datetime.now(timezone.utc).isoformat(),
+            lease_owner=None,
+            lease_expires_at=None,
         )
 
-    return repo.get_job(job_id)
+    result = repo.get_job(job_id)
+    if result is None:  # pragma: no cover - repository contract guard
+        raise RuntimeError(f"Ingestion job disappeared after execution: {job_id}")
+    return result
 
 
 def source_documents(source: Source, repo: Repo) -> list[Document]:
@@ -298,9 +317,7 @@ def _ensure_documents(source: Source, repo: Repo, chunks: list[Chunk]) -> list[D
         file_path = Path(chunk.path) if chunk.path else None
         title = file_path.name if file_path else source.name
         uri = file_path.resolve().as_uri() if file_path else f"source://{source.source_id}"
-        documents.append(
-            _ensure_document(source, repo, doc_id=doc_id, title=title, uri=uri)
-        )
+        documents.append(_ensure_document(source, repo, doc_id=doc_id, title=title, uri=uri))
     return documents
 
 
