@@ -1,3 +1,10 @@
+{{- $scaled := or (gt (int .Values.replicaCount) 1) .Values.autoscaling.enabled -}}
+{{- if and $scaled (not .Values.qdrant.url) -}}
+{{- fail "multi-replica/autoscaled Ragbot requires qdrant.url; in-memory vectors are process-local" -}}
+{{- end -}}
+{{- if and $scaled (not .Values.existingSecret) (not .Values.postgres.dsn) -}}
+{{- fail "multi-replica/autoscaled Ragbot requires postgres.dsn or existingSecret; in-memory metadata is process-local" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,7 +13,9 @@ metadata:
     app: ragbot
     component: api
 spec:
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   strategy:
     type: {{ .Values.strategy.type }}
     rollingUpdate:
@@ -22,6 +31,24 @@ spec:
         app: ragbot
         component: api
     spec:
+      {{- if or .Values.existingSecret .Values.postgres.dsn }}
+      initContainers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "services.api.app.storage.migrations"]
+          env:
+            {{- if .Values.existingSecret }}
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: postgres-dsn
+            {{- else }}
+            - name: POSTGRES_DSN
+              value: {{ .Values.postgres.dsn | quote }}
+            {{- end }}
+      {{- end }}
       containers:
         - name: api
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -61,6 +88,15 @@ spec:
                   name: {{ .Values.existingSecret }}
                   key: api-keys
                   optional: true
+            - name: QDRANT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: qdrant-api-key
+                  optional: true
+            {{- else if .Values.postgres.dsn }}
+            - name: POSTGRES_DSN
+              value: {{ .Values.postgres.dsn | quote }}
             {{- end }}
           livenessProbe:
             httpGet:
