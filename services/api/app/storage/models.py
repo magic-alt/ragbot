@@ -48,7 +48,7 @@ class ACLPolicy:
 class Source:
     source_id: str
     tenant_id: str
-    source_type: str  # local_fs, pdf, web, repo, email, database
+    source_type: str  # local_fs, pdf, web, repo
     name: str
     config: Dict[str, Any] = field(default_factory=dict)
     status: str = "active"  # active, paused, deleted
@@ -73,6 +73,11 @@ class IngestionJob:
     completed_at: Optional[str] = None
     created_at: Optional[str] = None
     stats: Dict[str, Any] = field(default_factory=dict)
+    attempts: int = 0
+    available_at: Optional[str] = None
+    lease_owner: Optional[str] = None
+    lease_expires_at: Optional[str] = None
+    heartbeat_at: Optional[str] = None
 
 
 @dataclass
@@ -80,4 +85,3 @@ class TableData:
     name: str
     rows: List[Dict[str, Any]]
     columns: List[Dict[str, str]]
-
