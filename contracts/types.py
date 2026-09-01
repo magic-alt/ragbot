@@ -38,10 +38,21 @@ class PatchResult:
     modified_lines: int
 
 
-SourceType = Literal["pdf", "web", "repo", "db_doc"]
+# SourceType represents document/vector retrieval sources. Database access is a
+# separate SQL tool configured by POSTGRES_DSN; it is not an ingestible source.
+SourceType = Literal["pdf", "web", "repo", "local_fs"]
 RouteType = Literal["doc_rag", "sql", "code", "mixed", "web_fallback"]
 Confidence = Literal["high", "medium", "low"]
-ToolName = Literal["retrieve", "sql_query", "code_search", "web_search", "web_fetch", "open_file", "apply_patch", "explain_error"]
+ToolName = Literal[
+    "retrieve",
+    "sql_query",
+    "code_search",
+    "web_search",
+    "web_fetch",
+    "open_file",
+    "apply_patch",
+    "explain_error",
+]
 
 
 @dataclass(eq=False)
@@ -77,7 +88,15 @@ class Citation:
 
 @dataclass
 class EvidenceItem:
-    kind: Literal["doc_chunk", "sql_rows", "code_snippets", "web_snippets", "file_content", "patch", "error_analysis"]
+    kind: Literal[
+        "doc_chunk",
+        "sql_rows",
+        "code_snippets",
+        "web_snippets",
+        "file_content",
+        "patch",
+        "error_analysis",
+    ]
     score: float = 0.0
     text: str = ""
     citations: List[Citation] = field(default_factory=list)
@@ -114,7 +133,17 @@ class Verification:
     enough_evidence: bool
     missing: List[str] = field(default_factory=list)
     next_query: Optional[str] = None
-    next_action: Optional[Literal["retrieve", "sql_query", "code_search", "web_search", "open_file", "apply_patch", "explain_error"]] = None
+    next_action: Optional[
+        Literal[
+            "retrieve",
+            "sql_query",
+            "code_search",
+            "web_search",
+            "open_file",
+            "apply_patch",
+            "explain_error",
+        ]
+    ] = None
 
 
 @dataclass
@@ -150,4 +179,3 @@ class AgentState:
     max_iterations: int = 3
     hard_fail: bool = False
     final: Optional[FinalAnswer] = None
-
