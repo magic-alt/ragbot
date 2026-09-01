@@ -3,34 +3,45 @@ from __future__ import annotations
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+
+from contracts.types import SourceType
+from services.worker.pipeline import purge_source_knowledge
 
 from ..storage.models import Source
 
 
 class CreateSourceRequest(BaseModel):
-    tenant_id: str
-    source_type: str = Field(description="local_fs | pdf | web | repo | database")
-    name: str
+    tenant_id: str = Field(min_length=1)
+    source_type: SourceType
+    name: str = Field(min_length=1)
     config: Dict[str, Any] = Field(default_factory=dict)
     acl_policy_id: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
 
 
 class UpdateSourceRequest(BaseModel):
-    name: Optional[str] = None
+    name: Optional[str] = Field(default=None, min_length=1)
     config: Optional[Dict[str, Any]] = None
-    status: Optional[str] = None
+    status: Optional[Literal["active", "paused"]] = None
     acl_policy_id: Optional[str] = None
     tags: Optional[List[str]] = None
 
 
-# Keep advertised API source types aligned with worker.pipeline. Reserved
-# connectors (for example email) belong in the roadmap until implemented.
-VALID_SOURCE_TYPES = {"local_fs", "pdf", "web", "repo", "database"}
+VALID_SOURCE_TYPES = {"local_fs", "pdf", "web", "repo"}
+
+
+def _validate_source_config(source_type: str, config: Dict[str, Any]) -> None:
+    required_key = "url" if source_type == "web" else "path"
+    value = config.get(required_key)
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(
+            status_code=422,
+            detail=f"source_type={source_type} requires non-empty config.{required_key}",
+        )
 
 
 def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
@@ -38,8 +49,7 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
 
     @router.post("", status_code=201)
     async def create_source(payload: CreateSourceRequest, _key=Depends(auth_dep)):
-        if payload.source_type not in VALID_SOURCE_TYPES:
-            raise HTTPException(400, f"Invalid source_type: {payload.source_type}")
+        _validate_source_config(payload.source_type, payload.config)
         services = get_services()
         now = datetime.now(timezone.utc).isoformat()
         source = Source(
@@ -76,6 +86,8 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         source = services.repo.get_source(source_id)
         if not source or source.status == "deleted":
             raise HTTPException(404, "Source not found")
+        if payload.config is not None:
+            _validate_source_config(source.source_type, payload.config)
         updates = {
             key: value
             for key, value in payload.model_dump(exclude_unset=True).items()
@@ -88,6 +100,13 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
     @router.delete("/{source_id}", status_code=204)
     async def delete_source(source_id: str, _key=Depends(auth_dep)):
         services = get_services()
+        source = services.repo.get_source(source_id)
+        if not source or source.status == "deleted":
+            raise HTTPException(404, "Source not found")
+
+        # Purge indexed knowledge before tombstoning the Source. If vector or
+        # repository cleanup fails, the source remains active and retryable.
+        purge_source_knowledge(source, services.repo, services.qdrant)
         if not services.repo.delete_source(source_id):
             raise HTTPException(404, "Source not found")
         return None
