@@ -33,6 +33,19 @@ class OpenAIChatRequest(BaseModel):
     max_tokens: Optional[int] = None
 
 
+def _estimate_tokens(text: str) -> int:
+    """Return a conservative tokenizer-independent usage estimate.
+
+    Ragbot's provider abstraction does not currently expose authoritative token
+    accounting. Keeping an integer usage object preserves OpenAI-client
+    compatibility while the ``estimated`` extension makes that limitation
+    explicit instead of reporting character counts as exact tokens.
+    """
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
 def create_openai_compat_endpoint(get_services, verify_api_key):
     """Register the /v1/chat/completions endpoint on the router."""
 
@@ -81,9 +94,9 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
         )
         answer = state.final.answer if state.final else ""
         citations = [asdict(c) for c in state.final.citations] if state.final else []
+        prompt_tokens = _estimate_tokens(query)
+        completion_tokens = _estimate_tokens(answer)
 
-        # Ragbot providers do not currently expose provider token accounting at
-        # this adapter boundary. Do not report character counts as token counts.
         return {
             "id": f"chatcmpl-{request_id}",
             "object": "chat.completion",
@@ -96,6 +109,12 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
                     "finish_reason": "stop",
                 }
             ],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "estimated": True,
+            },
             "citations": citations,
         }
 
