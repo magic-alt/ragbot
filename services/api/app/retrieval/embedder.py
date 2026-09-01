@@ -12,7 +12,6 @@ import requests
 logger = logging.getLogger(__name__)
 
 
-# Well-known model dimensions
 MODEL_DIMENSIONS: Dict[str, int] = {
     "text-embedding-3-small": 1536,
     "text-embedding-3-large": 3072,
@@ -31,8 +30,6 @@ MODEL_DIMENSIONS: Dict[str, int] = {
 
 @runtime_checkable
 class Embedder(Protocol):
-    """Protocol for embedding text into vectors."""
-
     @property
     def model_name(self) -> str: ...
 
@@ -45,12 +42,7 @@ class Embedder(Protocol):
 
 
 class HashEmbedder:
-    """Deterministic hash-based embedder for dev/testing.
-
-    Python's built-in ``hash()`` is intentionally randomized between interpreter
-    processes.  Persisted Qdrant vectors therefore must not depend on it: a
-    restart would otherwise change query vectors and invalidate the index.
-    """
+    """Deterministic hash-based embedder for development and tests."""
 
     def __init__(self, dim: int = 64) -> None:
         self._dim = dim
@@ -78,11 +70,7 @@ class HashEmbedder:
 
 
 class APIEmbedder:
-    """Embedder that calls an OpenAI-compatible /v1/embeddings endpoint.
-
-    Works with OpenAI, Ollama, vLLM, LiteLLM, and any other service that
-    exposes the standard embeddings API.
-    """
+    """OpenAI-compatible embedding client with strict vector dimensions."""
 
     def __init__(
         self,
@@ -117,8 +105,7 @@ class APIEmbedder:
         all_vectors: List[List[float]] = []
         for i in range(0, len(texts), self._batch_size):
             batch = texts[i : i + self._batch_size]
-            vectors = self._call_api(batch)
-            all_vectors.extend(vectors)
+            all_vectors.extend(self._call_api(batch))
         return all_vectors
 
     def _call_api(self, texts: List[str]) -> List[List[float]]:
@@ -129,46 +116,40 @@ class APIEmbedder:
         }
         payload: Dict[str, Any] = {"model": self._model, "input": texts}
         try:
-            response = requests.post(
-                url, headers=headers, json=payload, timeout=self._timeout
-            )
+            response = requests.post(url, headers=headers, json=payload, timeout=self._timeout)
             response.raise_for_status()
             data = response.json()
             items = sorted(data["data"], key=lambda x: x["index"])
-            vectors = []
+            vectors: List[List[float]] = []
             for item in items:
                 vec = item["embedding"]
-                vec = self._normalize_dimension(vec)
+                self._validate_dimension(vec)
                 vectors.append(vec)
+            if len(vectors) != len(texts):
+                raise ValueError(
+                    f"Embedding API returned {len(vectors)} vectors for {len(texts)} inputs"
+                )
             return vectors
         except Exception as exc:
             logger.warning("Embedding API failed: %s", exc)
             raise
 
-    def _normalize_dimension(self, vec: List[float]) -> List[float]:
-        if len(vec) == self._dimension:
-            return vec
-        if len(vec) > self._dimension:
-            return vec[: self._dimension]
-        return vec + [0.0] * (self._dimension - len(vec))
+    def _validate_dimension(self, vec: List[float]) -> None:
+        actual = len(vec)
+        if actual != self._dimension:
+            raise ValueError(
+                "Embedding API vector dimension mismatch: "
+                f"model={self._model}, actual={actual}, expected={self._dimension}. "
+                "Set QDRANT_DIM to the real model dimension and reindex into a compatible collection."
+            )
 
 
 def build_embedder(dimension: Optional[int] = None) -> Embedder:
     """Build an Embedder from environment variables.
 
-    ``dimension`` is the vector-store dimension selected by the caller. It is
-    deliberately shared by both the API and hash embedders so ingestion and
-    retrieval cannot silently use incompatible vector sizes.
-
-    Environment variables:
-        EMBEDDING_MODEL: Model name (e.g. ``text-embedding-3-small``)
-        EMBEDDING_API_KEY: API key (falls back to ``OPENAI_API_KEY``)
-        EMBEDDING_BASE_URL: API base URL (falls back to ``OPENAI_BASE_URL``)
-        QDRANT_DIM: Explicit dimension override
-
-    Returns a HashEmbedder for development when no usable embedding API is
-    configured. Production semantic retrieval should configure an embedding
-    model and API key.
+    Development can fall back to ``HashEmbedder``. Production startup
+    validation rejects that fallback so a missing semantic model cannot produce
+    a syntactically healthy but semantically useless persistent index.
     """
     model = os.getenv("EMBEDDING_MODEL", "")
     api_key = os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY", "")
