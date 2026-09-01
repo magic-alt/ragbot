@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from services.api.app.retrieval.embedder import Embedder
+from services.api.app.retrieval.qdrant import normalize_qdrant_point_id
 from services.api.app.storage.models import Chunk, Document, IngestionJob, Source
 from services.api.app.storage.protocol import Repo
 from services.worker.dedup.versioning import next_version
@@ -76,7 +77,11 @@ def run_ingest_pipeline(
         stale_chunk_ids = set(previous_chunks) - current_chunk_ids
         removed_doc_ids = previous_doc_ids - current_doc_ids
 
-        vector_chunks_removed = _delete_qdrant_points(qdrant, stale_chunk_ids)
+        stale_point_ids = {
+            normalize_qdrant_point_id(previous_chunks[chunk_id].qdrant_point_id, chunk_id)
+            for chunk_id in stale_chunk_ids
+        }
+        vector_chunks_removed = _delete_qdrant_points(qdrant, stale_point_ids)
         chunks_removed = repo.delete_chunks(stale_chunk_ids)
         _delete_qdrant_documents(qdrant, removed_doc_ids)
         documents_removed = repo.delete_documents(removed_doc_ids)
@@ -132,18 +137,12 @@ def run_ingest_pipeline(
 
 
 def source_documents(source: Source, repo: Repo) -> list[Document]:
-    """Return documents owned by ``source`` without unnecessary tenant scans.
-
-    PDF/Web/Git sources own one deterministic document and can use an indexed
-    primary-key lookup. ``local_fs`` remains a multi-document source and scans
-    the tenant's documents for its source-specific prefix.
-    """
+    """Return documents owned by ``source`` without unnecessary tenant scans."""
     base_doc_id = source.config.get("doc_id") or f"doc-{source.source_id}"
     if source.source_type != "local_fs":
         document = repo.get_document(base_doc_id)
         if document and document.tenant_id == source.tenant_id:
             return [document]
-        # Legacy documents may have source ownership only in their URI.
         return [
             doc
             for doc in repo.list_documents(source.tenant_id)
@@ -271,7 +270,7 @@ def _reuse_unchanged_chunks(
             to_write.append(candidate)
             continue
         candidate.chunk_id = old.chunk_id
-        candidate.qdrant_point_id = old.qdrant_point_id or old.chunk_id
+        candidate.qdrant_point_id = normalize_qdrant_point_id(old.qdrant_point_id, old.chunk_id)
         candidate.created_at = old.created_at
         candidate.metadata = dict(old.metadata or {})
         current.append(candidate)
