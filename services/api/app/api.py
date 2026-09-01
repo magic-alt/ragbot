@@ -7,13 +7,13 @@ import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Iterator, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from .agent.callbacks import AsyncQueueCallback
-from .agent.context import process_client_context, dedup_evidence, compress_evidence
+from .agent.context import compress_evidence, dedup_evidence, process_client_context
 from .agent.graph import run_agent
 from .agent.state import Constraints, SourceType
 from .factory import build_services_from_env
@@ -21,8 +21,8 @@ from .main import chat
 from .middleware import setup_middleware
 from .observability.metrics import get_metrics_collector
 from .observability.tracing import setup_tracing
-from .routes.openai_compat import create_openai_compat_endpoint
 from .routes.ingest import create_ingest_router
+from .routes.openai_compat import create_openai_compat_endpoint
 from .routes.search import create_search_endpoint
 from .routes.sources import create_sources_router
 
@@ -63,18 +63,23 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     _VALID_API_KEYS = _load_api_keys()
     setup_tracing()
     yield
-    services = _get_services()
-    engine = services.sql_engine
-    if hasattr(engine, "close"):
-        engine.close()
+
+    # Do not instantiate external services just to shut them down. If services
+    # were used, close every distinct closeable resource (SQL, repo, Qdrant).
+    if _services is not None:
+        closed: set[int] = set()
+        for resource in (_services.sql_engine, _services.repo, _services.qdrant):
+            if id(resource) in closed:
+                continue
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
+            closed.add(id(resource))
 
 
 app = FastAPI(title="ragbot API", version="0.5.0", lifespan=lifespan)
-
-# Register middleware (CORS + request logging)
 setup_middleware(app)
 
-# Register routers
 app.include_router(create_search_endpoint(_get_services, verify_api_key))
 app.include_router(create_openai_compat_endpoint(_get_services, verify_api_key))
 app.include_router(create_sources_router(_get_services, verify_api_key))
@@ -96,8 +101,8 @@ class ConstraintsModel(BaseModel):
 
 class ChatRequest(BaseModel):
     query: str = Field(min_length=1)
-    tenant_id: str
-    user_id: str
+    tenant_id: str = Field(min_length=1)
+    user_id: str = Field(min_length=1)
     session_id: Optional[str] = None
     stream: bool = False
     constraints: Optional[ConstraintsModel] = None
@@ -111,12 +116,11 @@ async def chat_endpoint(payload: ChatRequest, _key: str = Depends(verify_api_key
         return StreamingResponse(
             _chat_stream_realtime(payload),
             media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
     constraints = _constraints_from_model(payload.constraints)
-    # Process client_context (IDE context injection)
-    constraints, initial_evidence = process_client_context(
-        payload.client_context, constraints,
-    )
+    constraints, initial_evidence = process_client_context(payload.client_context, constraints)
     result = await chat(
         payload.query,
         payload.tenant_id,
@@ -131,7 +135,27 @@ async def chat_endpoint(payload: ChatRequest, _key: str = Depends(verify_api_key
 
 @app.get("/admin/health")
 async def health_endpoint() -> dict:
+    """Liveness endpoint: the API process is running."""
     return {"status": "ok"}
+
+
+@app.get("/admin/ready")
+async def readiness_endpoint() -> dict:
+    """Readiness endpoint: configured persistence/vector dependencies respond."""
+    try:
+        services = _get_services()
+        checks = {}
+        for name, resource in (("repository", services.repo), ("vector_store", services.qdrant)):
+            checker = getattr(resource, "healthcheck", None)
+            checks[name] = bool(checker()) if callable(checker) else True
+        if not all(checks.values()):
+            raise HTTPException(status_code=503, detail="Dependencies are not ready")
+        return {"status": "ready", "checks": checks}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Readiness check failed")
+        raise HTTPException(status_code=503, detail="Dependencies are not ready")
 
 
 @app.get("/admin/metrics")
@@ -164,7 +188,7 @@ async def metrics_history_endpoint(
 
 
 class FeedbackRequest(BaseModel):
-    request_id: str
+    request_id: str = Field(min_length=1)
     feedback: str = Field(pattern="^(positive|negative)$")
 
 
@@ -180,13 +204,14 @@ async def feedback_endpoint(payload: FeedbackRequest, _key: str = Depends(verify
 @app.get("/admin/cost")
 async def cost_endpoint(_key: str = Depends(verify_api_key)) -> dict:
     from .llm.router import CostTracker
-    # Return empty summary if no router is configured
+
     return CostTracker().summary()
 
 
 @app.get("/admin/cache")
 async def cache_endpoint(_key: str = Depends(verify_api_key)) -> dict:
-    from .cache.cache import get_retrieval_cache, get_embedding_cache, is_cache_enabled
+    from .cache.cache import get_embedding_cache, get_retrieval_cache, is_cache_enabled
+
     return {
         "enabled": is_cache_enabled(),
         "retrieval": get_retrieval_cache().stats(),
@@ -201,16 +226,13 @@ def _constraints_from_model(model: Optional[ConstraintsModel]) -> Optional[Const
 
 
 async def _chat_stream_realtime(payload: ChatRequest) -> AsyncIterator[str]:
-    """Real-time SSE streaming using AsyncQueueCallback.
-
-    The agent runs as an async task and emits events to an asyncio queue.
-    This async generator reads from the queue and yields SSE events.
-    """
+    """Stream agent events while preserving non-streaming request semantics."""
     services = _get_services()
     constraints = _constraints_from_model(payload.constraints)
+    constraints, initial_evidence = process_client_context(payload.client_context, constraints)
     cb = AsyncQueueCallback()
 
-    async def _run():
+    async def _run() -> None:
         await run_agent(
             query=payload.query,
             tenant_id=payload.tenant_id,
@@ -219,6 +241,7 @@ async def _chat_stream_realtime(payload: ChatRequest) -> AsyncIterator[str]:
             constraints=constraints,
             session_id=payload.session_id,
             callback=cb,
+            initial_evidence=initial_evidence,
         )
 
     task = asyncio.create_task(_run())
@@ -234,14 +257,24 @@ async def _chat_stream_realtime(payload: ChatRequest) -> AsyncIterator[str]:
                 yield _sse("tool_call", data)
             elif event.event_type == "tool_result":
                 yield _sse("tool_result", data)
+            elif event.event_type == "error":
+                yield _sse("error", data)
             elif event.event_type == "final":
                 answer = data.get("answer", "")
-                # Stream the final answer as token chunks
                 for delta in _iter_tokens(answer):
                     yield _sse("token", {"request_id": request_id, "delta": delta})
                 yield _sse("final", data)
     finally:
-        await task
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # run_agent already emitted a sanitized SSE error event. Keep the
+            # transport valid and retain the original stack trace server-side.
+            logger.exception("Streaming agent task failed")
 
 
 def _iter_tokens(text: str, size: int = 8) -> Iterator[str]:
