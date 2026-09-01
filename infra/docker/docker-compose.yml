@@ -3,6 +3,7 @@ services:
     build:
       context: ../..
       dockerfile: infra/docker/Dockerfile
+    image: ragbot:local
     ports:
       - "${RAGBOT_API_PORT:-8000}:8000"
     environment:
@@ -44,11 +45,24 @@ services:
         target: /data
         read_only: true
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       qdrant:
         condition: service_started
     restart: unless-stopped
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    image: ragbot:local
+    command: ["python", "-m", "services.api.app.storage.migrations"]
+    environment:
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-ragbot}:${POSTGRES_PASSWORD:-ragbot}@postgres:5432/${POSTGRES_DB:-ragbot}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   postgres:
     image: postgres:16-alpine
@@ -60,7 +74,6 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ../migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ragbot} -d ${POSTGRES_DB:-ragbot}"]
       interval: 5s
