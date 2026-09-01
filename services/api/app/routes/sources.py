@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from services.worker.pipeline import purge_source_knowledge
 
+from ..auth.principal import allowed_tenants, authorize_tenant
 from ..storage.models import Source
 
 
@@ -19,8 +20,6 @@ VALID_SOURCE_TYPES = set(SOURCE_TYPE_VALUES)
 
 class CreateSourceRequest(BaseModel):
     tenant_id: str = Field(min_length=1)
-    # Keep runtime validation explicit so unsupported types retain the existing
-    # 400 API contract, while still publishing the supported values in OpenAPI.
     source_type: str = Field(json_schema_extra={"enum": list(SOURCE_TYPE_VALUES)})
     name: str = Field(min_length=1)
     config: Dict[str, Any] = Field(default_factory=dict)
@@ -55,9 +54,10 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
     router = APIRouter(prefix="/sources", tags=["sources"])
 
     @router.post("", status_code=201)
-    async def create_source(payload: CreateSourceRequest, _key=Depends(auth_dep)):
+    async def create_source(payload: CreateSourceRequest, _key: Optional[str] = Depends(auth_dep)):
         _validate_source_type(payload.source_type)
         _validate_source_config(payload.source_type, payload.config)
+        authorize_tenant(_key, payload.tenant_id)
         services = get_services()
         now = datetime.now(timezone.utc).isoformat()
         source = Source(
@@ -75,25 +75,41 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         return asdict(source)
 
     @router.get("")
-    async def list_sources(tenant_id: Optional[str] = None, _key=Depends(auth_dep)):
+    async def list_sources(
+        tenant_id: Optional[str] = None,
+        _key: Optional[str] = Depends(auth_dep),
+    ):
         services = get_services()
-        sources = services.repo.list_sources(tenant_id=tenant_id)
-        return {"sources": [asdict(s) for s in sources if s.status != "deleted"]}
+        if tenant_id:
+            authorize_tenant(_key, tenant_id)
+            sources = services.repo.list_sources(tenant_id=tenant_id)
+        else:
+            tenant_scope = allowed_tenants(_key)
+            sources = services.repo.list_sources()
+            if tenant_scope is not None:
+                sources = [source for source in sources if source.tenant_id in tenant_scope]
+        return {"sources": [asdict(source) for source in sources if source.status != "deleted"]}
 
     @router.get("/{source_id}")
-    async def get_source(source_id: str, _key=Depends(auth_dep)):
+    async def get_source(source_id: str, _key: Optional[str] = Depends(auth_dep)):
         services = get_services()
         source = services.repo.get_source(source_id)
         if not source or source.status == "deleted":
             raise HTTPException(404, "Source not found")
+        authorize_tenant(_key, source.tenant_id)
         return asdict(source)
 
     @router.put("/{source_id}")
-    async def update_source(source_id: str, payload: UpdateSourceRequest, _key=Depends(auth_dep)):
+    async def update_source(
+        source_id: str,
+        payload: UpdateSourceRequest,
+        _key: Optional[str] = Depends(auth_dep),
+    ):
         services = get_services()
         source = services.repo.get_source(source_id)
         if not source or source.status == "deleted":
             raise HTTPException(404, "Source not found")
+        authorize_tenant(_key, source.tenant_id)
         if payload.config is not None:
             _validate_source_config(source.source_type, payload.config)
         updates = {
@@ -106,14 +122,12 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         return asdict(updated)
 
     @router.delete("/{source_id}", status_code=204)
-    async def delete_source(source_id: str, _key=Depends(auth_dep)):
+    async def delete_source(source_id: str, _key: Optional[str] = Depends(auth_dep)):
         services = get_services()
         source = services.repo.get_source(source_id)
         if not source or source.status == "deleted":
             raise HTTPException(404, "Source not found")
-
-        # Purge indexed knowledge before tombstoning the Source. If vector or
-        # repository cleanup fails, the source remains active and retryable.
+        authorize_tenant(_key, source.tenant_id)
         purge_source_knowledge(source, services.repo, services.qdrant)
         if not services.repo.delete_source(source_id):
             raise HTTPException(404, "Source not found")
