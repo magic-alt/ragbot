@@ -16,7 +16,6 @@ import resource
 import statistics
 import tempfile
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable
 
@@ -42,6 +41,7 @@ CATEGORIES = (
     "motor-control",
     "embedded-systems",
 )
+MARKER_SUFFIXES = ("A", "B", "C", "D")
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -52,6 +52,18 @@ def _percentile(values: list[float], percentile: float) -> float:
     return ordered[index]
 
 
+def _document_marker(document_index: int) -> str:
+    """Return a collision-resistant deterministic identity for the hash embedder.
+
+    A single synthetic marker is a poor retrieval oracle when HashEmbedder uses
+    only 128 buckets: 1000 document-marker tokens necessarily create many bucket
+    collisions.  Four independent marker tokens preserve the benchmark's fully
+    offline/deterministic character while making document identity observable by
+    both vector and lexical retrieval instead of measuring one hash collision.
+    """
+    return " ".join(f"RB{document_index:06d}{suffix}" for suffix in MARKER_SUFFIXES)
+
+
 def _make_pdf(path: Path, document_index: int, pages: int) -> None:
     try:
         from reportlab.lib.pagesizes import letter
@@ -59,7 +71,7 @@ def _make_pdf(path: Path, document_index: int, pages: int) -> None:
     except ImportError as exc:  # pragma: no cover - workflow dependency guard
         raise RuntimeError("reportlab is required for the PDF scale benchmark") from exc
 
-    marker = f"ENGINEERING_DOC_{document_index:06d}"
+    marker = _document_marker(document_index)
     category = CATEGORIES[document_index % len(CATEGORIES)]
     c = canvas.Canvas(str(path), pagesize=letter, pageCompression=1)
     width, height = letter
@@ -113,6 +125,13 @@ def _postgres_database_size(dsn: str) -> int:
     with psycopg.connect(dsn) as conn:
         row = conn.execute("SELECT pg_database_size(current_database())").fetchone()
     return int(row[0])
+
+
+def _write_result(path: str, result: dict) -> None:
+    output = Path(path)
+    output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    print(f"benchmark result written to {output}", flush=True)
 
 
 def run_benchmark(args: argparse.Namespace) -> dict:
@@ -193,7 +212,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             hits_at_5 = 0
             query_indexes = _query_indexes(args.documents, args.queries)
             for index in query_indexes:
-                marker = f"ENGINEERING_DOC_{index:06d}"
+                marker = _document_marker(index)
                 query = f"{marker} backpressure retry budget engineering reference"
                 query_start = time.perf_counter()
                 results = retriever.retrieve(query, filters, top_k=5)
@@ -273,6 +292,9 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "failures": failures[:20],
             "total_seconds": round(time.perf_counter() - started, 3),
         }
+        # Persist metrics before enforcing quality gates so a failing Actions run
+        # still uploads a useful benchmark summary for diagnosis.
+        _write_result(args.output, result)
 
         if len(sources) != args.documents:
             raise AssertionError(f"Only {len(sources)}/{args.documents} documents ingested")
@@ -314,11 +336,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    result = run_benchmark(args)
-    output = Path(args.output)
-    output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    print(f"benchmark result written to {output}")
+    run_benchmark(args)
     return 0
 
 
