@@ -26,7 +26,6 @@ def validate_remote_url(
     allow_private: Optional[bool] = None,
     schemes: tuple[str, ...] = ("http", "https"),
 ) -> str:
-    """Validate a remotely fetched URL against SSRF-sensitive destinations."""
     parsed = urlsplit(url)
     if parsed.scheme.lower() not in schemes:
         raise ValueError(f"Unsupported source URL scheme: {parsed.scheme or '<missing>'}")
@@ -36,7 +35,7 @@ def validate_remote_url(
         raise ValueError("Credentials embedded in source URLs are not allowed")
 
     hostname = parsed.hostname.rstrip(".").lower()
-    host_allowlist = tuple((allowed_hosts or ()))
+    host_allowlist = tuple(allowed_hosts or ())
     if host_allowlist and not any(_host_matches(hostname, pattern) for pattern in host_allowlist):
         raise ValueError(f"Source host is not allowlisted: {hostname}")
 
@@ -48,23 +47,29 @@ def validate_remote_url(
     return url
 
 
-def validate_local_repo_path(path: str) -> str:
-    """Ensure production local Git ingestion stays inside configured roots."""
+def validate_local_source_path(path: str) -> str:
+    """Restrict local PDF/text/Git sources to explicitly configured roots."""
     resolved = Path(path).expanduser().resolve()
     roots_raw = os.getenv("RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS", "")
-    roots = [Path(value).expanduser().resolve() for value in roots_raw.split(os.pathsep) if value.strip()]
-
-    # Local source access remains convenient in development. In production an
-    # explicit root list is required so a Source cannot request arbitrary files.
+    roots = [
+        Path(value).expanduser().resolve()
+        for value in roots_raw.split(os.pathsep)
+        if value.strip()
+    ]
     environment = os.getenv("RAGBOT_ENV", "development").strip().lower()
     if not roots:
         if environment in {"production", "prod"}:
-            raise ValueError("Production local Git ingestion requires RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS")
+            raise ValueError(
+                "Production local ingestion requires RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS"
+            )
         return str(resolved)
-
     if not any(_is_within(resolved, root) for root in roots):
-        raise ValueError("Local Git source is outside RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS")
+        raise ValueError("Local source is outside RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS")
     return str(resolved)
+
+
+def validate_local_repo_path(path: str) -> str:
+    return validate_local_source_path(path)
 
 
 def _resolve_addresses(hostname: str, port: Optional[int]) -> set[str]:
