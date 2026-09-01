@@ -74,7 +74,13 @@ def ingest_local_fs(
     tags: Optional[list] = None,
     acl_hash: Optional[str] = None,
 ) -> Iterable[Chunk]:
-    """Scan a directory and ingest all matching text files."""
+    """Scan a directory and ingest all matching text files.
+
+    A local filesystem Source is represented by one Document record. Individual
+    files remain distinguishable through ``Chunk.path``/filename metadata, but
+    all chunks retain the Source document's ``doc_id`` so Postgres foreign-key
+    relationships and document-level filters remain valid.
+    """
     logger.info("Ingesting local_fs directory: %s (doc_id=%s)", directory, doc_id)
     ext_set: Optional[Set[str]] = None
     if extensions:
@@ -87,7 +93,7 @@ def ingest_local_fs(
     for file_path in files:
         for chunk in ingest_text_file(
             path=file_path,
-            doc_id=f"{doc_id}:{Path(file_path).name}",
+            doc_id=doc_id,
             tenant_id=tenant_id,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,

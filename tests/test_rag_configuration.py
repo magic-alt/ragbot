@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from services.api.app.agent.graph import build_default_services
 from services.api.app.retrieval.embedder import HashEmbedder, build_embedder
+from services.api.app.retrieval.qdrant import InMemoryQdrant
 from services.api.app.storage.models import Source
 from services.worker.pipeline import run_ingest_pipeline
 
@@ -58,7 +59,7 @@ class BuildEmbedderConfigurationTests(unittest.TestCase):
 class IngestionConsistencyTests(unittest.TestCase):
     def test_pipeline_uses_shared_embedder_and_stable_document_id(self):
         services = build_default_services()
-        services.qdrant._dim = 8  # test-only in-memory adapter configuration
+        qdrant = InMemoryQdrant(dim=8)
         embedder = _RecordingEmbedder(dimension=8)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -77,7 +78,7 @@ class IngestionConsistencyTests(unittest.TestCase):
             job = run_ingest_pipeline(
                 source,
                 services.repo,
-                services.qdrant,
+                qdrant,
                 job_id="job-config",
                 embedder=embedder,
             )
@@ -92,7 +93,7 @@ class IngestionConsistencyTests(unittest.TestCase):
         self.assertTrue(all(chunk.doc_id == "doc-src-config" for chunk in chunks))
         self.assertIsNotNone(services.repo.get_document("doc-src-config"))
 
-        hits = services.qdrant.search(
+        hits = qdrant.search(
             [1.0] + [0.0] * 7,
             {"tenant_id": "tenant-test"},
             top_k=10,
