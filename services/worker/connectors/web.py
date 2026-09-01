@@ -1,30 +1,86 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
+from urllib.parse import urljoin
 
 import requests
+
+from .security import csv_values, validate_remote_url
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 30
 _MAX_CONTENT_LENGTH = 5 * 1024 * 1024  # 5 MB
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_ALLOWED_CONTENT_TYPES = ("text/", "application/json", "application/xml", "application/xhtml+xml")
 
 
 def fetch_web(url: str, timeout: int = _DEFAULT_TIMEOUT, max_length: int = _MAX_CONTENT_LENGTH) -> str:
-    """Fetch a web page and return its text content.
+    """Fetch a bounded public/allowlisted web resource and return text content.
 
-    Uses BeautifulSoup for HTML parsing when available, otherwise falls
-    back to raw text extraction.
+    Redirects are followed manually so every destination is revalidated. The
+    body is streamed with a hard byte cap; slicing ``response.text`` is not a
+    download limit because the complete response has already been buffered.
     """
-    response = requests.get(url, timeout=timeout, headers={"User-Agent": "ragbot-crawler/0.1"})
-    response.raise_for_status()
-    content_type = response.headers.get("Content-Type", "")
-    raw = response.text[:max_length]
+    allowed_hosts = csv_values("RAGBOT_WEB_ALLOWED_HOSTS")
+    max_redirects = int(os.getenv("RAGBOT_WEB_MAX_REDIRECTS", "5"))
+    current_url = url
 
-    if "html" in content_type:
-        return _extract_html_text(raw) or raw
-    return raw
+    for redirect_count in range(max_redirects + 1):
+        validate_remote_url(current_url, allowed_hosts=allowed_hosts)
+        response = requests.get(
+            current_url,
+            timeout=timeout,
+            headers={"User-Agent": "ragbot-crawler/1.0"},
+            allow_redirects=False,
+            stream=True,
+        )
+        try:
+            if response.status_code in _REDIRECT_STATUSES:
+                location = response.headers.get("Location")
+                if not location:
+                    raise ValueError("Web source redirect did not include Location")
+                if redirect_count >= max_redirects:
+                    raise ValueError("Web source exceeded redirect limit")
+                current_url = urljoin(current_url, location)
+                continue
+
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type and not any(content_type.startswith(prefix) for prefix in _ALLOWED_CONTENT_TYPES):
+                raise ValueError(f"Unsupported web source content type: {content_type}")
+
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    if int(content_length) > max_length:
+                        raise ValueError(f"Web source exceeds {max_length} byte limit")
+                except ValueError as exc:
+                    if "exceeds" in str(exc):
+                        raise
+                    logger.debug("Ignoring invalid Content-Length: %s", content_length)
+
+            raw_bytes = bytearray()
+            for chunk in response.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                if len(raw_bytes) + len(chunk) > max_length:
+                    raise ValueError(f"Web source exceeds {max_length} byte limit")
+                raw_bytes.extend(chunk)
+
+            encoding = response.encoding or "utf-8"
+            raw = bytes(raw_bytes).decode(encoding, errors="replace")
+            if "html" in content_type:
+                return _extract_html_text(raw) or raw
+            return raw
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+
+    raise ValueError("Web source exceeded redirect limit")
 
 
 def _extract_html_text(html: str) -> Optional[str]:
@@ -36,5 +92,4 @@ def _extract_html_text(html: str) -> Optional[str]:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header"]):
         tag.decompose()
-    text = soup.get_text(separator="\n", strip=True)
-    return text
+    return soup.get_text(separator="\n", strip=True)
