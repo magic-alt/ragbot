@@ -57,15 +57,18 @@ class BuildEmbedderConfigurationTests(unittest.TestCase):
 
 
 class IngestionConsistencyTests(unittest.TestCase):
-    def test_pipeline_uses_shared_embedder_and_stable_document_id(self):
+    def test_pipeline_uses_shared_embedder_and_persists_file_documents(self):
         services = build_default_services()
         qdrant = InMemoryQdrant(dim=8)
         embedder = _RecordingEmbedder(dimension=8)
 
         with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "knowledge.txt")
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write("Ragbot indexes local knowledge for downstream agents. " * 20)
+            for filename in ("knowledge-a.txt", "knowledge-b.md"):
+                path = os.path.join(directory, filename)
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(
+                        f"{filename}: Ragbot indexes local knowledge for downstream agents. " * 20
+                    )
 
             source = Source(
                 source_id="src-config",
@@ -85,13 +88,23 @@ class IngestionConsistencyTests(unittest.TestCase):
 
         self.assertEqual(job.status, "completed")
         self.assertGreater(job.chunk_count, 0)
+        self.assertEqual(job.doc_count, 2)
         self.assertTrue(embedder.calls)
-        self.assertEqual(job.stats["doc_id"], "doc-src-config")
 
         chunks = list(services.repo.iter_chunks())
         self.assertTrue(chunks)
-        self.assertTrue(all(chunk.doc_id == "doc-src-config" for chunk in chunks))
-        self.assertIsNotNone(services.repo.get_document("doc-src-config"))
+        doc_ids = {chunk.doc_id for chunk in chunks}
+        self.assertEqual(
+            doc_ids,
+            {
+                "doc-src-config:knowledge-a.txt",
+                "doc-src-config:knowledge-b.md",
+            },
+        )
+        self.assertEqual(set(job.stats["doc_ids"]), doc_ids)
+        self.assertTrue(
+            all(services.repo.get_document(doc_id) is not None for doc_id in doc_ids)
+        )
 
         hits = qdrant.search(
             [1.0] + [0.0] * 7,
