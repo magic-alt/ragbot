@@ -12,6 +12,7 @@ from services.worker.connectors.credentials import resolve_secret
 from services.worker.connectors.incremental import previous_by_external_id, reusable_chunks, stable_document_id
 from services.worker.dedup.hashing import content_hash
 from services.worker.jobs.ingest_text import _split_text
+from services.worker.reliability import provider_request
 
 logger = logging.getLogger(__name__)
 _NOTION_API = "https://api.notion.com/v1"
@@ -176,7 +177,7 @@ def _page_title(page: dict) -> str:
 
 
 def _get_json(client: requests.Session, url: str, params: Optional[dict] = None) -> dict:
-    response = client.get(url, params=params, timeout=30)
+    response = provider_request(client, "get", url, params=params, timeout=30)
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict):
