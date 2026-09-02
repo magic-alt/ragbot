@@ -2,7 +2,8 @@
 
 Credentials are deliberately not stored in Source.config. boto3 uses its normal
 credential chain, or an optional environment prefix can map deployment secrets
-to AWS-style client arguments.
+to AWS-style client arguments. Custom S3-compatible endpoints are constrained by
+an explicit production allowlist so object-store support does not reopen SSRF.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from pathlib import PurePosixPath
 from typing import Iterable, Optional
 
 from services.api.app.storage.models import Chunk
+from services.worker.connectors.security import csv_values, validate_remote_url
 from services.worker.dedup.hashing import content_hash
 from services.worker.jobs.ingest_text import _extract_section, _split_text
 
@@ -51,7 +53,7 @@ def ingest_s3(
     ext_set = _normalize_extensions(extensions)
     client_kwargs = {}
     if endpoint_url:
-        client_kwargs["endpoint_url"] = endpoint_url
+        client_kwargs["endpoint_url"] = _validate_custom_endpoint(endpoint_url)
     if region_name:
         client_kwargs["region_name"] = region_name
     if credential_env_prefix:
@@ -118,6 +120,23 @@ def ingest_s3(
             total_objects += 1
 
     logger.info("S3 ingestion complete: bucket=%s prefix=%s objects=%d chunks=%d", bucket, prefix, total_objects, total_chunks)
+
+
+def _validate_custom_endpoint(endpoint_url: str) -> str:
+    allowed_hosts = csv_values("RAGBOT_S3_ALLOWED_HOSTS")
+    environment = os.getenv("RAGBOT_ENV", "development").strip().lower()
+    if environment in {"production", "prod"} and not allowed_hosts:
+        raise ValueError(
+            "Production custom S3/MinIO endpoint_url requires RAGBOT_S3_ALLOWED_HOSTS"
+        )
+    # An explicitly allowlisted S3-compatible endpoint may legitimately be a
+    # private MinIO service. Without that explicit allowlist, reuse the default
+    # remote-source private-network policy.
+    return validate_remote_url(
+        endpoint_url,
+        allowed_hosts=allowed_hosts or None,
+        allow_private=True if allowed_hosts else None,
+    )
 
 
 def _extract_object_text(body: bytes, suffix: str) -> str:
