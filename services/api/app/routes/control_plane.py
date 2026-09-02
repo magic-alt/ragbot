@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Query
 
@@ -132,8 +133,6 @@ def build_overview(repo, tenant_scope: Optional[set[str] | frozenset[str]]) -> d
         if job.completed_at and (now - _parse_time(job.completed_at)).total_seconds() <= 86400
     )
 
-    # A pending/running refresh must not erase the size of the last successfully
-    # activated knowledge view. Track the most recent completed Job per Source.
     latest_completed_by_source = {}
     for job in sorted(completed, key=_job_sort_key, reverse=True):
         latest_completed_by_source.setdefault(job.source_id, job)
@@ -219,8 +218,6 @@ def _source_catalog_item(source, latest, jobs) -> dict[str, Any]:
 
 def _job_item(job) -> dict[str, Any]:
     data = asdict(job)
-    # Connector configuration can later contain secret references and should not
-    # be mirrored through catalog/operations endpoints.
     data.pop("source_config", None)
     for key in ("created_at", "started_at", "completed_at", "available_at", "lease_expires_at", "heartbeat_at"):
         data[key] = _iso(data.get(key))
@@ -228,6 +225,7 @@ def _job_item(job) -> dict[str, Any]:
 
 
 def _safe_location(source) -> Optional[str]:
+    """Return a useful location without exposing connector credentials/config."""
     config = source.config or {}
     if source.source_type == "web":
         value = config.get("url")
@@ -236,6 +234,17 @@ def _safe_location(source) -> Optional[str]:
         bucket = config.get("bucket")
         prefix = str(config.get("prefix") or "").strip("/")
         return f"s3://{bucket}/{prefix}" if bucket and prefix else (f"s3://{bucket}" if bucket else None)
+    if source.source_type == "gdrive":
+        folder_id = config.get("folder_id")
+        return f"gdrive://{folder_id}" if folder_id else None
+    if source.source_type == "notion":
+        page_id = config.get("page_id")
+        return f"notion://{page_id}" if page_id else None
+    if source.source_type == "confluence":
+        base_url = str(config.get("base_url") or "")
+        host = urlsplit(base_url).hostname
+        space = config.get("space_key")
+        return f"confluence://{host}/{space}" if host and space else None
     value = config.get("path")
     return str(value) if value else None
 
