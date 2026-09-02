@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional
@@ -22,7 +23,10 @@ from .ingest import assert_source_ingestible, enqueue_ingestion_job, latest_acti
 from .sources import _validate_source_config, _validate_source_type
 
 logger = logging.getLogger(__name__)
-SourceType = Literal["local_fs", "pdf", "web", "repo", "s3"]
+SourceType = Literal[
+    "local_fs", "pdf", "web", "repo", "s3", "gdrive", "notion", "confluence"
+]
+_NOTION_ID = re.compile(r"([0-9a-fA-F]{32})(?:[/?#]|$)")
 
 
 class QuickSourceSpec(BaseModel):
@@ -48,14 +52,27 @@ class BatchQuickIngestRequest(BaseModel):
 
 
 def infer_source_type(location: str) -> SourceType:
-    """Infer the connector from a local path or remote URL."""
+    """Infer a connector from local paths, product schemes or well-known URLs."""
     value = location.strip()
     parsed = urlsplit(value)
-    if parsed.scheme.lower() == "s3":
+    scheme = parsed.scheme.lower()
+    if scheme == "s3":
         return "s3"
-    if parsed.scheme.lower() in {"http", "https"}:
+    if scheme in {"gdrive", "googledrive"}:
+        return "gdrive"
+    if scheme == "notion":
+        return "notion"
+    if scheme == "confluence":
+        return "confluence"
+    if scheme in {"http", "https"}:
         host = (parsed.hostname or "").lower()
         path = parsed.path.lower().rstrip("/")
+        if host in {"drive.google.com", "www.drive.google.com"} and "/folders/" in path:
+            return "gdrive"
+        if host in {"notion.so", "www.notion.so"} or host.endswith(".notion.site"):
+            return "notion"
+        if host.endswith(".atlassian.net") and "/spaces/" in path:
+            return "confluence"
         if path.endswith(".pdf"):
             return "pdf"
         if path.endswith(".git") or host in {"github.com", "gitlab.com", "bitbucket.org"}:
@@ -71,7 +88,7 @@ def infer_source_type(location: str) -> SourceType:
 
 
 def canonical_location(location: str) -> str:
-    """Normalize locations enough for stable source identity without resolving I/O."""
+    """Normalize locations for stable Source identity without resolving I/O."""
     value = location.strip()
     parsed = urlsplit(value)
     scheme = parsed.scheme.lower()
@@ -79,7 +96,28 @@ def canonical_location(location: str) -> str:
         bucket = (parsed.netloc or "").lower()
         prefix = parsed.path.strip("/")
         return f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}"
+    if scheme in {"gdrive", "googledrive"}:
+        folder_id = (parsed.netloc or parsed.path).strip("/")
+        return f"gdrive://{folder_id}"
+    if scheme == "notion":
+        page_id = _extract_notion_page_id(parsed.netloc + parsed.path) or (parsed.netloc + parsed.path).strip("/")
+        return f"notion://{page_id.replace('-', '').lower()}"
+    if scheme == "confluence":
+        host = (parsed.hostname or parsed.netloc or "").lower()
+        space = parsed.path.strip("/").upper()
+        return f"confluence://{host}/{space}"
     if scheme in {"http", "https"}:
+        host = (parsed.hostname or "").lower()
+        if host in {"drive.google.com", "www.drive.google.com"} and "/folders/" in parsed.path:
+            return f"gdrive://{_drive_folder_id(parsed.path)}"
+        if host in {"notion.so", "www.notion.so"} or host.endswith(".notion.site"):
+            page_id = _extract_notion_page_id(value)
+            if page_id:
+                return f"notion://{page_id.replace('-', '').lower()}"
+        if host.endswith(".atlassian.net") and "/spaces/" in parsed.path:
+            space = _confluence_space_key(parsed.path)
+            if space:
+                return f"confluence://{host}/{space.upper()}"
         netloc = parsed.netloc.lower()
         path = parsed.path.rstrip("/") or "/"
         return urlunsplit((scheme, netloc, path, parsed.query, ""))
@@ -90,12 +128,51 @@ def canonical_location(location: str) -> str:
 def build_source_config(source_type: SourceType, location: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     config = dict(extra or {})
     value = location.strip()
+    parsed = urlsplit(value)
     if source_type == "s3":
-        parsed = urlsplit(value)
         if parsed.scheme.lower() != "s3" or not parsed.netloc:
             raise HTTPException(status_code=422, detail="source_type=s3 requires location like s3://bucket/prefix")
         config["bucket"] = parsed.netloc
         config["prefix"] = parsed.path.lstrip("/")
+        return config
+    if source_type == "gdrive":
+        if parsed.scheme.lower() in {"gdrive", "googledrive"}:
+            folder_id = (parsed.netloc or parsed.path).strip("/")
+        elif (parsed.hostname or "").lower() in {"drive.google.com", "www.drive.google.com"}:
+            folder_id = _drive_folder_id(parsed.path)
+        else:
+            folder_id = value
+        if not folder_id:
+            raise HTTPException(status_code=422, detail="gdrive location requires a Drive folder ID")
+        config["folder_id"] = folder_id
+        return config
+    if source_type == "notion":
+        page_id = _extract_notion_page_id(value)
+        if parsed.scheme.lower() == "notion" and not page_id:
+            page_id = (parsed.netloc + parsed.path).strip("/")
+        if not page_id:
+            page_id = value if "/" not in value else ""
+        if not page_id:
+            raise HTTPException(status_code=422, detail="notion location requires a page ID or Notion page URL")
+        config["page_id"] = page_id
+        return config
+    if source_type == "confluence":
+        if parsed.scheme.lower() == "confluence":
+            host = parsed.hostname or parsed.netloc
+            space = parsed.path.strip("/")
+            if not host or not space:
+                raise HTTPException(status_code=422, detail="confluence location requires confluence://host/SPACE")
+            config.setdefault("base_url", f"https://{host}/wiki")
+            config["space_key"] = space
+        elif parsed.scheme.lower() in {"http", "https"} and parsed.hostname:
+            space = _confluence_space_key(parsed.path)
+            if not space:
+                raise HTTPException(status_code=422, detail="Confluence URL must contain /spaces/SPACE")
+            wiki_prefix = "/wiki" if parsed.path.startswith("/wiki/") else ""
+            config.setdefault("base_url", f"{parsed.scheme.lower()}://{parsed.netloc}{wiki_prefix}")
+            config["space_key"] = space
+        else:
+            config["space_key"] = value
         return config
     key = "url" if source_type == "web" else "path"
     config[key] = value
@@ -113,14 +190,26 @@ def deterministic_job_id(source_id: str, idempotency_key: str) -> str:
 
 
 def _source_location(source: Source) -> Optional[str]:
+    config = source.config or {}
     if source.source_type == "s3":
-        bucket = source.config.get("bucket")
+        bucket = config.get("bucket")
         if not isinstance(bucket, str) or not bucket.strip():
             return None
-        prefix = str(source.config.get("prefix") or "").strip("/")
+        prefix = str(config.get("prefix") or "").strip("/")
         return f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}"
+    if source.source_type == "gdrive":
+        folder_id = config.get("folder_id")
+        return f"gdrive://{folder_id}" if folder_id else None
+    if source.source_type == "notion":
+        page_id = config.get("page_id")
+        return f"notion://{str(page_id).replace('-', '').lower()}" if page_id else None
+    if source.source_type == "confluence":
+        base_url = str(config.get("base_url") or "")
+        host = (urlsplit(base_url).hostname or "").lower()
+        space = str(config.get("space_key") or "").upper()
+        return f"confluence://{host}/{space}" if host and space else None
     key = "url" if source.source_type == "web" else "path"
-    value = source.config.get(key)
+    value = config.get(key)
     return value if isinstance(value, str) and value.strip() else None
 
 
@@ -237,9 +326,6 @@ def _run_quick_import(*, tenant_id: str, spec: QuickSourceSpec, services) -> Dic
         else deterministic_source_id(tenant_id, source_type, spec.location)
     )
 
-    # Explicit request idempotency is checked before any metadata mutation.
-    # A replay should be observationally stable rather than modifying Source
-    # state merely because the same request was sent again.
     if spec.idempotency_key:
         job_id = deterministic_job_id(stable_source_id, spec.idempotency_key)
         existing_job = services.repo.get_job(job_id)
@@ -258,10 +344,6 @@ def _run_quick_import(*, tenant_id: str, spec: QuickSourceSpec, services) -> Dic
     else:
         job_id = None
 
-    # Do not rewrite a Source's connector configuration while an earlier run is
-    # pending/running and then claim that the older Job represents the new
-    # request. Same-config repeats are safe to dedupe; config changes must wait
-    # for the active run to finish.
     if existing_source is not None and spec.dedupe_active_job:
         active_job = latest_active_ingestion_job(
             services.repo,
@@ -361,3 +443,28 @@ def create_quick_import_router(get_services: Callable, auth_dep: Any) -> APIRout
         }
 
     return router
+
+
+def _drive_folder_id(path: str) -> str:
+    parts = [part for part in path.split("/") if part]
+    try:
+        index = parts.index("folders")
+    except ValueError:
+        return ""
+    return parts[index + 1] if index + 1 < len(parts) else ""
+
+
+def _extract_notion_page_id(value: str) -> str:
+    compact = str(value or "").replace("-", "")
+    matches = list(_NOTION_ID.finditer(compact))
+    return matches[-1].group(1) if matches else ""
+
+
+def _confluence_space_key(path: str) -> str:
+    parts = [part for part in path.split("/") if part]
+    lowered = [part.lower() for part in parts]
+    try:
+        index = lowered.index("spaces")
+    except ValueError:
+        return ""
+    return parts[index + 1] if index + 1 < len(parts) else ""
