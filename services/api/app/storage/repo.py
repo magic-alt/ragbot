@@ -156,6 +156,13 @@ class InMemoryRepo:
         with self._lock:
             self._jobs[job.job_id] = job
 
+    def add_job_if_absent(self, job: IngestionJob) -> bool:
+        with self._lock:
+            if job.job_id in self._jobs:
+                return False
+            self._jobs[job.job_id] = job
+            return True
+
     def get_job(self, job_id: str) -> Optional[IngestionJob]:
         with self._lock:
             return self._jobs.get(job_id)
