@@ -1,0 +1,61 @@
+name: SaaS Connector Staging Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      connectors:
+        description: "Comma-separated connectors: gdrive,notion,confluence"
+        required: true
+        default: "gdrive,notion,confluence"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install SaaS connector dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[worker,saas]"
+
+      - name: Run real SaaS connector smoke
+        env:
+          SAAS_SMOKE_CONNECTORS: ${{ inputs.connectors }}
+
+          # Google Drive. The credential ref points at the env var populated
+          # from the GitHub Environment secret below.
+          STAGING_GDRIVE_FOLDER_ID: ${{ vars.STAGING_GDRIVE_FOLDER_ID }}
+          STAGING_GDRIVE_CREDENTIAL_REF: env:RAGBOT_STAGING_GDRIVE_CREDENTIAL
+          STAGING_GDRIVE_CREDENTIAL_TYPE: ${{ vars.STAGING_GDRIVE_CREDENTIAL_TYPE || 'google_json' }}
+          STAGING_GDRIVE_RECURSIVE: ${{ vars.STAGING_GDRIVE_RECURSIVE || 'true' }}
+          RAGBOT_STAGING_GDRIVE_CREDENTIAL: ${{ secrets.STAGING_GDRIVE_CREDENTIAL }}
+
+          # Notion.
+          STAGING_NOTION_PAGE_ID: ${{ vars.STAGING_NOTION_PAGE_ID }}
+          STAGING_NOTION_CREDENTIAL_REF: env:RAGBOT_STAGING_NOTION_TOKEN
+          STAGING_NOTION_RECURSIVE: ${{ vars.STAGING_NOTION_RECURSIVE || 'false' }}
+          RAGBOT_STAGING_NOTION_TOKEN: ${{ secrets.STAGING_NOTION_TOKEN }}
+
+          # Confluence.
+          STAGING_CONFLUENCE_BASE_URL: ${{ vars.STAGING_CONFLUENCE_BASE_URL }}
+          STAGING_CONFLUENCE_SPACE_KEY: ${{ vars.STAGING_CONFLUENCE_SPACE_KEY }}
+          STAGING_CONFLUENCE_CREDENTIAL_REF: env:RAGBOT_STAGING_CONFLUENCE_TOKEN
+          STAGING_CONFLUENCE_AUTH_TYPE: ${{ vars.STAGING_CONFLUENCE_AUTH_TYPE || 'basic' }}
+          STAGING_CONFLUENCE_EMAIL: ${{ vars.STAGING_CONFLUENCE_EMAIL }}
+          STAGING_CONFLUENCE_ROOT_PAGE_ID: ${{ vars.STAGING_CONFLUENCE_ROOT_PAGE_ID }}
+          RAGBOT_CONFLUENCE_ALLOWED_HOSTS: ${{ vars.RAGBOT_CONFLUENCE_ALLOWED_HOSTS }}
+          RAGBOT_ALLOW_PRIVATE_SOURCE_NETWORKS: ${{ vars.RAGBOT_ALLOW_PRIVATE_SOURCE_NETWORKS || 'false' }}
+          RAGBOT_STAGING_CONFLUENCE_TOKEN: ${{ secrets.STAGING_CONFLUENCE_TOKEN }}
+        run: python -m eval.saas_staging_smoke

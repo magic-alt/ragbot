@@ -30,7 +30,6 @@ def _api_request(
     headers: Optional[Dict[str, str]] = None,
     timeout: float = 120,
 ) -> Dict[str, Any]:
-    """Make an HTTP request to the ragbot API."""
     import requests
 
     url = f"{base_url.rstrip('/')}{path}"
@@ -56,7 +55,6 @@ def _local_chat(
     constraints: Optional[Dict[str, Any]] = None,
     client_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run a chat query using local services (no HTTP)."""
     from services.api.app.main import chat
     from services.api.app.agent.graph import build_default_services
     from services.api.app.agent.state import Constraints
@@ -89,7 +87,6 @@ def _wait_for_job(
             suffix = f" ({', '.join(details)})" if details else ""
             print(f"Ingestion {job_id}: {status}{suffix}")
             previous_status = status
-
         if status == "completed":
             return job
         if status == "failed":
@@ -100,13 +97,35 @@ def _wait_for_job(
 
 
 def _ingest_config(args: argparse.Namespace) -> Dict[str, Any]:
+    """Build non-secret connector config; credential values are never CLI args."""
     config: Dict[str, Any] = {}
-    if getattr(args, "ref", None):
-        config["ref"] = args.ref
+    for attr, key in (
+        ("ref", "ref"),
+        ("credential_ref", "credential_ref"),
+        ("credential_type", "credential_type"),
+        ("base_url", "base_url"),
+        ("email", "email"),
+        ("auth_type", "auth_type"),
+        ("root_page_id", "root_page_id"),
+        ("notion_version", "notion_version"),
+    ):
+        value = getattr(args, attr, None)
+        if value:
+            config[key] = value
     if getattr(args, "chunk_size", None):
         config["chunk_size"] = args.chunk_size
     if getattr(args, "chunk_overlap", None) is not None:
         config["chunk_overlap"] = args.chunk_overlap
+    if getattr(args, "max_file_bytes", None):
+        config["max_file_bytes"] = args.max_file_bytes
+    if getattr(args, "no_recursive", False):
+        config["recursive"] = False
+    raw_json = getattr(args, "config_json", None)
+    if raw_json:
+        extra = json.loads(raw_json)
+        if not isinstance(extra, dict):
+            raise ValueError("--config-json must decode to a JSON object")
+        config.update(extra)
     return config
 
 
@@ -131,10 +150,7 @@ def _manifest_source_spec(item: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(location, str) or not location.strip():
         raise ValueError("Each manifest source requires location/path/url")
     source_type = item.get("source_type") or item.get("type") or infer_source_type(location)
-    spec: Dict[str, Any] = {
-        "location": location,
-        "source_type": source_type,
-    }
+    spec: Dict[str, Any] = {"location": location, "source_type": source_type}
     for key in (
         "name", "tags", "acl_policy_id", "config", "reuse_source",
         "sync_source_metadata", "dedupe_active_job", "idempotency_key",
@@ -146,11 +162,8 @@ def _manifest_source_spec(item: Dict[str, Any]) -> Dict[str, Any]:
 
 def _ingest_local_spec(tenant_id: str, spec: Dict[str, Any]) -> Dict[str, Any]:
     from services.api.app.agent.graph import build_default_services
-    from services.api.app.routes.quick_import import (
-        build_source_config,
-        deterministic_source_id,
-        infer_source_type,
-    )
+    from services.api.app.routes.quick_import import build_source_config, deterministic_source_id, infer_source_type
+    from services.api.app.routes.sources import _validate_source_config
     from services.api.app.storage.models import Source
     from services.worker.pipeline import run_ingest_pipeline
 
@@ -158,6 +171,7 @@ def _ingest_local_spec(tenant_id: str, spec: Dict[str, Any]) -> Dict[str, Any]:
     location = str(spec["location"])
     source_type = spec.get("source_type") or infer_source_type(location)
     config = build_source_config(source_type, location, spec.get("config"))
+    _validate_source_config(source_type, config)
     source_id = deterministic_source_id(tenant_id, source_type, location)
     existing = services.repo.get_source(source_id)
     source = Source(
@@ -172,12 +186,7 @@ def _ingest_local_spec(tenant_id: str, spec: Dict[str, Any]) -> Dict[str, Any]:
         created_at=existing.created_at if existing else None,
     )
     services.repo.add_source(source)
-    job = run_ingest_pipeline(
-        source,
-        services.repo,
-        services.qdrant,
-        embedder=services.embedder,
-    )
+    job = run_ingest_pipeline(source, services.repo, services.qdrant, embedder=services.embedder)
     return {
         "status": job.status,
         "source_id": source.source_id,
@@ -196,63 +205,38 @@ def cmd_ask(args: argparse.Namespace) -> None:
         constraints["ref"] = args.ref
     if args.tags:
         constraints["tags"] = args.tags
-
     if args.server:
-        payload = {
-            "query": query,
-            "tenant_id": args.tenant,
-            "user_id": args.user,
-            "constraints": constraints or None,
-        }
+        payload = {"query": query, "tenant_id": args.tenant, "user_id": args.user, "constraints": constraints or None}
         result = _api_request(args.server, "POST", "/chat", payload, _auth_headers(args.api_key))
     else:
         result = _local_chat(query, args.tenant, args.user, constraints or None)
-
     _print_result(result, args.json)
 
 
 def cmd_search(args: argparse.Namespace) -> None:
     query = " ".join(args.query)
-
     if args.server:
-        payload = {
-            "query": query,
-            "tenant_id": args.tenant,
-            "user_id": args.user,
-            "top_k": args.top_k,
-        }
+        payload = {"query": query, "tenant_id": args.tenant, "user_id": args.user, "top_k": args.top_k}
         result = _api_request(args.server, "POST", "/search", payload, _auth_headers(args.api_key))
     else:
         from services.api.app.agent.graph import build_default_services
         from services.api.app.auth.acl import compute_security_scope
-
         services = build_default_services()
         scope = compute_security_scope(args.user, services.repo.list_policies())
         filters = {"tenant_id": args.tenant, "acl_hashes": scope}
         chunks = services.retriever.retrieve(query, filters, top_k=args.top_k)
-        result = {
-            "chunks": [{"chunk_id": c.chunk_id, "text": c.text, "score": c.score} for c in chunks],
-            "total": len(chunks),
-        }
-
+        result = {"chunks": [{"chunk_id": c.chunk_id, "text": c.text, "score": c.score} for c in chunks], "total": len(chunks)}
     _print_result(result, args.json)
 
 
 def cmd_patch(args: argparse.Namespace) -> None:
     query = " ".join(args.query)
     constraints = {"repo": args.repo} if args.repo else {}
-
     if args.server:
-        payload = {
-            "query": query,
-            "tenant_id": args.tenant,
-            "user_id": args.user,
-            "constraints": constraints or None,
-        }
+        payload = {"query": query, "tenant_id": args.tenant, "user_id": args.user, "constraints": constraints or None}
         result = _api_request(args.server, "POST", "/chat", payload, _auth_headers(args.api_key))
     else:
         result = _local_chat(query, args.tenant, args.user, constraints or None)
-
     _print_result(result, args.json)
 
 
@@ -271,25 +255,14 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         "dedupe_active_job": not args.force_new_job,
         "idempotency_key": args.idempotency_key,
     }
-
     if args.server:
         payload = {"tenant_id": args.tenant, **spec}
-        result = _api_request(
-            args.server,
-            "POST",
-            "/ingest/quick",
-            payload,
-            _auth_headers(args.api_key),
-        )
+        result = _api_request(args.server, "POST", "/ingest/quick", payload, _auth_headers(args.api_key))
         final_job = None
         if args.wait and result.get("job_id"):
             final_job = _wait_for_job(
-                args.server,
-                result["job_id"],
-                headers=_auth_headers(args.api_key),
-                timeout=args.timeout,
-                poll_interval=args.poll_interval,
-                quiet=args.json,
+                args.server, result["job_id"], headers=_auth_headers(args.api_key),
+                timeout=args.timeout, poll_interval=args.poll_interval, quiet=args.json,
             )
         if args.json:
             output = {"submission": result}
@@ -297,15 +270,9 @@ def cmd_ingest(args: argparse.Namespace) -> None:
                 output["job"] = final_job
             print(json.dumps(output, indent=2, ensure_ascii=False))
         else:
-            print(
-                f"Source {result.get('source_id')} [{result.get('source_type')}] -> "
-                f"job {result.get('job_id')} ({result.get('status')})"
-            )
+            print(f"Source {result.get('source_id')} [{result.get('source_type')}] -> job {result.get('job_id')} ({result.get('status')})")
             if final_job is not None:
-                print(
-                    f"Knowledge ready: docs={final_job.get('doc_count', 0)}, "
-                    f"chunks={final_job.get('chunk_count', 0)}"
-                )
+                print(f"Knowledge ready: docs={final_job.get('doc_count', 0)}, chunks={final_job.get('chunk_count', 0)}")
         return
 
     result = _ingest_local_spec(args.tenant, spec)
@@ -313,10 +280,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
         job = result["job"]
-        print(
-            f"Ingestion complete: source={result['source_id']}, status={job['status']}, "
-            f"docs={job['doc_count']}, chunks={job['chunk_count']}"
-        )
+        print(f"Ingestion complete: source={result['source_id']}, status={job['status']}, docs={job['doc_count']}, chunks={job['chunk_count']}")
 
 
 def cmd_import(args: argparse.Namespace) -> None:
@@ -324,17 +288,9 @@ def cmd_import(args: argparse.Namespace) -> None:
     raw = json.loads(manifest_path.read_text(encoding="utf-8"))
     tenant_id, items = _normalize_manifest(raw, args.tenant)
     specs = [_manifest_source_spec(item) for item in items]
-
     if args.server:
         payload = {"tenant_id": tenant_id, "sources": specs}
-        result = _api_request(
-            args.server,
-            "POST",
-            "/ingest/batch",
-            payload,
-            _auth_headers(args.api_key),
-            timeout=180,
-        )
+        result = _api_request(args.server, "POST", "/ingest/batch", payload, _auth_headers(args.api_key), timeout=180)
         jobs: Dict[str, Dict[str, Any]] = {}
         if args.wait:
             for item in result.get("items", []):
@@ -342,20 +298,13 @@ def cmd_import(args: argparse.Namespace) -> None:
                 if not job_id or item.get("status") == "error" or job_id in jobs:
                     continue
                 jobs[job_id] = _wait_for_job(
-                    args.server,
-                    job_id,
-                    headers=_auth_headers(args.api_key),
-                    timeout=args.timeout,
-                    poll_interval=args.poll_interval,
-                    quiet=args.json,
+                    args.server, job_id, headers=_auth_headers(args.api_key),
+                    timeout=args.timeout, poll_interval=args.poll_interval, quiet=args.json,
                 )
         if args.json:
             print(json.dumps({"submission": result, "jobs": jobs}, indent=2, ensure_ascii=False))
         else:
-            print(
-                f"Batch submitted: total={result.get('total', 0)}, "
-                f"accepted={result.get('accepted', 0)}, failed={result.get('failed', 0)}"
-            )
+            print(f"Batch submitted: total={result.get('total', 0)}, accepted={result.get('accepted', 0)}, failed={result.get('failed', 0)}")
             if args.wait:
                 completed = sum(1 for job in jobs.values() if job.get("status") == "completed")
                 chunks = sum(int(job.get("chunk_count", 0)) for job in jobs.values())
@@ -387,7 +336,6 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         ok = checks.get("liveness", {}).get("status") == "ok" and checks.get("readiness", {}).get("status") == "ready"
     else:
         from services.api.app.agent.graph import build_default_services
-
         try:
             services = build_default_services()
             repo_check = getattr(services.repo, "healthcheck", None)
@@ -401,7 +349,6 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         except Exception as exc:
             checks = {"startup": False, "error": str(exc)}
             ok = False
-
     if args.json:
         print(json.dumps({"ok": ok, "checks": checks}, indent=2, ensure_ascii=False))
     else:
@@ -416,7 +363,6 @@ def _print_result(result: Dict[str, Any], as_json: bool) -> None:
     if as_json:
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return
-
     if "answer" in result:
         print(result["answer"])
         if result.get("citations"):
@@ -455,16 +401,12 @@ def _add_wait_options(parser: argparse.ArgumentParser) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    parser = argparse.ArgumentParser(
-        prog="rag",
-        description="ragbot CLI - build and query a RAG knowledge base",
-    )
+    parser = argparse.ArgumentParser(prog="rag", description="ragbot CLI - build and query a RAG knowledge base")
     parser.add_argument("--server", "-s", help="API server URL (e.g., http://localhost:8000). If omitted, runs locally.")
     parser.add_argument("--api-key", "-k", help="API key for authentication")
     parser.add_argument("--tenant", "-t", default="default", help="Tenant ID (default: 'default')")
     parser.add_argument("--user", "-u", default="cli-user", help="User ID (default: 'cli-user')")
     parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
-
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     ask_parser = subparsers.add_parser("ask", help="Ask a question")
@@ -485,11 +427,28 @@ def main(argv: Optional[List[str]] = None) -> None:
     patch_parser.set_defaults(func=cmd_patch)
 
     ingest_parser = subparsers.add_parser("ingest", help="Create/reuse a source and ingest it")
-    ingest_parser.add_argument("path", help="Local path, PDF URL, web URL or repository URL")
-    ingest_parser.add_argument("--type", choices=["local_fs", "repo", "pdf", "web"], help="Source type (auto-detected if omitted)")
+    ingest_parser.add_argument(
+        "path",
+        help="Local/HTTP/S3/Google Drive/Notion/Confluence location",
+    )
+    ingest_parser.add_argument(
+        "--type",
+        choices=["local_fs", "repo", "pdf", "web", "s3", "gdrive", "notion", "confluence"],
+        help="Source type (auto-detected if omitted)",
+    )
     ingest_parser.add_argument("--name", help="Source name")
     ingest_parser.add_argument("--tag", dest="tags", action="append", help="Source tag; repeat for multiple tags")
     ingest_parser.add_argument("--ref", help="Git ref for repository sources")
+    ingest_parser.add_argument("--credential-ref", help="Secret reference such as env:RAGBOT_NOTION_TOKEN; never pass token values")
+    ingest_parser.add_argument("--credential-type", choices=["access_token", "google_json"], help="Google Drive credential type")
+    ingest_parser.add_argument("--base-url", help="Confluence base URL when location is only a space key")
+    ingest_parser.add_argument("--email", help="Confluence account email for basic auth")
+    ingest_parser.add_argument("--auth-type", choices=["basic", "bearer"], help="Confluence authentication mode")
+    ingest_parser.add_argument("--root-page-id", help="Optional Confluence root page restriction")
+    ingest_parser.add_argument("--notion-version", help="Notion API version override")
+    ingest_parser.add_argument("--no-recursive", action="store_true", help="Disable recursive Drive/Notion traversal")
+    ingest_parser.add_argument("--max-file-bytes", type=int, help="Per-file hard download limit for cloud connectors")
+    ingest_parser.add_argument("--config-json", help="Additional non-secret connector config as a JSON object")
     ingest_parser.add_argument("--chunk-size", type=int, help="Override connector chunk size")
     ingest_parser.add_argument("--chunk-overlap", type=int, help="Override connector chunk overlap")
     ingest_parser.add_argument("--idempotency-key", help="Return the same job for repeated submissions with this key")
@@ -507,11 +466,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     doctor_parser.set_defaults(func=cmd_doctor)
 
     args = parser.parse_args(argv)
-
     if not args.command:
         parser.print_help()
         sys.exit(1)
-
     try:
         args.func(args)
     except Exception as exc:
