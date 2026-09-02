@@ -15,7 +15,7 @@ from ..auth.principal import allowed_tenants, authorize_tenant
 from ..storage.models import Source
 
 
-SOURCE_TYPE_VALUES = ("local_fs", "pdf", "web", "repo")
+SOURCE_TYPE_VALUES = ("local_fs", "pdf", "web", "repo", "s3")
 VALID_SOURCE_TYPES = set(SOURCE_TYPE_VALUES)
 
 
@@ -48,7 +48,12 @@ def _validate_source_type(source_type: str) -> None:
 
 
 def _validate_source_config(source_type: str, config: Dict[str, Any]) -> None:
-    required_key = "url" if source_type == "web" else "path"
+    if source_type == "web":
+        required_key = "url"
+    elif source_type == "s3":
+        required_key = "bucket"
+    else:
+        required_key = "path"
     value = config.get(required_key)
     if not isinstance(value, str) or not value.strip():
         raise HTTPException(
