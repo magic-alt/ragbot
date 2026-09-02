@@ -32,7 +32,7 @@ jobs:
           --health-timeout 3s
           --health-retries 10
       qdrant:
-        image: qdrant/qdrant:v1.15.4
+        image: qdrant/qdrant:v1.19.0
         ports:
           - 6333:6333
 
@@ -41,7 +41,7 @@ jobs:
       RAGBOT_INGESTION_MODE: worker
       RAGBOT_API_KEYS: staging-ci-key
       RAGBOT_API_KEY_PRINCIPALS: >-
-        {"staging-ci-key":{"tenant_ids":["staging"],"user_id":"staging-user","groups":[],"roles":["reader"],"admin":false}}
+        {"staging-ci-key":{"tenant_ids":["staging"],"user_id":"staging-user","groups":[],"roles":["operator"],"admin":false}}
       POSTGRES_DSN: postgresql://ragbot:ragbot@127.0.0.1:5432/ragbot
       QDRANT_URL: http://127.0.0.1:6333
       QDRANT_COLLECTION: rag_chunks_staging_smoke
