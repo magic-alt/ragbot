@@ -21,7 +21,8 @@ from services.worker.jobs.embed_and_upsert import embed_and_upsert
 
 logger = logging.getLogger(__name__)
 LEXICAL_VERSION = 2
-_MULTI_DOCUMENT_SOURCE_TYPES = {"local_fs", "s3"}
+_MULTI_DOCUMENT_SOURCE_TYPES = {"local_fs", "s3", "gdrive", "notion", "confluence"}
+_REMOTE_DOCUMENT_SOURCE_TYPES = {"s3", "gdrive", "notion", "confluence"}
 
 
 def run_ingest_pipeline(
@@ -62,7 +63,10 @@ def run_ingest_pipeline(
             for chunk in repo.list_chunks(doc_id)
         }
 
-        candidate_chunks = list(_run_connector(source, repo))
+        # Cloud/SaaS connectors receive the previous snapshot so they can list
+        # remote metadata, reuse unchanged documents and download only changed
+        # content while still returning a complete replacement snapshot.
+        candidate_chunks = list(_run_connector(source, repo, previous_chunks.values()))
         _normalize_chunk_metadata(source, candidate_chunks, now)
         candidate_chunks = _dedup_chunks(candidate_chunks)
         current_chunks, chunks_to_write, chunks_reused = _reuse_unchanged_chunks(
@@ -184,7 +188,7 @@ def _delete_qdrant_documents(qdrant: object, doc_ids: set[str]) -> int:
     return int(delete(doc_ids) or 0)
 
 
-def _run_connector(source: Source, repo: Repo) -> Iterable[Chunk]:
+def _run_connector(source: Source, repo: Repo, previous_chunks: Iterable[Chunk] = ()) -> Iterable[Chunk]:
     source_type = source.source_type
     config = source.config
     doc_id = config.get("doc_id") or f"doc-{source.source_id}"
@@ -231,6 +235,45 @@ def _run_connector(source: Source, repo: Repo) -> Iterable[Chunk]:
             max_object_bytes=int(config.get("max_object_bytes", 20 * 1024 * 1024)),
             chunk_size=int(config.get("chunk_size", 800)),
             chunk_overlap=int(config.get("chunk_overlap", 100)),
+            **common,
+        )
+    if source_type == "gdrive":
+        from services.worker.jobs.ingest_google_drive import ingest_google_drive
+        return ingest_google_drive(
+            folder_id=config["folder_id"],
+            credential_ref=config["credential_ref"],
+            credential_type=config.get("credential_type", "access_token"),
+            recursive=bool(config.get("recursive", True)),
+            max_file_bytes=int(config.get("max_file_bytes", 20 * 1024 * 1024)),
+            chunk_size=int(config.get("chunk_size", 800)),
+            chunk_overlap=int(config.get("chunk_overlap", 100)),
+            previous_chunks=previous_chunks,
+            **common,
+        )
+    if source_type == "notion":
+        from services.worker.jobs.ingest_notion import ingest_notion
+        return ingest_notion(
+            page_id=config["page_id"],
+            credential_ref=config["credential_ref"],
+            recursive=bool(config.get("recursive", True)),
+            notion_version=config.get("notion_version", "2022-06-28"),
+            chunk_size=int(config.get("chunk_size", 800)),
+            chunk_overlap=int(config.get("chunk_overlap", 100)),
+            previous_chunks=previous_chunks,
+            **common,
+        )
+    if source_type == "confluence":
+        from services.worker.jobs.ingest_confluence import ingest_confluence
+        return ingest_confluence(
+            base_url=config["base_url"],
+            space_key=config["space_key"],
+            credential_ref=config["credential_ref"],
+            auth_type=config.get("auth_type", "basic"),
+            email=config.get("email"),
+            root_page_id=config.get("root_page_id"),
+            chunk_size=int(config.get("chunk_size", 800)),
+            chunk_overlap=int(config.get("chunk_overlap", 100)),
+            previous_chunks=previous_chunks,
             **common,
         )
     raise ValueError(f"Unsupported source_type: {source_type}")
@@ -309,6 +352,7 @@ def _reuse_key(chunk: Chunk) -> tuple:
         tuple(metadata.get("tags") or []),
         metadata.get("acl_hash") or "public",
         metadata.get("version"),
+        metadata.get("remote_version"),
         metadata.get("lexical_version"),
     )
 
@@ -324,10 +368,15 @@ def _ensure_documents(source: Source, repo: Repo, chunks: list[Chunk]) -> list[D
         first_chunk_by_doc_id.setdefault(chunk.doc_id, chunk)
     documents: list[Document] = []
     for doc_id, chunk in first_chunk_by_doc_id.items():
-        if source.source_type == "s3":
-            metadata = chunk.metadata or {}
-            title = str(metadata.get("filename") or metadata.get("object_key") or source.name)
-            uri = chunk.path or f"source://{source.source_id}/{doc_id}"
+        metadata = chunk.metadata or {}
+        if source.source_type in _REMOTE_DOCUMENT_SOURCE_TYPES:
+            title = str(
+                metadata.get("document_title")
+                or metadata.get("filename")
+                or metadata.get("object_key")
+                or source.name
+            )
+            uri = str(metadata.get("document_uri") or chunk.url or chunk.path or f"source://{source.source_id}/{doc_id}")
         else:
             file_path = Path(chunk.path) if chunk.path else None
             title = file_path.name if file_path else source.name
