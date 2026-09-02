@@ -1,95 +1,77 @@
 # Changelog
 
-All notable project changes intended for release are recorded here. Ragbot still reports package version `0.5.0`; the entries below remain **Unreleased** until a dedicated release commit promotes them to `1.0.0`.
+All notable project changes intended for release are recorded here. Ragbot still reports package version `0.5.0`; the entries below remain **Unreleased** until a dedicated release-only change promotes them to `1.0.0`.
 
 ## [Unreleased]
 
 ### Added
 
-- high-level `POST /ingest/quick` product API that creates/reuses a Source and submits ingestion in one call;
-- `POST /ingest/batch` for manifest-style onboarding of up to 100 knowledge sources per request;
-- stable Source identity from tenant + source type + canonicalized location;
-- active-ingestion deduplication and explicit deterministic ingestion idempotency keys;
-- product CLI workflow with automatic source-type inference, ingestion progress polling and `--wait`;
-- `rag import` JSON-manifest knowledge-base bootstrap command;
-- `rag doctor` deployment liveness/readiness command;
-- 60-second product quickstart and example multi-source manifest;
-- reusable ingestion queue helpers shared by low-level and product APIs;
-- real PostgreSQL + Qdrant 1000-PDF capacity/integration benchmark and benchmark documentation;
-- durable SQL migration runner with advisory locking and migration history;
-- native PostgreSQL FTS integration in the production repository path;
-- replacement-oriented source ingestion and stale PostgreSQL/Qdrant cleanup;
-- explicit Qdrant health/dimension validation and vector deletion support;
-- Node client TypeScript build/typecheck configuration;
-- Helm Ingress/HPA templates, migration initContainer and source-volume extension points;
-- system design, API, deployment and v1 release-readiness documentation;
-- API-key principal model for tenant/user/group/role scoped service identities;
-- production runtime validation through `RAGBOT_ENV=production`;
-- Web/PDF/Git network-source policy and local source-root policy;
+- Quick Import (`POST /ingest/quick`) and batch onboarding (`POST /ingest/batch`);
+- stable Source identity, explicit idempotency keys, CLI `rag ingest --wait`, `rag import`, and `rag doctor`;
+- PostgreSQL-backed durable ingestion queue with worker claim, lease, heartbeat, crash recovery, retry/backoff, scheduler, and reconciliation;
+- explicit `dead_lettered` Job state, `failure_class`, DLQ Requeue, and global queue reconcile endpoint;
+- shared provider HTTP reliability layer with `Retry-After`, bounded exponential backoff, and no blind retry of permanent 4xx responses;
+- reader/operator/owner/admin RBAC on tenant mutation and global operations;
+- `/catalog/session` non-secret capability endpoint for product UIs;
+- built-in zero-build Admin UI with Source Catalog, queue health, scheduled sync, failed Retry, DLQ Requeue, and principal capability guidance;
+- S3/MinIO, Google Drive, Notion, and Confluence connectors using worker-only secret references;
+- metadata-first Drive/Notion/Confluence incremental reuse for unchanged remote documents;
+- Docker Compose worker-only credential env files and Helm `worker.extraEnv` / `worker.extraEnvFrom`;
+- optional KEDA PostgreSQL backlog autoscaling for ingestion workers;
+- PostgreSQL native FTS plus CJK bigram lexical representation and Recall@5/MRR regression gates;
+- deterministic 1000-PDF PostgreSQL/Qdrant capacity/integration benchmark;
 - Apache License 2.0;
-- PostgreSQL-backed durable ingestion queue with atomic worker claims, leases, heartbeat, crash recovery and bounded attempts;
-- independent ingestion worker deployments for Docker Compose and Helm;
-- CJK bigram lexical representation on top of PostgreSQL `simple` FTS;
-- deterministic PostgreSQL CJK retrieval regression corpus with Recall@5/MRR release floors;
-- manual production-style staging smoke workflow for real LLM/embedding provider credentials, PostgreSQL and Qdrant;
-- v1 release/security/queue/CJK regression tests.
+- executable PostgreSQL + Qdrant backup/restore scripts with SHA-256 manifest validation;
+- CI `Backup + restore smoke` that performs seed → backup → destroy → restore → verify against PostgreSQL 16 and Qdrant v1.19.0;
+- `docs/DISASTER_RECOVERY.md` plus production/admin/deployment/v1 readiness runbooks.
 
 ### Changed
 
-- the default onboarding workflow is now Quick Import/CLI instead of requiring callers to manually orchestrate Source creation followed by Job creation;
-- repeated product bootstrap calls reuse an existing Source and same-config pending/running Job by default;
-- durable ingestion Jobs execute the connector `source_type/source_config` snapshot captured at enqueue time, rather than silently switching to a later mutable Source config;
-- local CLI ingestion explicitly uses the configured shared embedder, preserving the same embedding contract as retrieval;
-- FastAPI `/openapi.json` is the canonical HTTP API schema instead of a separately maintained static OpenAPI file;
-- ingestion/query paths share one embedding contract and reject incompatible vector dimensions;
-- PostgreSQL migrations are executed explicitly during Compose/Helm deployment rather than only on first database-volume creation;
-- PostgreSQL-backed deployments enqueue ingestion jobs for independent workers instead of executing them in the API process;
-- production mode rejects inline ingestion and Helm production renders require the durable worker;
-- Source and Ingest APIs enforce tenant authorization when API-key principals are configured;
-- `/search`, `/chat` and `/v1/chat/completions` derive ACL scope from trusted API-key principals;
-- optional reranker failures fall back to RRF ordering instead of failing retrieval;
-- Web/PDF downloads are bounded and redirects are revalidated;
-- local source paths are constrained to configured roots in production;
-- global metrics/cost/cache endpoints require an admin principal when scoped principals are enabled;
-- unchanged chunks carry a lexical representation version so retrieval-format upgrades trigger one controlled rewrite/reindex pass.
+- product onboarding now defaults to Quick Import instead of manually orchestrating Source creation and Job submission;
+- queued Jobs execute immutable connector snapshots captured at submission time;
+- production mode rejects inline ingestion and in-memory/hash fallbacks;
+- Source/Ingest mutation routes require operator/owner capability when scoped principals are configured;
+- Admin UI write controls follow `/catalog/session`, while API RBAC remains authoritative;
+- PostgreSQL-backed ingestion failure handling now uses two layers: provider request retry followed by whole-ingestion durable retry;
+- exhausted/permanent work is separated from ordinary failure state through DLQ;
+- both Docker Compose variants expose the same retry/reconcile/provider settings and pin Qdrant to v1.19.0;
+- Helm worker values/template expose durable retry, reconciliation, scheduler, and provider backoff settings;
+- hybrid retrieval uses Qdrant vector + PostgreSQL lexical/CJK + balanced RRF with optional reranking;
+- reranker failure remains fail-open to the base hybrid ordering;
+- cloud connector secrets remain worker-only and never become Source credential values.
 
 ### Fixed
 
-- strict quick-import idempotency can no longer be combined with non-reusable Source identity;
-- Quick Import no longer mutates/reuses an active Source Job when the newly requested connector configuration differs;
-- batch Quick Import no longer returns raw unexpected exception text to clients;
-- queued durable Jobs are no longer redirected by Source config edits made after submission;
-- hybrid RRF modality crowd-out that could suppress an exact lexical candidate behind the vector candidate window;
-- invalid single-marker identity assumptions in the deterministic 1000-PDF hash-embedding benchmark;
-- stable deterministic hash embeddings for development/testing;
-- ingestion/query embedding-dimension drift;
-- stale chunks/vectors/documents after replacement ingestion;
-- PostgreSQL row/JSONB/array/schema adaptation issues;
-- migration ordering/schema alignment problems;
-- SSE failure paths that could leave a stream waiting indefinitely;
-- Node client missing shared types/build metadata;
-- previously advertised unsupported source types and contract drift;
-- unsafe remote-source SSRF exposure to loopback/private/link-local destinations;
-- silent embedding vector truncation/zero-padding;
-- cross-tenant Source/Ingest access possible with service-level API keys;
-- ingestion jobs being lost when an API process restarted mid-execution;
-- poor Chinese lexical recall caused by treating long CJK strings as unsplit `simple`-FTS tokens.
+- worker helper compatibility regression after introducing `max_attempts`;
+- Quick Import active-Job/config drift;
+- queued Job redirection after Source config edits;
+- hybrid RRF modality crowd-out;
+- Qdrant point-ID/logical chunk-ID mismatch;
+- deterministic 1000-PDF marker collisions;
+- ingestion/query embedding contract drift;
+- stale SQL/vector state after replacement ingestion;
+- remote-source SSRF and redirect gaps;
+- cross-tenant Source/Ingest access under service-level API keys;
+- ingestion loss on API restart;
+- long CJK-token lexical recall regression.
+
+### Known v1 limitations
+
+- Drive/Notion/Confluence synchronization is metadata-first and still enumerates the configured remote scope; provider change-feed/delta cursors are not yet implemented;
+- API-key principal IAM is service-oriented and is not full OIDC/SAML enterprise directory integration;
+- PostgreSQL and Qdrant do not share a distributed transaction;
+- CJK bigrams are a baseline rather than a universal Chinese search solution;
+- network-layer egress controls are still required in addition to application connector validation.
 
 ### Remaining release gates
 
-- run the manual `Staging Smoke` workflow successfully with the intended production-compatible LLM/embedding credential;
-- record staging evidence for backup/restore, network policy and any reranker that will be enabled in production;
-- create a release-only change for `0.5.0 -> 1.0.0`, synchronize Python/FastAPI/Helm/image metadata, and publish the tag/release only from the exact CI-validated release commit.
-
-### Non-blocking v1.x roadmap
-
-- web/admin UI for source catalog, ingestion progress, retrieval inspection and evaluation;
-- scheduled/synchronized connectors for frequently changing knowledge sources;
-- OIDC/OAuth2/SAML and centrally managed enterprise IAM beyond service-to-service API-key principals;
-- larger customer/domain CJK corpora and optional PGroonga/pg_jieba/external lexical-index comparison when they materially outperform the built-in bigram baseline;
-- stronger PostgreSQL/Qdrant cross-store activation semantics such as outbox/reconciler or staged source versions;
-- authoritative provider token accounting for the OpenAI-compatible `usage` object.
+- exact-head production-hardening CI must remain green after final docs/configuration changes;
+- run the real core staging workflow with intended production LLM/embedding credentials;
+- run SaaS staging for every connector enabled at launch;
+- record production network, secret, image, backup retention, RPO/RTO, and rollback evidence;
+- create a separate `release/v1.0.0` change that synchronizes Python/FastAPI/Helm/image metadata;
+- run CI/staging/recovery on the exact release SHA before creating the `v1.0.0` tag and GitHub Release.
 
 ## Release policy
 
-A future `1.0.0` release should move the accepted Unreleased entries into a dated `## [1.0.0] - YYYY-MM-DD` section, update package/Helm/application metadata together, pass the full CI matrix on that exact commit, complete the real-provider staging gate, and only then create the `v1.0.0` tag and GitHub Release.
+A future `1.0.0` release should move accepted Unreleased entries into a dated `## [1.0.0] - YYYY-MM-DD` section, update all release metadata together, pass the complete CI matrix on that exact commit, complete real-provider staging and recovery gates, and only then create the `v1.0.0` tag and GitHub Release.
