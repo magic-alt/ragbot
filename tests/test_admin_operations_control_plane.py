@@ -133,11 +133,28 @@ def test_overview_reports_queue_health_and_latest_knowledge_size():
             created_at=(now - timedelta(seconds=30)).isoformat(),
         )
     )
+    repo.add_job(
+        IngestionJob(
+            job_id="dead",
+            tenant_id=source.tenant_id,
+            source_id=source.source_id,
+            source_type=source.source_type,
+            source_config=dict(source.config),
+            status="dead_lettered",
+            failure_class="provider_auth",
+            error="unauthorized",
+            created_at=(now - timedelta(minutes=2)).isoformat(),
+            dead_lettered_at=(now - timedelta(minutes=1)).isoformat(),
+        )
+    )
 
     overview = build_overview(repo, {"tenant-a"})
 
     assert overview["sources"]["scheduled"] == 1
     assert overview["queue"]["pending"] == 1
+    assert overview["queue"]["dead_lettered"] == 1
+    assert overview["queue"]["dead_lettered_24h"] == 1
+    assert overview["recent_failures"][0]["failure_class"] == "provider_auth"
     assert overview["queue"]["oldest_pending_age_seconds"] >= 29
     # Knowledge size is based on the latest completed index, not the pending run.
     assert overview["knowledge"] == {"documents": 7, "chunks": 42}
@@ -168,18 +185,41 @@ def test_catalog_api_is_tenant_scoped_and_never_returns_source_config(monkeypatc
 
     monkeypatch.setenv(
         "RAGBOT_API_KEY_PRINCIPALS",
-        '{"tenant-a-key":{"tenant_ids":["tenant-a"],"user_id":"svc-a","admin":false}}',
+        '{"tenant-a-key":{"tenant_ids":["tenant-a"],"user_id":"svc-a","roles":["reader"],"admin":false}}',
     )
     app.include_router(create_control_plane_router(lambda: services, auth_dep))
     client = TestClient(app)
 
     sources = client.get("/catalog/sources").json()["sources"]
     jobs = client.get("/catalog/jobs").json()["jobs"]
+    session = client.get("/catalog/session").json()
 
     assert [item["source_id"] for item in sources] == ["s1"]
     assert [item["job_id"] for item in jobs] == ["j1"]
     assert "source_config" not in jobs[0]
     assert "must-not-leak" not in str(jobs)
+    assert session["roles"] == ["reader"]
+    assert session["capabilities"] == {"read": True, "operate": False, "admin": False}
+
+
+def test_catalog_session_reports_operator_capability(monkeypatch):
+    services = SimpleNamespace(repo=InMemoryRepo())
+    app = FastAPI()
+
+    async def auth_dep():
+        return "operator-key"
+
+    monkeypatch.setenv(
+        "RAGBOT_API_KEY_PRINCIPALS",
+        '{"operator-key":{"tenant_ids":["tenant-a"],"user_id":"svc-operator","roles":["operator"],"admin":false}}',
+    )
+    app.include_router(create_control_plane_router(lambda: services, auth_dep))
+    session = TestClient(app).get("/catalog/session").json()
+
+    assert session["roles"] == ["operator"]
+    assert session["tenant_ids"] == ["tenant-a"]
+    assert session["capabilities"]["operate"] is True
+    assert session["capabilities"]["admin"] is False
 
 
 def test_admin_ui_is_zero_build_html_without_embedded_api_key():
@@ -189,4 +229,7 @@ def test_admin_ui_is_zero_build_html_without_embedded_api_key():
     assert response.status_code == 200
     assert "Ragbot Control Plane" in response.text
     assert "sessionStorage" in response.text
+    assert "Dead Lettered" in response.text
+    assert "Requeue snapshot" in response.text
+    assert "operator or owner" in response.text
     assert "RAGBOT_API_KEYS" not in response.text
