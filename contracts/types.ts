@@ -30,7 +30,7 @@ export interface PatchResult {
 
 // Document/vector retrieval source types. SQL database access is configured
 // separately through POSTGRES_DSN and is not an ingestible source.
-export type SourceType = "pdf" | "web" | "repo" | "local_fs";
+export type SourceType = "pdf" | "web" | "repo" | "local_fs" | "s3";
 export type RouteType = "doc_rag" | "sql" | "code" | "mixed" | "web_fallback";
 export type Confidence = "high" | "medium" | "low";
 export type ToolName =

@@ -46,6 +46,21 @@ worker:
   pollSeconds: "1"
   leaseSeconds: "120"
   maxAttempts: "3"
+  # Every worker may scan recurring Sources. Deterministic scheduled Job IDs and
+  # atomic insert-if-absent semantics make scans safe across replicas. Set 0 to
+  # disable the scheduler while retaining ordinary durable ingestion.
+  schedulerScanSeconds: "30"
+  autoscaling:
+    # Optional KEDA PostgreSQL scaler. Requires the KEDA CRDs/operator to be
+    # installed in the cluster. It reads POSTGRES_DSN from the worker target and
+    # scales on ready pending Jobs plus expired running leases.
+    enabled: false
+    minReplicaCount: 1
+    maxReplicaCount: 10
+    pollingInterval: 15
+    cooldownPeriod: 120
+    targetJobsPerWorker: "4"
+    activationJobs: "1"
   resources:
     limits:
       cpu: "2"
@@ -80,9 +95,13 @@ otel:
 # Optional existing Secret keys used by the chart:
 #   postgres-dsn
 #   openai-api-key
+#   embedding-api-key
 #   api-keys
 #   api-key-principals
 #   qdrant-api-key
+# Object-store credentials should be injected as ordinary Kubernetes env/secret
+# variables matching Source credential_env_prefix; never place secret values in
+# Source.config.
 existingSecret: ""
 
 # Optional data/config mounts for local_fs/local PDF/local Git sources. Production

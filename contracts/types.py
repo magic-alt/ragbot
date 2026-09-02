@@ -40,7 +40,7 @@ class PatchResult:
 
 # SourceType represents document/vector retrieval sources. Database access is a
 # separate SQL tool configured by POSTGRES_DSN; it is not an ingestible source.
-SourceType = Literal["pdf", "web", "repo", "local_fs"]
+SourceType = Literal["pdf", "web", "repo", "local_fs", "s3"]
 RouteType = Literal["doc_rag", "sql", "code", "mixed", "web_fallback"]
 Confidence = Literal["high", "medium", "low"]
 ToolName = Literal[

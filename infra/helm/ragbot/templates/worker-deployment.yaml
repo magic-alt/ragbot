@@ -60,6 +60,8 @@ spec:
               value: {{ .Values.worker.leaseSeconds | quote }}
             - name: RAGBOT_WORKER_MAX_ATTEMPTS
               value: {{ .Values.worker.maxAttempts | quote }}
+            - name: RAGBOT_SCHEDULER_SCAN_SECONDS
+              value: {{ .Values.worker.schedulerScanSeconds | quote }}
             - name: QDRANT_URL
               value: {{ .Values.qdrant.url | quote }}
             - name: QDRANT_COLLECTION

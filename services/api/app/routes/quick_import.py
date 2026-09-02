@@ -22,7 +22,7 @@ from .ingest import assert_source_ingestible, enqueue_ingestion_job, latest_acti
 from .sources import _validate_source_config, _validate_source_type
 
 logger = logging.getLogger(__name__)
-SourceType = Literal["local_fs", "pdf", "web", "repo"]
+SourceType = Literal["local_fs", "pdf", "web", "repo", "s3"]
 
 
 class QuickSourceSpec(BaseModel):
@@ -51,6 +51,8 @@ def infer_source_type(location: str) -> SourceType:
     """Infer the connector from a local path or remote URL."""
     value = location.strip()
     parsed = urlsplit(value)
+    if parsed.scheme.lower() == "s3":
+        return "s3"
     if parsed.scheme.lower() in {"http", "https"}:
         host = (parsed.hostname or "").lower()
         path = parsed.path.lower().rstrip("/")
@@ -72,8 +74,12 @@ def canonical_location(location: str) -> str:
     """Normalize locations enough for stable source identity without resolving I/O."""
     value = location.strip()
     parsed = urlsplit(value)
-    if parsed.scheme.lower() in {"http", "https"}:
-        scheme = parsed.scheme.lower()
+    scheme = parsed.scheme.lower()
+    if scheme == "s3":
+        bucket = (parsed.netloc or "").lower()
+        prefix = parsed.path.strip("/")
+        return f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}"
+    if scheme in {"http", "https"}:
         netloc = parsed.netloc.lower()
         path = parsed.path.rstrip("/") or "/"
         return urlunsplit((scheme, netloc, path, parsed.query, ""))
@@ -83,8 +89,16 @@ def canonical_location(location: str) -> str:
 
 def build_source_config(source_type: SourceType, location: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     config = dict(extra or {})
+    value = location.strip()
+    if source_type == "s3":
+        parsed = urlsplit(value)
+        if parsed.scheme.lower() != "s3" or not parsed.netloc:
+            raise HTTPException(status_code=422, detail="source_type=s3 requires location like s3://bucket/prefix")
+        config["bucket"] = parsed.netloc
+        config["prefix"] = parsed.path.lstrip("/")
+        return config
     key = "url" if source_type == "web" else "path"
-    config[key] = location.strip()
+    config[key] = value
     return config
 
 
@@ -99,6 +113,12 @@ def deterministic_job_id(source_id: str, idempotency_key: str) -> str:
 
 
 def _source_location(source: Source) -> Optional[str]:
+    if source.source_type == "s3":
+        bucket = source.config.get("bucket")
+        if not isinstance(bucket, str) or not bucket.strip():
+            return None
+        prefix = str(source.config.get("prefix") or "").strip("/")
+        return f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}"
     key = "url" if source.source_type == "web" else "path"
     value = source.config.get(key)
     return value if isinstance(value, str) and value.strip() else None
@@ -151,6 +171,10 @@ def _upsert_source(
                 tags=spec.tags if spec.tags is not None else existing.tags,
                 created_at=existing.created_at or now,
                 updated_at=now,
+                sync_enabled=existing.sync_enabled,
+                sync_interval_seconds=existing.sync_interval_seconds,
+                sync_next_at=existing.sync_next_at,
+                sync_last_enqueued_at=existing.sync_last_enqueued_at,
             )
             repo.add_source(restored)
             return restored, True

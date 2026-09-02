@@ -21,6 +21,7 @@ from services.worker.jobs.embed_and_upsert import embed_and_upsert
 
 logger = logging.getLogger(__name__)
 LEXICAL_VERSION = 2
+_MULTI_DOCUMENT_SOURCE_TYPES = {"local_fs", "s3"}
 
 
 def run_ingest_pipeline(
@@ -139,7 +140,7 @@ def run_ingest_pipeline(
 def source_documents(source: Source, repo: Repo) -> list[Document]:
     """Return documents owned by ``source`` without unnecessary tenant scans."""
     base_doc_id = source.config.get("doc_id") or f"doc-{source.source_id}"
-    if source.source_type != "local_fs":
+    if source.source_type not in _MULTI_DOCUMENT_SOURCE_TYPES:
         document = repo.get_document(base_doc_id)
         if document and document.tenant_id == source.tenant_id:
             return [document]
@@ -214,6 +215,22 @@ def _run_connector(source: Source, repo: Repo) -> Iterable[Chunk]:
         return ingest_local_fs(
             directory=config["path"],
             extensions=config.get("extensions"),
+            chunk_size=int(config.get("chunk_size", 800)),
+            chunk_overlap=int(config.get("chunk_overlap", 100)),
+            **common,
+        )
+    if source_type == "s3":
+        from services.worker.jobs.ingest_s3 import ingest_s3
+        return ingest_s3(
+            bucket=config["bucket"],
+            prefix=config.get("prefix", ""),
+            endpoint_url=config.get("endpoint_url"),
+            region_name=config.get("region_name"),
+            credential_env_prefix=config.get("credential_env_prefix"),
+            extensions=config.get("extensions"),
+            max_object_bytes=int(config.get("max_object_bytes", 20 * 1024 * 1024)),
+            chunk_size=int(config.get("chunk_size", 800)),
+            chunk_overlap=int(config.get("chunk_overlap", 100)),
             **common,
         )
     raise ValueError(f"Unsupported source_type: {source_type}")
@@ -297,7 +314,7 @@ def _reuse_key(chunk: Chunk) -> tuple:
 
 
 def _ensure_documents(source: Source, repo: Repo, chunks: list[Chunk]) -> list[Document]:
-    if source.source_type != "local_fs":
+    if source.source_type not in _MULTI_DOCUMENT_SOURCE_TYPES:
         if not chunks:
             return []
         return [_ensure_document(source, repo)]
@@ -307,9 +324,14 @@ def _ensure_documents(source: Source, repo: Repo, chunks: list[Chunk]) -> list[D
         first_chunk_by_doc_id.setdefault(chunk.doc_id, chunk)
     documents: list[Document] = []
     for doc_id, chunk in first_chunk_by_doc_id.items():
-        file_path = Path(chunk.path) if chunk.path else None
-        title = file_path.name if file_path else source.name
-        uri = file_path.resolve().as_uri() if file_path else f"source://{source.source_id}"
+        if source.source_type == "s3":
+            metadata = chunk.metadata or {}
+            title = str(metadata.get("filename") or metadata.get("object_key") or source.name)
+            uri = chunk.path or f"source://{source.source_id}/{doc_id}"
+        else:
+            file_path = Path(chunk.path) if chunk.path else None
+            title = file_path.name if file_path else source.name
+            uri = file_path.resolve().as_uri() if file_path else f"source://{source.source_id}"
         documents.append(_ensure_document(source, repo, doc_id=doc_id, title=title, uri=uri))
     return documents
 
