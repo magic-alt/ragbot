@@ -62,15 +62,17 @@ Source type inference:
 | GitHub/GitLab/Bitbucket or `*.git` URL | `repo` |
 | other HTTP(S) URL | `web` |
 
-Default source identity is derived from:
+Default Source identity is derived from:
 
 ```text
 tenant_id + source_type + canonicalized location
 ```
 
-Therefore deployment/bootstrap scripts can submit the same knowledge source repeatedly without creating an unbounded number of Source rows.
+This allows deployment/bootstrap scripts to submit the same knowledge source repeatedly without creating an unbounded number of Source rows.
 
-If a matching Source already exists, Quick Import reuses it and, by default, synchronizes the config plus any explicitly supplied name/tags/ACL metadata. If a pending/running ingestion Job already exists for the Source, the API returns that Job rather than enqueuing another one.
+If a matching Source already exists and no incompatible ingestion is active, Quick Import can reuse it and synchronize the connector config plus explicitly supplied name/tags/ACL metadata.
+
+If a pending/running Job already exists with the **same** connector configuration, the default convenience dedupe returns that Job. If an active Job exists with a **different** connector configuration, such as another Git `ref`, path or chunking configuration, the new request returns `409` instead of mutating the Source and pretending the old Job represents the new request.
 
 Representative response:
 
@@ -89,10 +91,16 @@ Representative response:
 Possible submission status values include:
 
 - `accepted`: a Job was submitted.
-- `already_queued`: an active Job was reused.
+- `already_queued`: an active same-config Job was reused.
 - `idempotent_replay`: the exact Job associated with the explicit idempotency key already exists.
 
-`idempotency_key` requires `reuse_source=true`, because strict replay semantics require a stable Source identity. The API rejects the incompatible combination with `422` before persisting Source/Job state.
+#### Strict idempotency
+
+`idempotency_key` derives a deterministic Job ID from stable Source identity + caller key. A replay is checked before Source metadata mutation and returns the exact existing Job even after completion.
+
+`idempotency_key` requires `reuse_source=true`; the incompatible combination is rejected with `422` before persisting Source/Job state.
+
+The ordinary active-Job lookup is a duplicate-prevention convenience, not a distributed uniqueness guarantee. If callers require strict repeat-request behavior across multiple API replicas or genuinely concurrent requests, they should provide an `idempotency_key`.
 
 ### `POST /ingest/batch`
 
@@ -112,9 +120,9 @@ Submits 1–100 Quick Import specifications under one tenant.
 }
 ```
 
-Response contains `total`, `accepted`, `failed` and one result per input item. Submission errors are isolated per item so callers can see which sources were accepted. A `202` batch response therefore does not imply every item succeeded; inspect `failed` and `items`.
+Response contains `total`, `accepted`, `failed` and one result per input item. Expected request/config errors are isolated per item so callers can see which sources were accepted. Unexpected internal submission failures are logged server-side and returned as a generic error rather than exposing internal exception details.
 
-For large catalog imports, batch multiple requests rather than bypassing the 100-source validation limit.
+A `202` batch response does not imply every item succeeded; inspect `failed` and `items`. For large catalogs, send multiple bounded batches instead of bypassing the 100-source validation limit.
 
 ## Low-level Sources API
 
@@ -143,6 +151,10 @@ Gets one active/paused Source after tenant authorization.
 
 Updates name, config, status (`active` or `paused`), ACL policy or tags. Replacement config is validated against the existing source type.
 
+A queued durable Job does **not** read mutable connector config at execution time. Its `source_type` and `source_config` are captured at submission and executed from that snapshot. Therefore changing a Source after a Job is queued affects future Jobs, not the connector configuration of the already queued Job.
+
+Current Source metadata/ACL state is still resolved at worker execution, so security-policy changes can apply to work that has not yet completed.
+
 ### `DELETE /sources/{source_id}`
 
 Purges indexed Qdrant vectors and PostgreSQL/in-memory Documents/Chunks, then tombstones the Source. Cleanup occurs before the status transition so a cleanup failure leaves the Source retryable rather than silently searchable after deletion.
@@ -159,6 +171,8 @@ Queues an ingestion run for an **active** Source. This is the lower-level altern
 
 With PostgreSQL, the API persists a `pending` Job and returns `202`; an independent worker owns execution. Workers claim jobs atomically with `FOR UPDATE SKIP LOCKED`, maintain lease/heartbeat state, reclaim expired leases after crashes and stop retrying after the configured maximum attempt count.
 
+At submission the Job records `source_type` and `source_config`. The worker reconstructs connector execution from this snapshot instead of silently switching to a later mutable Source config.
+
 Development/in-memory mode can execute inline for convenience. Production mode rejects inline ingestion.
 
 ### `GET /ingest/jobs`
@@ -172,6 +186,7 @@ Gets one Job after tenant authorization. Useful for CLI/UI progress polling.
 Important fields include:
 
 - `status`: `pending`, `running`, `completed`, `failed`
+- `source_type`, `source_config`
 - `doc_count`, `chunk_count`
 - `error`
 - `attempts`
@@ -183,7 +198,7 @@ Job stats include current document IDs/chunks, new writes, reused unchanged chun
 
 ### `POST /ingest/jobs/{job_id}/retry`
 
-Creates a fresh Job for a failed ingestion if the Source still exists and is active.
+Creates a fresh Job for a failed ingestion if the Source still exists and is active. The retry captures the Source's current connector configuration as the new Job snapshot.
 
 ## Search
 
