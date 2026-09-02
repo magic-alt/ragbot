@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
+from services.api.app.routes.ingest import enqueue_ingestion_job
 from services.api.app.routes.quick_import import QuickSourceSpec, _run_quick_import
 from services.api.app.storage.models import IngestionJob, Source
 from services.api.app.storage.repo import InMemoryRepo
@@ -19,6 +20,26 @@ def _worker_mode(monkeypatch):
 
 def _services(repo: InMemoryRepo | None = None):
     return SimpleNamespace(repo=repo or InMemoryRepo(), qdrant=object(), embedder=object())
+
+
+def test_enqueue_copies_connector_config_snapshot():
+    services = _services()
+    source = Source(
+        source_id="source-1",
+        tenant_id="t1",
+        source_type="repo",
+        config={"path": "https://example.com/repo.git", "ref": "main"},
+        status="active",
+    )
+    services.repo.add_source(source)
+
+    job = enqueue_ingestion_job(source, services, job_id="job-snapshot")
+    source.config["ref"] = "release"
+
+    persisted = services.repo.get_job(job.job_id)
+    assert persisted is not None
+    assert persisted.source_config["ref"] == "main"
+    assert services.repo.get_source(source.source_id).config["ref"] == "release"
 
 
 def test_changed_connector_config_does_not_reuse_active_job_or_mutate_source():
