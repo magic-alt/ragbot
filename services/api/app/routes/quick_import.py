@@ -7,6 +7,7 @@ one idempotent call and provides a batch surface suitable for manifests.
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional
@@ -20,6 +21,7 @@ from ..storage.models import Source
 from .ingest import assert_source_ingestible, enqueue_ingestion_job, latest_active_ingestion_job
 from .sources import _validate_source_config, _validate_source_type
 
+logger = logging.getLogger(__name__)
 SourceType = Literal["local_fs", "pdf", "web", "repo"]
 
 
@@ -118,13 +120,22 @@ def _find_existing_source(repo, *, tenant_id: str, source_type: str, location: s
     return None
 
 
-def _upsert_source(repo, *, tenant_id: str, spec: QuickSourceSpec, source_type: SourceType, config: Dict[str, Any]) -> tuple[Source, bool]:
-    existing = _find_existing_source(
-        repo,
-        tenant_id=tenant_id,
-        source_type=source_type,
-        location=spec.location,
-    ) if spec.reuse_source else None
+def _upsert_source(
+    repo,
+    *,
+    tenant_id: str,
+    spec: QuickSourceSpec,
+    source_type: SourceType,
+    config: Dict[str, Any],
+    existing: Optional[Source] = None,
+) -> tuple[Source, bool]:
+    if existing is None and spec.reuse_source:
+        existing = _find_existing_source(
+            repo,
+            tenant_id=tenant_id,
+            source_type=source_type,
+            location=spec.location,
+        )
 
     now = datetime.now(timezone.utc).isoformat()
     if existing is not None:
@@ -187,26 +198,35 @@ def _run_quick_import(*, tenant_id: str, spec: QuickSourceSpec, services) -> Dic
     config = build_source_config(source_type, spec.location, spec.config)
     _validate_source_config(source_type, config)
 
-    source, source_reused = _upsert_source(
-        services.repo,
-        tenant_id=tenant_id,
-        spec=spec,
-        source_type=source_type,
-        config=config,
-    )
-    assert_source_ingestible(source)
+    existing_source = None
+    if spec.reuse_source:
+        existing_source = _find_existing_source(
+            services.repo,
+            tenant_id=tenant_id,
+            source_type=source_type,
+            location=spec.location,
+        )
 
+    stable_source_id = (
+        existing_source.source_id
+        if existing_source is not None
+        else deterministic_source_id(tenant_id, source_type, spec.location)
+    )
+
+    # Explicit request idempotency is checked before any metadata mutation.
+    # A replay should be observationally stable rather than modifying Source
+    # state merely because the same request was sent again.
     if spec.idempotency_key:
-        job_id = deterministic_job_id(source.source_id, spec.idempotency_key)
+        job_id = deterministic_job_id(stable_source_id, spec.idempotency_key)
         existing_job = services.repo.get_job(job_id)
         if existing_job is not None:
-            if existing_job.tenant_id != tenant_id or existing_job.source_id != source.source_id:
+            if existing_job.tenant_id != tenant_id or existing_job.source_id != stable_source_id:
                 raise HTTPException(status_code=409, detail="Idempotency key collision")
             return {
                 "status": "idempotent_replay",
-                "source_id": source.source_id,
-                "source_type": source.source_type,
-                "source_reused": source_reused,
+                "source_id": stable_source_id,
+                "source_type": existing_job.source_type,
+                "source_reused": existing_source is not None,
                 "job_id": existing_job.job_id,
                 "job_status": existing_job.status,
                 "job_reused": True,
@@ -214,22 +234,44 @@ def _run_quick_import(*, tenant_id: str, spec: QuickSourceSpec, services) -> Dic
     else:
         job_id = None
 
-    if spec.dedupe_active_job:
+    # Do not rewrite a Source's connector configuration while an earlier run is
+    # pending/running and then claim that the older Job represents the new
+    # request. Same-config repeats are safe to dedupe; config changes must wait
+    # for the active run to finish.
+    if existing_source is not None and spec.dedupe_active_job:
         active_job = latest_active_ingestion_job(
             services.repo,
             tenant_id=tenant_id,
-            source_id=source.source_id,
+            source_id=existing_source.source_id,
         )
         if active_job is not None:
+            if active_job.source_type != source_type or dict(active_job.source_config or {}) != config:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Source already has an active ingestion job with a different connector configuration; "
+                        "wait for that job to finish before changing the source configuration"
+                    ),
+                )
             return {
                 "status": "already_queued",
-                "source_id": source.source_id,
-                "source_type": source.source_type,
-                "source_reused": source_reused,
+                "source_id": existing_source.source_id,
+                "source_type": existing_source.source_type,
+                "source_reused": True,
                 "job_id": active_job.job_id,
                 "job_status": active_job.status,
                 "job_reused": True,
             }
+
+    source, source_reused = _upsert_source(
+        services.repo,
+        tenant_id=tenant_id,
+        spec=spec,
+        source_type=source_type,
+        config=config,
+        existing=existing_source,
+    )
+    assert_source_ingestible(source)
 
     job = enqueue_ingestion_job(source, services, job_id=job_id)
     return {
@@ -277,13 +319,14 @@ def create_quick_import_router(get_services: Callable, auth_dep: Any) -> APIRout
                     "status_code": exc.status_code,
                     "error": exc.detail,
                 })
-            except Exception as exc:
+            except Exception:
                 failed += 1
+                logger.exception("Unexpected quick-import submission failure for tenant=%s", payload.tenant_id)
                 items.append({
                     "location": spec.location,
                     "status": "error",
                     "status_code": 500,
-                    "error": str(exc),
+                    "error": "Internal ingestion submission error",
                 })
         return {
             "tenant_id": payload.tenant_id,
