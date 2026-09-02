@@ -34,7 +34,7 @@ jobs:
       - name: Install project and full test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,postgres,qdrant,worker,s3,observability]"
+          python -m pip install -e ".[dev,postgres,qdrant,worker,s3,saas,observability]"
 
       - name: Check dependency consistency
         run: python -m pip check
@@ -170,6 +170,16 @@ jobs:
             --set postgres.dsn=postgresql://ragbot:ragbot@postgres/ragbot \
             --set qdrant.url=http://qdrant:6333 \
             | grep -q 'kind: ScaledObject'
+
+      - name: Render worker-only SaaS secret injection
+        run: |
+          output="$(helm template ragbot infra/helm/ragbot \
+            --set worker.enabled=true \
+            --set postgres.dsn=postgresql://ragbot:ragbot@postgres/ragbot \
+            --set qdrant.url=http://qdrant:6333 \
+            --set 'worker.extraEnvFrom[0].secretRef.name=ragbot-saas-connectors')"
+          echo "$output" | grep -q 'name: ragbot-saas-connectors'
+          echo "$output" | grep -q 'envFrom:'
 
       - name: Reject production Helm without worker
         run: |
