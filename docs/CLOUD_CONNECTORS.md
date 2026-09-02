@@ -20,6 +20,28 @@ Ragbot rejects common inline secret fields such as `access_token`, `refresh_toke
 
 For Kubernetes, inject the referenced environment variable into the worker from a Secret or external secret provider. Do not put the secret value in Helm values checked into source control.
 
+### Docker Compose worker-only credentials
+
+Exporting a variable in the host shell does **not** automatically make it available inside an already-defined Compose service. Ragbot therefore supports a dedicated worker env file in both Compose entry points.
+
+```bash
+cp .env.worker.example .env.worker
+# edit .env.worker with real connector credentials; the file is git-ignored
+
+RAGBOT_WORKER_ENV_FILE="$PWD/.env.worker" docker compose up -d --build
+```
+
+Only the `worker` service loads this file; the API service does not. This matches the Helm `worker.extraEnvFrom` least-privilege model and allows arbitrary credential variable names such as `RAGBOT_TENANT_A_NOTION_TOKEN` without adding every secret to the Compose YAML.
+
+When using `infra/docker/docker-compose.yml`, prefer an absolute `RAGBOT_WORKER_ENV_FILE` path as shown above so the same command is unambiguous regardless of the Compose file directory.
+
+For a worker process launched directly rather than through Compose, ordinary shell exports remain valid:
+
+```bash
+export RAGBOT_NOTION_TOKEN='secret_...'
+python -m services.worker.main
+```
+
 ## Incremental synchronization model
 
 The SaaS connectors are metadata-first rather than full-download polling:
@@ -47,8 +69,9 @@ https://drive.google.com/drive/folders/<folder-id>
 Minimal configuration using a pre-issued access token:
 
 ```bash
-export RAGBOT_DRIVE_TOKEN='...'
-
+# Direct worker: export RAGBOT_DRIVE_TOKEN='...'
+# Docker Compose: put RAGBOT_DRIVE_TOKEN=... in .env.worker and start Compose
+# with RAGBOT_WORKER_ENV_FILE pointing at that file.
 rag --server http://localhost:8000 \
   --tenant engineering \
   ingest gdrive://1AbCdEfFolder \
@@ -59,8 +82,8 @@ rag --server http://localhost:8000 \
 For long-lived production deployments, prefer Google JSON credentials so the worker can refresh credentials:
 
 ```bash
-export RAGBOT_DRIVE_CREDENTIALS_JSON='{"type":"service_account", ...}'
-
+# Direct worker: export RAGBOT_DRIVE_CREDENTIALS_JSON='{"type":"service_account", ...}'
+# Docker Compose: store the same variable in .env.worker.
 rag --server http://localhost:8000 \
   --tenant engineering \
   ingest gdrive://1AbCdEfFolder \
@@ -92,11 +115,9 @@ notion://<page-id>
 https://www.notion.so/<page-title>-<page-id>
 ```
 
-Create an internal integration, grant it read access only to the pages that should enter the knowledge base, then expose its token only to the worker:
+Create an internal integration and grant it read access only to the pages that should enter the knowledge base. Put `RAGBOT_NOTION_TOKEN` in the worker environment (or `.env.worker` for Compose), then submit only the reference:
 
 ```bash
-export RAGBOT_NOTION_TOKEN='secret_...'
-
 rag --server http://localhost:8000 \
   --tenant engineering \
   ingest notion://0123456789abcdef0123456789abcdef \
@@ -122,7 +143,7 @@ https://acme.atlassian.net/wiki/spaces/ENG/overview
 Basic API-token authentication:
 
 ```bash
-export RAGBOT_CONFLUENCE_TOKEN='...'
+# Put RAGBOT_CONFLUENCE_TOKEN in the worker environment / .env.worker.
 export RAGBOT_CONFLUENCE_ALLOWED_HOSTS='acme.atlassian.net'
 
 rag --server http://localhost:8000 \
