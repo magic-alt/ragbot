@@ -37,7 +37,7 @@ ragbot doctor: READY
   readiness: {'status': 'ready', ...}
 ```
 
-`doctor` checks both process liveness and storage dependency readiness. It does not validate the semantic quality of a configured external model; production deployments should still run the staging smoke workflow with real providers.
+`doctor` checks process liveness and storage dependency readiness. It does not establish the semantic quality of an external model; production deployments should still run staging smoke with real providers.
 
 ## 3. Build a RAG database from one source
 
@@ -83,7 +83,7 @@ rag --server http://localhost:8000 \
 
 When `--type` is omitted, the CLI and Quick Import API infer `local_fs`, `pdf`, `repo`, or `web` from the location. Use `--type` when a location is ambiguous.
 
-`--wait` polls the durable ingestion job until it is `completed` or `failed` and prints the final document/chunk counts. Without `--wait`, submission returns immediately.
+`--wait` polls the durable ingestion Job until it is `completed` or `failed` and prints final document/chunk counts. Without `--wait`, submission returns immediately.
 
 ## 4. Build a knowledge base from a manifest
 
@@ -104,13 +104,13 @@ Start with [`examples/ragbot-manifest.json`](../examples/ragbot-manifest.json):
 }
 ```
 
-Submit and wait for all jobs:
+Submit and wait for all Jobs:
 
 ```bash
 rag --server http://localhost:8000 import examples/ragbot-manifest.json --wait
 ```
 
-The batch API accepts up to 100 sources per request. Each item returns its own source/job result, so one connector-level submission error does not hide the state of the other items.
+The batch API accepts up to 100 sources per request. Each item returns its own Source/Job result, so one submission error does not hide the state of the other items.
 
 ## 5. Query the knowledge base
 
@@ -174,9 +174,9 @@ curl -X POST http://localhost:8000/ingest/batch \
   }'
 ```
 
-## 7. Source reuse and idempotency semantics
+## 7. Source reuse, configuration safety, and idempotency
 
-Quick Import uses a stable source identity derived from:
+Quick Import uses a stable Source identity derived from:
 
 ```text
 tenant + source type + normalized location
@@ -185,12 +185,15 @@ tenant + source type + normalized location
 By default:
 
 1. a matching existing Source is reused;
-2. supplied source metadata/config is synchronized to that Source;
-3. if a `pending` or `running` job already exists, that active job is returned rather than creating a duplicate.
+2. supplied Source metadata/config is synchronized when it is safe to submit a new run;
+3. if a `pending` or `running` Job already exists with the same connector configuration, that active Job is returned instead of creating an obvious duplicate;
+4. if an active Job exists but the requested connector configuration differs (for example `ref=main` versus `ref=release`), the request returns `409` instead of silently treating the old Job as the new request.
 
-This makes repeated bootstrap/deployment scripts safe for the common case.
+Each durable Job stores the connector `source_type` and `source_config` captured at submission. The worker executes that snapshot even if the Source record is edited while the Job waits in the queue. This makes retries and delayed execution deterministic for connector path/ref/chunking settings.
 
-For strict request idempotency, provide a key:
+### Strict idempotency
+
+For deployment automation or concurrent callers, provide an explicit key:
 
 ```bash
 rag --server http://localhost:8000 \
@@ -198,20 +201,24 @@ rag --server http://localhost:8000 \
   --idempotency-key nightly-2026-09-02
 ```
 
-Submitting the same source + idempotency key returns the exact same job, even if it has already completed.
+Submitting the same stable Source + idempotency key returns the exact same Job, including after completion. This is the recommended mechanism when callers need strict repeat-request behavior across multiple API replicas.
+
+The ordinary active-Job check is an ergonomic duplicate guard, not a distributed uniqueness primitive. Without an explicit idempotency key, two truly concurrent requests reaching different API replicas may still both enqueue before either observes the other.
+
+`idempotency_key` requires Source reuse; combining it with `--no-reuse-source` is rejected because a newly generated Source ID would make strict replay impossible.
 
 Advanced overrides:
 
 ```text
 --no-reuse-source   create a distinct Source record
---force-new-job     queue another job even when one is pending/running
+--force-new-job     bypass the active-Job convenience dedupe
 ```
 
 Use these deliberately; the default behavior is designed for repeatable product bootstrap.
 
 ## 8. Production authentication
 
-When production API-key principals are enabled, add the API key to every CLI operation:
+When production API-key principals are enabled, add the API key to CLI operations:
 
 ```bash
 rag --server https://rag.example.com \
@@ -224,7 +231,7 @@ The tenant requested by ingest/search/chat must be inside the API-key principal'
 
 ## 9. Production checklist
 
-Quick Import shortens the data onboarding path; it does not remove production release requirements. Before exposing Ragbot as a shared service, verify at minimum:
+Quick Import shortens data onboarding; it does not remove production release requirements. Before exposing Ragbot as a shared service, verify at minimum:
 
 - `RAGBOT_ENV=production` and durable worker mode;
 - real semantic embedding and LLM providers;
