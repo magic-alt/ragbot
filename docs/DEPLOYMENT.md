@@ -2,114 +2,122 @@
 
 ## 1. Deployment modes
 
-### Local Python development
+### Development
 
-When `POSTGRES_DSN`/`QDRANT_URL` are unset, Ragbot can use in-memory stores and inline ingestion. This mode is for tests and single-process development only; state is process-local.
+Without `POSTGRES_DSN`/`QDRANT_URL`, Ragbot can use in-memory stores and inline ingestion. This mode is for tests and local single-process development only.
 
 ### Docker Compose
 
-Root `docker-compose.yml` and `infra/docker/docker-compose.yml` start API, independent ingestion worker, one-shot migration service, PostgreSQL and Qdrant. Optional profiles add Ollama and Jaeger.
+Root `docker-compose.yml` and `infra/docker/docker-compose.yml` start:
+
+- API;
+- independent ingestion worker;
+- migration service;
+- PostgreSQL 16;
+- Qdrant v1.19.0;
+- optional Ollama and Jaeger profiles.
 
 ```bash
 cp .env.example .env
-# configure model/storage settings
+mkdir -p data
 docker compose up -d --build
 ```
 
-Compose sets `RAGBOT_INGESTION_MODE=worker`, so ingestion is durable rather than tied to the API process lifecycle.
+Both Compose variants set `RAGBOT_INGESTION_MODE=worker` and now expose the same durable retry/reconcile/provider retry settings.
 
-#### Worker-only connector credentials
+### Worker-only SaaS credentials
 
-Cloud/SaaS `credential_ref=env:VARIABLE` values must exist inside the ingestion worker, not merely in the host shell. Both Compose files therefore load an additional env file **only for the worker service**.
-
-The checked-in `.env.worker.example` is safe and keeps Compose usable without cloud credentials. For real connectors:
+Cloud connector credentials should exist only in the worker. Both Compose files support:
 
 ```bash
 cp .env.worker.example .env.worker
-# edit .env.worker; it is ignored by git
-
-# absolute path works with either root or infra/docker Compose file
 RAGBOT_WORKER_ENV_FILE="$PWD/.env.worker" docker compose up -d --build
 ```
 
-Example `.env.worker`:
+The API service does not load this file. Source config contains only `credential_ref=env:VARIABLE`.
 
-```dotenv
-RAGBOT_DRIVE_CREDENTIALS_JSON={"type":"service_account",...}
-RAGBOT_NOTION_TOKEN=secret_...
-RAGBOT_CONFLUENCE_TOKEN=...
-RAGBOT_TENANT_A_NOTION_TOKEN=secret_...
-```
+## 2. Production identity and RBAC
 
-The API service does not load `RAGBOT_WORKER_ENV_FILE`. This keeps SaaS provider credentials out of the API container while allowing arbitrary tenant/integration-specific environment names without editing the Compose YAML for every new credential.
+Production requires API-key principal mappings. Recommended role split:
 
-Compose precedence still applies: keys explicitly declared under the worker `environment:` block override the same key from `env_file`. Use dedicated connector credential variable names rather than reusing core variables such as `OPENAI_API_KEY`.
+- `reader`: retrieval/chat/catalog/job read only;
+- `operator`: reader plus Source/ingestion/schedule/retry/requeue mutations;
+- `owner`: tenant-level operator superset;
+- `admin=true`: global operational surfaces and reconciliation.
 
-## 2. Database migration lifecycle
+Do not give a `reader` key to automation that must create or refresh knowledge Sources.
 
-Migrations under `infra/migrations/` run in filename order. The runner maintains `schema_migrations` and uses a PostgreSQL advisory lock so concurrent deployment instances cannot apply the same migration concurrently.
+## 3. Database migration lifecycle
+
+Migrations under `infra/migrations/` run in filename order and are tracked in `schema_migrations`. The migration runner uses a PostgreSQL advisory lock.
 
 Rules:
 
 1. released migrations are immutable;
-2. schema changes create a new ordered migration;
-3. CI proves a clean DB can apply the complete chain and that a second run is a no-op;
-4. back up PostgreSQL before destructive migration work.
+2. schema changes add a new ordered migration;
+3. clean-database migration and no-op re-run are CI concerns;
+4. back up PostgreSQL before destructive changes.
 
 ```bash
 POSTGRES_DSN='postgresql://...' python -m services.api.app.storage.migrations
 ```
 
-Migration 006 adds durable ingestion leases/attempts and CJK lexical support. Migration 008 adds durable Source synchronization state.
+Migration 006 introduced durable queue state; 008 introduced Source sync schedule; 009 introduces dead-letter metadata/indexes.
 
-## 3. Durable ingestion worker and scheduler
+## 4. Durable worker, retries, reconciliation, and scheduler
+
+Recommended defaults:
 
 ```bash
 RAGBOT_WORKER_POLL_SECONDS=1
 RAGBOT_WORKER_LEASE_SECONDS=120
 RAGBOT_WORKER_MAX_ATTEMPTS=3
+RAGBOT_WORKER_RETRY_BASE_SECONDS=5
+RAGBOT_WORKER_RETRY_MAX_SECONDS=300
+RAGBOT_RECONCILE_SECONDS=30
 RAGBOT_SCHEDULER_SCAN_SECONDS=30
+RAGBOT_PROVIDER_MAX_ATTEMPTS=4
+RAGBOT_PROVIDER_BACKOFF_BASE_SECONDS=0.5
+RAGBOT_PROVIDER_BACKOFF_MAX_SECONDS=30
 python -m services.worker.main
 ```
 
-Execution:
+Execution model:
 
 ```text
-API / recurring Source scheduler
-            │
-            ▼
+API / scheduler
+      ↓
 PostgreSQL pending Job
-            │
-            ▼
-FOR UPDATE SKIP LOCKED claim
-            │
-        lease + heartbeat
-            │
-            ▼
-connector → chunks → PostgreSQL + Qdrant
+      ↓ claim (FOR UPDATE SKIP LOCKED)
+running + lease + heartbeat
+      ↓
+provider/connector request
+  ├─ transient HTTP/transport failure
+  │      → short provider retry/backoff
+  └─ still failing
+         ↓
+whole-ingestion durable attempt
+  ├─ retryable + attempts remain
+  │      → pending + durable backoff
+  └─ permanent/exhausted
+         → dead_lettered
 ```
 
-Properties:
+`Retry-After` is honored for provider responses when present. Permanent authentication/not-found style failures are not blindly retried.
 
-- API restart does not delete pending Jobs;
-- workers compete safely for Jobs;
-- crashed workers are recovered after lease expiration;
-- max attempts stop infinite crash loops;
-- Job connector config is an immutable submission snapshot;
-- recurring scheduler uses deterministic Job IDs + atomic insert-if-absent across replicas;
-- missed recurring windows collapse to one current refresh rather than replaying every missed interval;
-- active work for a Source delays its scheduled refresh.
+Reconciliation periodically repairs expired leases and stranded failure state. Set `RAGBOT_RECONCILE_SECONDS=0` only when another operational process owns reconciliation.
 
-This is an at-least-once execution model, so connector/upsert paths must remain idempotent.
+Scheduled sync uses deterministic Job IDs + atomic insert-if-absent. Missed intervals collapse into one current refresh instead of backfilling every historical interval.
 
-## 4. Kubernetes / Helm
+## 5. Docker Compose reliability parity
+
+Both Compose files expose the same worker reliability variables and pin Qdrant to `qdrant/qdrant:v1.19.0`.
+
+This parity matters because local/staging Compose should exercise the same retry/reconcile semantics as Helm rather than silently running weaker defaults.
+
+## 6. Kubernetes / Helm
 
 Chart: `infra/helm/ragbot`.
-
-```bash
-helm lint infra/helm/ragbot
-helm template ragbot infra/helm/ragbot
-```
 
 Minimum production shape:
 
@@ -120,7 +128,16 @@ env:
 worker:
   enabled: true
   replicaCount: 1
+  pollSeconds: "1"
+  leaseSeconds: "120"
+  maxAttempts: "3"
+  retryBaseSeconds: "5"
+  retryMaxSeconds: "300"
+  reconcileSeconds: "30"
   schedulerScanSeconds: "30"
+  providerMaxAttempts: "4"
+  providerBackoffBaseSeconds: "0.5"
+  providerBackoffMaxSeconds: "30"
 
 postgres:
   dsn: postgresql://...
@@ -129,11 +146,11 @@ qdrant:
   url: http://qdrant:6333
 ```
 
-Production rendering rejects missing durable worker, PostgreSQL or Qdrant. Multi-replica API/HPA also requires shared PostgreSQL and Qdrant.
+Production rendering rejects missing durable worker, PostgreSQL, or Qdrant.
 
-### Core existing Secret
+### Core Secret
 
-`existingSecret` supports the core fixed keys:
+`existingSecret` may provide:
 
 - `postgres-dsn`
 - `openai-api-key`
@@ -142,11 +159,9 @@ Production rendering rejects missing durable worker, PostgreSQL or Qdrant. Multi
 - `api-key-principals`
 - `qdrant-api-key`
 
-### Worker-only cloud/SaaS credentials
+### Worker-only connector Secrets
 
-Google Drive, Notion and Confluence Source configs store only `credential_ref=env:VARIABLE`. The referenced environment variable should normally exist **only on worker pods**.
-
-Use `worker.extraEnvFrom` with a dedicated Secret/ExternalSecret:
+Use `worker.extraEnvFrom` or `worker.extraEnv` for SaaS credentials:
 
 ```yaml
 worker:
@@ -156,35 +171,18 @@ worker:
         name: ragbot-saas-connectors
 ```
 
-Example Secret keys:
-
-```text
-RAGBOT_DRIVE_CREDENTIALS_JSON
-RAGBOT_NOTION_TOKEN
-RAGBOT_CONFLUENCE_TOKEN
-```
-
-Then Source config references them without persisting their values:
-
-```json
-{"credential_ref":"env:RAGBOT_NOTION_TOKEN"}
-```
-
-For fine-grained mapping use `worker.extraEnv` with `valueFrom.secretKeyRef`. Do not commit literal SaaS token values to Helm values.
-
-This worker-only injection is preferable to placing SaaS credentials into `.Values.env`, because the API deployment does not need them.
+Avoid putting SaaS secrets into `.Values.env`, because API pods do not need them.
 
 ### Source mounts
 
-`extraVolumes` / `extraVolumeMounts` remain available for local_fs/local PDF/local Git Sources. Prefer read-only mounts below `RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS`.
+Use `extraVolumes` / `extraVolumeMounts` for local filesystem/PDF/Git Sources and keep them read-only below `RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS` when possible.
 
-## 5. Worker autoscaling
+## 7. Backlog-driven worker autoscaling
 
-Ragbot supports optional KEDA backlog scaling for workers. The scaler queries the durable PostgreSQL Job queue rather than using CPU as an indirect backlog proxy.
+Optional KEDA scaling uses the PostgreSQL queue, not CPU, as the backlog signal:
 
 ```yaml
 worker:
-  enabled: true
   autoscaling:
     enabled: true
     minReplicaCount: 1
@@ -195,120 +193,111 @@ worker:
     activationJobs: "1"
 ```
 
-The query counts ready pending Jobs plus expired running leases. KEDA must already be installed in the cluster.
+Size `maxReplicaCount` against upstream provider quotas. More workers can increase 429 pressure if provider quotas are already saturated.
 
-When cloud/SaaS Sources are enabled, size `maxReplicaCount` against upstream rate limits. Scaling workers faster than Google/Notion/Atlassian API quotas permit can turn a queue recovery into provider throttling.
+## 8. Queue operations
 
-## 6. Cloud/SaaS network and secret boundaries
+Useful endpoints:
 
-Full connector configuration is in `docs/CLOUD_CONNECTORS.md`.
+- `/catalog/overview`: tenant-scoped queue/knowledge summary;
+- `/catalog/jobs`: redacted Job list with failure class;
+- `/catalog/session`: non-secret principal capability summary;
+- `/admin/queue/metrics`: global backlog/DLQ metrics, admin only;
+- `/admin/queue/reconcile`: admin repair of expired/stranded queue state;
+- `/ingest/jobs/{id}/retry`: retry a `failed` Job using current Source config;
+- `/ingest/jobs/{id}/requeue`: requeue a `dead_lettered` Job, defaulting to its immutable connector snapshot.
 
-Security expectations:
+Production alerting should include:
 
-- secret values are worker environment/secret-store data, never Source config;
-- Google Drive and Notion use fixed official API hosts;
-- Confluence base URLs are tenant-configurable, therefore production requires `RAGBOT_CONFLUENCE_ALLOWED_HOSTS`;
-- private/self-hosted Confluence additionally requires explicit private-network opt-in when its address is non-public;
-- S3-compatible custom endpoints require their own explicit host allowlist;
-- provider service identities should have read-only/least-privilege access to only the intended content;
-- cluster/VPC/service-mesh egress policy remains the final network boundary.
+- oldest pending age;
+- pending/running counts;
+- stale leases;
+- failed and dead-lettered counts;
+- provider throttling/retry rates;
+- worker process availability.
 
-Credential rotation does not require rewriting Sources: keep the same `credential_ref` and rotate the worker Secret value.
+## 9. Disaster recovery
 
-## 7. Incremental SaaS synchronization
+Ragbot ships:
 
-Scheduled Google Drive, Notion and Confluence refreshes are metadata-first:
-
-```text
-remote metadata listing
-        │
-        ├─ unchanged version → reuse existing chunks
-        │                      no body download / no embedding
-        │
-        └─ new/changed       → fetch body → chunk → embed
-                               │
-complete replacement snapshot ┘
-        │
-        └─ prune remotely deleted documents
+```bash
+bash scripts/backup_ragbot.sh ./backups/<name>
+bash scripts/restore_ragbot.sh ./backups/<name>
 ```
 
-This reduces content-download and embedding cost while keeping the same replacement/retry semantics as other Ragbot Sources.
+The scripts cover PostgreSQL custom-format dump/restore and Qdrant collection snapshot download/upload with SHA-256 manifest verification.
 
-Current metadata discovery still scans the configured remote tree/space; it is not yet based on provider delta/change feeds.
+Full operational procedure, traffic quiescing, post-restore validation, queue reconciliation, RPO/RTO recording, and limitations are documented in [`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md).
 
-## 8. Health and operations
+CI includes a real destructive seed → backup → delete → restore → verify smoke against PostgreSQL 16 and Qdrant v1.19.0.
 
-- `/admin/health`: process liveness.
-- `/admin/ready`: repository/vector readiness.
-- `/admin/ui`: built-in operator control plane.
-- `/catalog/overview`: tenant-scoped Source/knowledge/queue summary.
-- `/admin/queue/metrics`: global admin backlog and schedule metrics.
+## 10. Cloud/SaaS network boundaries
 
-API readiness does not prove a worker is consuming Jobs. Production alerting should include oldest pending age, failed Job count, stale running leases and worker process health.
+- secret values live in worker environment/secret stores;
+- Drive/Notion use fixed official API hosts;
+- Confluence custom host requires production allowlisting;
+- private/self-hosted endpoints require explicit private-network opt-in where applicable;
+- S3-compatible custom endpoints require host allowlisting;
+- provider service identities should be read-only/least privilege;
+- egress firewall/service-mesh policy remains the final network boundary.
 
-## 9. Embedding / Qdrant upgrades
+Credential rotation does not require Source rewrite when the `credential_ref` name remains stable.
 
-`QDRANT_DIM` must equal the actual embedder dimension and collection size. An embedding model/dimension change is a data migration:
+## 11. Incremental synchronization
+
+Drive/Notion/Confluence are metadata-first: unchanged remote versions reuse existing chunks and skip body download/embedding; changed/new content is downloaded and indexed; remote deletions are pruned after successful replacement.
+
+The current implementation still enumerates configured remote trees/spaces. It is not yet based on provider delta/change feeds. Persistent provider cursors/tokens are a separate optimization milestone.
+
+## 12. Embedding / Qdrant upgrades
+
+`QDRANT_DIM` must equal the actual embedding dimension. A model/dimension change is a data migration:
 
 1. provision a new collection;
 2. deploy the target embedder;
 3. re-ingest Sources;
 4. validate retrieval/ACL/citations;
-5. cut query traffic;
+5. cut traffic;
 6. retain old collection for rollback;
-7. remove only after acceptance.
+7. remove it only after acceptance.
 
 Do not silently reuse an incompatible collection.
 
-## 10. CJK lexical upgrade behavior
+## 13. Staging gates
 
-New writes create the current lexical representation and chunk metadata carries `lexical_version`. After a lexical-version change, ordinary re-ingest rewrites stale representation once; subsequent unchanged runs can reuse it.
+Core staging uses `.github/workflows/staging-smoke.yml` with production mode, PostgreSQL, Qdrant, independent worker, and real model credentials.
 
-Validate disk growth, index build time and retrieval quality before production-wide reindex.
+SaaS staging uses the dedicated SaaS smoke workflow when staging service identities are configured. Ordinary fake-server connector tests are necessary but not sufficient for production enablement.
 
-## 11. Source/network boundaries
+A green PR CI is not a substitute for real credentials/network/provider validation.
 
-Production local Sources must remain inside `RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS`. Remote Web/PDF/Git connectors enforce URL/redirect rules; S3 and Confluence have connector-specific endpoint allowlists. These application checks complement, not replace, network egress controls.
+## 14. Upgrade checklist
 
-Do not expose PostgreSQL or Qdrant admin endpoints publicly.
-
-## 12. Staging gates
-
-`.github/workflows/staging-smoke.yml` is the manual core production-mode gate using real model credentials, PostgreSQL and Qdrant. It covers local/Web/PDF/Git ingestion, hybrid search, Agent chat and ACL-negative isolation.
-
-Cloud/SaaS connectors have protocol-level fake-server tests in ordinary CI and should additionally be exercised with dedicated staging service identities before production enablement. The optional SaaS smoke workflow is intended for that purpose when connector staging credentials are configured.
-
-A green ordinary PR CI is not a substitute for production credentials/network validation.
-
-## 13. Upgrade procedure
-
-1. back up PostgreSQL and verify Qdrant snapshot availability;
-2. build/pull an immutable image;
-3. inspect schema/embedding/connector release notes;
+1. capture PostgreSQL + Qdrant backup and verify restore procedure;
+2. use an immutable image tag/digest;
+3. inspect migration/embedding/connector changes;
 4. run migrations;
-5. deploy workers and API with compatible secrets/configuration;
-6. confirm readiness and worker queue consumption;
-7. run controlled re-ingestion if index representation changed;
+5. deploy workers/API with compatible secrets;
+6. verify readiness and queue consumption;
+7. run controlled re-ingestion when representation changed;
 8. run core and applicable SaaS staging smoke;
-9. monitor queue age, provider throttling, retrieval/tool errors and latency;
-10. use the rollback/reindex runbook if acceptance fails.
+9. monitor queue age, provider throttling, DLQ, retrieval errors, and latency;
+10. invoke rollback/reindex/restore runbook if acceptance fails.
 
-## 14. v1 production checklist
+## 15. v1 production checklist
 
-- production mode and scoped principals enabled;
-- durable workers consuming Jobs;
+- production mode enabled;
+- every API key mapped to a scoped principal;
+- reader/operator/admin keys separated by actual duties;
+- durable worker enabled;
+- retry/reconcile parameters reviewed;
 - external PostgreSQL/Qdrant;
-- TLS/rate limiting/upstream auth policy;
-- source allowlists and network egress policy;
-- SaaS secrets injected only into required worker workloads;
-- least-privilege provider service identities;
-- PostgreSQL backup/restore test;
-- Qdrant snapshot/restore test;
-- pinned image tag/digest;
-- resource/load evidence;
-- logs/traces exported durably;
-- embedding collection/model/dimension recorded;
-- retrieval baseline captured;
+- TLS/ingress/rate-limit/egress policy;
+- worker-only SaaS secrets;
+- least-privilege provider identities;
+- PostgreSQL + Qdrant restore test;
+- immutable image version;
+- capacity/retrieval baseline;
 - core staging smoke green;
-- SaaS staging smoke green for enabled production connectors;
-- rollback/migration/reindex runbook reviewed.
+- SaaS staging green for enabled connectors;
+- rollback/migration/reindex/DR runbooks reviewed.
