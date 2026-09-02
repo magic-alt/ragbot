@@ -1,0 +1,27 @@
+{{- if and .Values.worker.enabled .Values.worker.autoscaling.enabled -}}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ .Release.Name }}-worker
+  labels:
+    app: ragbot
+    component: worker
+spec:
+  scaleTargetRef:
+    name: {{ .Release.Name }}-worker
+  pollingInterval: {{ .Values.worker.autoscaling.pollingInterval }}
+  cooldownPeriod: {{ .Values.worker.autoscaling.cooldownPeriod }}
+  minReplicaCount: {{ .Values.worker.autoscaling.minReplicaCount }}
+  maxReplicaCount: {{ .Values.worker.autoscaling.maxReplicaCount }}
+  triggers:
+    - type: postgresql
+      metadata:
+        connectionFromEnv: POSTGRES_DSN
+        query: >-
+          SELECT COUNT(*)::bigint
+          FROM ingestion_jobs
+          WHERE (status = 'pending' AND COALESCE(available_at, NOW()) <= NOW())
+             OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= NOW())
+        targetQueryValue: {{ .Values.worker.autoscaling.targetJobsPerWorker | quote }}
+        activationTargetQueryValue: {{ .Values.worker.autoscaling.activationJobs | quote }}
+{{- end }}
