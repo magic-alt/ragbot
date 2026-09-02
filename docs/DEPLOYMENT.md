@@ -12,11 +12,38 @@ Root `docker-compose.yml` and `infra/docker/docker-compose.yml` start API, indep
 
 ```bash
 cp .env.example .env
-# configure provider credentials
+# configure model/storage settings
 docker compose up -d --build
 ```
 
 Compose sets `RAGBOT_INGESTION_MODE=worker`, so ingestion is durable rather than tied to the API process lifecycle.
+
+#### Worker-only connector credentials
+
+Cloud/SaaS `credential_ref=env:VARIABLE` values must exist inside the ingestion worker, not merely in the host shell. Both Compose files therefore load an additional env file **only for the worker service**.
+
+The checked-in `.env.worker.example` is safe and keeps Compose usable without cloud credentials. For real connectors:
+
+```bash
+cp .env.worker.example .env.worker
+# edit .env.worker; it is ignored by git
+
+# absolute path works with either root or infra/docker Compose file
+RAGBOT_WORKER_ENV_FILE="$PWD/.env.worker" docker compose up -d --build
+```
+
+Example `.env.worker`:
+
+```dotenv
+RAGBOT_DRIVE_CREDENTIALS_JSON={"type":"service_account",...}
+RAGBOT_NOTION_TOKEN=secret_...
+RAGBOT_CONFLUENCE_TOKEN=...
+RAGBOT_TENANT_A_NOTION_TOKEN=secret_...
+```
+
+The API service does not load `RAGBOT_WORKER_ENV_FILE`. This keeps SaaS provider credentials out of the API container while allowing arbitrary tenant/integration-specific environment names without editing the Compose YAML for every new credential.
+
+Compose precedence still applies: keys explicitly declared under the worker `environment:` block override the same key from `env_file`. Use dedicated connector credential variable names rather than reusing core variables such as `OPENAI_API_KEY`.
 
 ## 2. Database migration lifecycle
 
