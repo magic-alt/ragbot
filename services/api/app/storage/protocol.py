@@ -1,6 +1,7 @@
 """Repository Protocol — abstract interface for data persistence.
 
-Both InMemoryRepo (dev/test) and PostgresRepo (production) implement this protocol.
+Both InMemoryRepo (dev/test) and production managed PostgreSQL repositories
+implement this protocol.
 """
 from __future__ import annotations
 
@@ -50,6 +51,7 @@ class Repo(Protocol):
     def claim_next_job(self, worker_id: str, lease_seconds: int = 120, max_attempts: int = 3) -> Optional[IngestionJob]: ...
     def heartbeat_job(self, job_id: str, worker_id: str, lease_seconds: int = 120) -> bool: ...
     def release_job_lease(self, job_id: str, worker_id: str) -> bool: ...
+    def reconcile_ingestion_jobs(self, max_attempts: int = 3) -> Dict[str, int]: ...
 
     # ── Tables (InMemory only; PostgresRepo is no-op) ──────────────────
     def register_table(self, table: TableData) -> None: ...
