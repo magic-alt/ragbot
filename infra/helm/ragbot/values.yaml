@@ -44,7 +44,13 @@ worker:
   pollSeconds: "1"
   leaseSeconds: "120"
   maxAttempts: "3"
+  retryBaseSeconds: "5"
+  retryMaxSeconds: "300"
+  reconcileSeconds: "30"
   schedulerScanSeconds: "30"
+  providerMaxAttempts: "4"
+  providerBackoffBaseSeconds: "0.5"
+  providerBackoffMaxSeconds: "30"
   # Worker-only environment is the preferred way to expose cloud connector
   # credential references. API pods do not need SaaS credentials.
   # extraEnv accepts ordinary Kubernetes EnvVar objects; use secretKeyRef rather
