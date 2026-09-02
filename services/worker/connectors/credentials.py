@@ -15,18 +15,26 @@ from typing import Any
 _ENV_REF = re.compile(r"^env:([A-Za-z_][A-Za-z0-9_]*)$")
 
 
-def resolve_secret(ref: str) -> str:
-    """Resolve a supported secret reference without allowing arbitrary file reads."""
+def validate_secret_ref(ref: str) -> str:
+    """Validate a secret reference without requiring the secret in the API pod."""
     if not isinstance(ref, str) or not ref.strip():
         raise ValueError("credential_ref must be a non-empty secret reference")
-    match = _ENV_REF.fullmatch(ref.strip())
-    if not match:
+    value = ref.strip()
+    if not _ENV_REF.fullmatch(value):
         raise ValueError("Only env:VARIABLE credential references are supported")
-    name = match.group(1)
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        raise ValueError(f"Credential environment variable is missing or empty: {name}")
     return value
+
+
+def resolve_secret(ref: str) -> str:
+    """Resolve a supported secret reference without allowing arbitrary file reads."""
+    value = validate_secret_ref(ref)
+    match = _ENV_REF.fullmatch(value)
+    assert match is not None
+    name = match.group(1)
+    secret = os.getenv(name)
+    if secret is None or not secret.strip():
+        raise ValueError(f"Credential environment variable is missing or empty: {name}")
+    return secret
 
 
 def resolve_json_secret(ref: str) -> dict[str, Any]:
