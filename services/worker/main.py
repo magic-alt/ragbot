@@ -5,8 +5,8 @@ Run with::
     python -m services.worker.main
 
 The API persists jobs as ``pending``. Workers atomically claim jobs using the
-repository lease contract, heartbeat while connectors/embedders run, and allow
-another worker to recover work after a process crash or node restart.
+repository lease contract, heartbeat while connectors/embedders run, recover
+expired leases, and periodically enqueue due recurring Source syncs.
 """
 from __future__ import annotations
 
@@ -16,11 +16,13 @@ import signal
 import socket
 import threading
 import time
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
 
 from services.api.app.factory import build_services_from_env
 from services.worker.pipeline import run_ingest_pipeline
+from services.worker.scheduler import schedule_due_sources
 
 logger = logging.getLogger(__name__)
 _STOP = threading.Event()
@@ -36,23 +38,37 @@ def main() -> int:
     poll_seconds = _positive_float("RAGBOT_WORKER_POLL_SECONDS", 1.0)
     lease_seconds = _positive_int("RAGBOT_WORKER_LEASE_SECONDS", 120)
     max_attempts = _positive_int("RAGBOT_WORKER_MAX_ATTEMPTS", 3)
+    scheduler_scan_seconds = _nonnegative_float("RAGBOT_SCHEDULER_SCAN_SECONDS", 30.0)
     worker_id = os.getenv("RAGBOT_WORKER_ID") or f"{socket.gethostname()}:{os.getpid()}"
 
     services = build_services_from_env()
     claim = getattr(services.repo, "claim_next_job", None)
     heartbeat = getattr(services.repo, "heartbeat_job", None)
     release = getattr(services.repo, "release_job_lease", None)
-    if not callable(claim) or not callable(heartbeat) or not callable(release):
-        raise RuntimeError("Configured repository does not implement durable ingestion leases")
+    add_if_absent = getattr(services.repo, "add_job_if_absent", None)
+    if not all(callable(item) for item in (claim, heartbeat, release, add_if_absent)):
+        raise RuntimeError("Configured repository does not implement durable ingestion/scheduling contracts")
 
     logger.info(
-        "Ingestion worker started: worker_id=%s lease=%ss max_attempts=%d",
+        "Ingestion worker started: worker_id=%s lease=%ss max_attempts=%d scheduler_scan=%ss",
         worker_id,
         lease_seconds,
         max_attempts,
+        scheduler_scan_seconds,
     )
+    next_schedule_scan = 0.0
     try:
         while not _STOP.is_set():
+            monotonic_now = time.monotonic()
+            if scheduler_scan_seconds > 0 and monotonic_now >= next_schedule_scan:
+                try:
+                    stats = schedule_due_sources(services.repo)
+                    if stats["enqueued"] or stats["blocked_active"]:
+                        logger.info("Scheduled source scan: %s", stats)
+                except Exception:
+                    logger.exception("Scheduled source scan failed")
+                next_schedule_scan = monotonic_now + scheduler_scan_seconds
+
             job = claim(worker_id, lease_seconds=lease_seconds, max_attempts=max_attempts)
             if job is None:
                 _STOP.wait(poll_seconds)
@@ -85,14 +101,12 @@ def _execute_claimed_job(job, services, *, worker_id: str, lease_seconds: int) -
         return
 
     # Connector configuration is part of the durable job contract. A Source may
-    # be edited while a job waits in the queue; executing the queued job against
-    # the mutable current config would make retries/non-immediate execution
-    # nondeterministic. Keep current Source metadata/ACL state, but execute the
-    # connector type/config snapshot captured when this job was submitted.
+    # be edited while a job waits in the queue; execute the immutable snapshot
+    # captured when the Job was submitted while retaining current metadata/ACL.
     source = replace(
         current_source,
         source_type=job.source_type,
-        config=dict(job.source_config or {}),
+        config=deepcopy(job.source_config or {}),
     )
 
     heartbeat_stop = threading.Event()
@@ -168,6 +182,13 @@ def _positive_float(name: str, default: float) -> float:
     value = float(os.getenv(name, str(default)))
     if value <= 0:
         raise ValueError(f"{name} must be > 0")
+    return value
+
+
+def _nonnegative_float(name: str, default: float) -> float:
+    value = float(os.getenv(name, str(default)))
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0")
     return value
 
 
