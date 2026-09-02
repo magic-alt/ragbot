@@ -6,6 +6,16 @@ All notable project changes intended for release are recorded here. Ragbot still
 
 ### Added
 
+- high-level `POST /ingest/quick` product API that creates/reuses a Source and submits ingestion in one call;
+- `POST /ingest/batch` for manifest-style onboarding of up to 100 knowledge sources per request;
+- stable Source identity from tenant + source type + canonicalized location;
+- active-ingestion deduplication and explicit deterministic ingestion idempotency keys;
+- product CLI workflow with automatic source-type inference, ingestion progress polling and `--wait`;
+- `rag import` JSON-manifest knowledge-base bootstrap command;
+- `rag doctor` deployment liveness/readiness command;
+- 60-second product quickstart and example multi-source manifest;
+- reusable ingestion queue helpers shared by low-level and product APIs;
+- real PostgreSQL + Qdrant 1000-PDF capacity/integration benchmark and benchmark documentation;
 - durable SQL migration runner with advisory locking and migration history;
 - native PostgreSQL FTS integration in the production repository path;
 - replacement-oriented source ingestion and stale PostgreSQL/Qdrant cleanup;
@@ -26,6 +36,9 @@ All notable project changes intended for release are recorded here. Ragbot still
 
 ### Changed
 
+- the default onboarding workflow is now Quick Import/CLI instead of requiring callers to manually orchestrate Source creation followed by Job creation;
+- repeated product bootstrap calls reuse an existing Source and pending/running Job by default;
+- local CLI ingestion explicitly uses the configured shared embedder, preserving the same embedding contract as retrieval;
 - FastAPI `/openapi.json` is the canonical HTTP API schema instead of a separately maintained static OpenAPI file;
 - ingestion/query paths share one embedding contract and reject incompatible vector dimensions;
 - PostgreSQL migrations are executed explicitly during Compose/Helm deployment rather than only on first database-volume creation;
@@ -41,6 +54,9 @@ All notable project changes intended for release are recorded here. Ragbot still
 
 ### Fixed
 
+- strict quick-import idempotency can no longer be combined with non-reusable Source identity;
+- hybrid RRF modality crowd-out that could suppress an exact lexical candidate behind the vector candidate window;
+- invalid single-marker identity assumptions in the deterministic 1000-PDF hash-embedding benchmark;
 - stable deterministic hash embeddings for development/testing;
 - ingestion/query embedding-dimension drift;
 - stale chunks/vectors/documents after replacement ingestion;
@@ -63,8 +79,10 @@ All notable project changes intended for release are recorded here. Ragbot still
 
 ### Non-blocking v1.x roadmap
 
+- web/admin UI for source catalog, ingestion progress, retrieval inspection and evaluation;
+- scheduled/synchronized connectors for frequently changing knowledge sources;
 - OIDC/OAuth2/SAML and centrally managed enterprise IAM beyond service-to-service API-key principals;
-- larger customer/domain CJK corpora and optional PGroonga/pg_jieba/external lexical-index comparison when they outperform the built-in bigram baseline materially enough to justify operational complexity;
+- larger customer/domain CJK corpora and optional PGroonga/pg_jieba/external lexical-index comparison when they materially outperform the built-in bigram baseline;
 - stronger PostgreSQL/Qdrant cross-store activation semantics such as outbox/reconciler or staged source versions;
 - authoritative provider token accounting for the OpenAI-compatible `usage` object.
 
