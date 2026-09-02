@@ -21,6 +21,7 @@ env/
 .env
 .env.*
 !.env.example
+!.env.worker.example
 
 # Local data / runtime state
 data/
