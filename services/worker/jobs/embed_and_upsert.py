@@ -4,7 +4,7 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from services.api.app.retrieval.embedder import Embedder, HashEmbedder
-from services.api.app.retrieval.qdrant import to_epoch
+from services.api.app.retrieval.qdrant import point_id_for_chunk, to_epoch
 from services.api.app.storage.models import Chunk
 from services.api.app.storage.protocol import Repo
 
@@ -20,22 +20,23 @@ def embed_and_upsert(
     batch_size: int = DEFAULT_BATCH_SIZE,
     embedder: Optional[Embedder] = None,
 ) -> None:
-    """Persist chunks and their vectors in bounded batches.
+    """Persist chunks and vectors in bounded batches.
 
-    ``qdrant_point_id`` is kept equal to ``chunk_id`` so stale vectors can be
-    pruned deterministically after a successful re-ingestion.
+    SQL keeps Ragbot's logical ``chunk_id`` while Qdrant receives a stable UUID
+    derived from it. The logical ID is also stored in the vector payload so
+    retrieval can fuse vector and lexical rankings without coupling SQL primary
+    keys to Qdrant's restricted point-ID type.
     """
     emb = embedder or HashEmbedder(dim=qdrant.dim)
-    batch: List[Tuple[str, List[float], Dict[str, Any]]] = []
+    vector_batch: List[Tuple[str, List[float], Dict[str, Any]]] = []
     chunk_list: List[Chunk] = []
     total = 0
 
     def flush() -> None:
-        nonlocal batch, chunk_list, total
+        nonlocal vector_batch, chunk_list, total
         if not chunk_list:
             return
-        texts = [c.text for c in chunk_list]
-        vectors = emb.embed_batch(texts)
+        vectors = emb.embed_batch([c.text for c in chunk_list])
         if len(vectors) != len(chunk_list):
             raise RuntimeError(
                 f"Embedder returned {len(vectors)} vectors for {len(chunk_list)} chunks"
@@ -46,15 +47,20 @@ def embed_and_upsert(
                     "Embedding dimension does not match vector store: "
                     f"chunk={chunk.chunk_id}, vector={len(vector)}, qdrant={qdrant.dim}"
                 )
-            chunk.qdrant_point_id = chunk.chunk_id
-            repo.add_chunk(chunk)
-            batch.append(
-                (chunk.chunk_id, vector, _build_payload(chunk, emb.model_name))
-            )
-        qdrant.upsert(batch)
-        total += len(batch)
-        logger.debug("Upserted batch of %d points (total: %d)", len(batch), total)
-        batch = []
+            point_id = point_id_for_chunk(chunk.chunk_id)
+            chunk.qdrant_point_id = point_id
+            vector_batch.append((point_id, vector, _build_payload(chunk, emb.model_name)))
+
+        add_chunks = getattr(repo, "add_chunks", None)
+        if callable(add_chunks):
+            add_chunks(chunk_list)
+        else:  # compatibility with third-party Repo implementations
+            for chunk in chunk_list:
+                repo.add_chunk(chunk)
+        qdrant.upsert(vector_batch)
+        total += len(vector_batch)
+        logger.debug("Upserted batch of %d points (total: %d)", len(vector_batch), total)
+        vector_batch = []
         chunk_list = []
 
     for chunk in chunks:
@@ -69,6 +75,7 @@ def _build_payload(chunk: Chunk, embedding_model: str = "hash-64") -> Dict[str, 
     doc_updated_at = chunk.metadata.get("doc_updated_at")
     acl_hash = chunk.metadata.get("acl_hash") or "public"
     return {
+        "chunk_id": chunk.chunk_id,
         "tenant_id": chunk.tenant_id,
         "source_type": chunk.metadata.get("source_type"),
         "doc_id": chunk.doc_id,
