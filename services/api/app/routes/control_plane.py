@@ -84,6 +84,17 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
         require_admin(_key)
         return build_overview(get_services().repo, None)
 
+    @router.get("/admin/queue/metrics")
+    async def admin_queue_metrics(_key: Optional[str] = Depends(auth_dep)):
+        require_admin(_key)
+        overview = build_overview(get_services().repo, None)
+        return {
+            "generated_at": overview["generated_at"],
+            "queue": overview["queue"],
+            "scheduled_sources": overview["sources"]["scheduled"],
+            "next_sync_at": overview["sources"]["next_sync_at"],
+        }
+
     return router
 
 
@@ -121,16 +132,16 @@ def build_overview(repo, tenant_scope: Optional[set[str] | frozenset[str]]) -> d
         if job.completed_at and (now - _parse_time(job.completed_at)).total_seconds() <= 86400
     )
 
-    latest_by_source = {}
-    for job in sorted(jobs, key=_job_sort_key, reverse=True):
-        latest_by_source.setdefault(job.source_id, job)
-    indexed_docs = 0
-    indexed_chunks = 0
-    for job in latest_by_source.values():
-        if job.status != "completed":
-            continue
-        indexed_docs += int(job.doc_count or 0)
-        indexed_chunks += int((job.stats or {}).get("chunks_total", job.chunk_count or 0))
+    # A pending/running refresh must not erase the size of the last successfully
+    # activated knowledge view. Track the most recent completed Job per Source.
+    latest_completed_by_source = {}
+    for job in sorted(completed, key=_job_sort_key, reverse=True):
+        latest_completed_by_source.setdefault(job.source_id, job)
+    indexed_docs = sum(int(job.doc_count or 0) for job in latest_completed_by_source.values())
+    indexed_chunks = sum(
+        int((job.stats or {}).get("chunks_total", job.chunk_count or 0))
+        for job in latest_completed_by_source.values()
+    )
 
     next_syncs = [_parse_time(source.sync_next_at) for source in scheduled if source.sync_next_at]
     return {
@@ -223,8 +234,8 @@ def _safe_location(source) -> Optional[str]:
         return str(value) if value else None
     if source.source_type == "s3":
         bucket = config.get("bucket")
-        prefix = config.get("prefix") or ""
-        return f"s3://{bucket}/{prefix}" if bucket else None
+        prefix = str(config.get("prefix") or "").strip("/")
+        return f"s3://{bucket}/{prefix}" if bucket and prefix else (f"s3://{bucket}" if bucket else None)
     value = config.get("path")
     return str(value) if value else None
 
