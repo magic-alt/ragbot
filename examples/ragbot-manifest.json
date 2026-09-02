@@ -1,0 +1,28 @@
+{
+  "tenant_id": "engineering",
+  "sources": [
+    {
+      "location": "/data/manuals",
+      "name": "Local engineering manuals",
+      "tags": ["manuals", "local"]
+    },
+    {
+      "location": "https://example.com/product/guide.pdf",
+      "name": "Product guide",
+      "tags": ["product", "pdf"]
+    },
+    {
+      "location": "https://github.com/magic-alt/ragbot",
+      "name": "Ragbot source",
+      "tags": ["code"],
+      "config": {
+        "ref": "main"
+      }
+    },
+    {
+      "location": "https://example.com/knowledge-base/",
+      "name": "Team knowledge portal",
+      "tags": ["web"]
+    }
+  ]
+}
