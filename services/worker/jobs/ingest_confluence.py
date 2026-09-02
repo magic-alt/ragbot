@@ -16,6 +16,7 @@ from services.worker.connectors.incremental import previous_by_external_id, reus
 from services.worker.connectors.security import csv_values, validate_remote_url
 from services.worker.dedup.hashing import content_hash
 from services.worker.jobs.ingest_text import _split_text
+from services.worker.reliability import provider_request
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,9 @@ def _list_pages(client: requests.Session, base: str, space_key: str, *, root_pag
             "start": start,
             "expand": "version,history.lastUpdated,ancestors",
         }
-        response = client.get(f"{base}/rest/api/content", params=params, timeout=30)
+        response = provider_request(
+            client, "get", f"{base}/rest/api/content", params=params, timeout=30
+        )
         response.raise_for_status()
         payload = response.json()
         results = payload.get("results", []) if isinstance(payload, dict) else []
@@ -125,7 +128,9 @@ def _list_pages(client: requests.Session, base: str, space_key: str, *, root_pag
 
 
 def _get_page(client: requests.Session, base: str, page_id: str) -> dict:
-    response = client.get(
+    response = provider_request(
+        client,
+        "get",
         f"{base}/rest/api/content/{page_id}",
         params={"expand": "body.storage,version,history.lastUpdated"},
         timeout=30,
