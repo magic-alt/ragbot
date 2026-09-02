@@ -1,201 +1,188 @@
 # Ragbot Admin & Operations Guide
 
-This guide covers the product control plane introduced after Quick Import: the built-in Web UI, Source Catalog, ingestion queue operations, recurring Source sync, S3/MinIO onboarding and worker backlog autoscaling.
+This guide covers the built-in control plane, tenant RBAC, durable ingestion operations, dead-letter recovery, recurring synchronization, connector operations, and worker scaling.
 
-## 1. Open the built-in control plane
-
-After the API is running:
+## 1. Open the control plane
 
 ```text
 http://localhost:8000/admin/ui
 ```
 
-The UI is served directly by FastAPI and has no Node/npm build step. It does not embed an API credential. Operators enter `X-API-Key` in the browser; the value is stored only in browser `sessionStorage` and is sent to Ragbot APIs.
+The UI is served directly by FastAPI with no Node/npm build step. It contains no embedded API credential. The entered `X-API-Key` is stored only in browser `sessionStorage`.
 
-The page provides:
+The UI displays the current principal role/capability using `GET /catalog/session` and applies the same backend RBAC contract to its controls:
+
+- `reader`: read-only catalog/queue visibility;
+- `operator`: Source, ingestion, retry/requeue, pause/resume, and schedule operations;
+- `owner`: tenant-level operator superset;
+- `admin=true`: global admin operations such as reconciliation.
+
+UI hiding/disablement is usability only. Authorization is always enforced again by the API.
+
+## 2. Dashboard signals
+
+The control plane shows:
+
+- Source count;
+- indexed document/chunk count;
+- pending/running Jobs;
+- failed Jobs;
+- **Dead Lettered** Jobs;
+- scheduled Sources;
+- oldest pending age;
+- stale running leases;
+- completed/failed/dead-lettered counts over 24 hours;
+- next scheduled sync.
+
+Job rows show `failure_class`, bounded error text, attempts, completion/DLQ timestamps, and the appropriate recovery action.
+
+## 3. Reader vs operator behavior
+
+A reader key can inspect tenant-scoped knowledge/catalog state but cannot mutate it. Quick Import and Source/Job mutation controls are disabled in the UI and backend calls return `403`.
+
+An operator/owner key can:
 
 - Quick Import;
-- tenant-scoped Source Catalog;
-- last successful indexed document/chunk counts;
-- latest ingestion status;
-- failed Job retry;
-- Source pause/resume;
-- recurring sync configuration;
-- pending/running/failed queue metrics;
-- oldest pending age and stale lease count.
+- trigger ingestion;
+- pause/resume Sources;
+- configure schedules;
+- retry failed Jobs;
+- requeue dead-lettered Jobs.
 
-The UI is an operations console, not an IAM boundary. In production, keep the existing API-key principal / ingress / TLS controls in front of it.
+Use a dedicated global admin key only for global operations. Avoid giving admin credentials to routine ingestion automation.
 
-## 2. Control-plane APIs
+## 4. Queue state model
 
-### Tenant-scoped overview
-
-```http
-GET /catalog/overview?tenant_id=engineering
+```text
+pending
+  ↓ worker claim
+running
+  ├─ completed
+  ├─ retryable failure → pending after durable backoff
+  └─ permanent/exhausted failure → dead_lettered
 ```
 
-Returns Source totals, scheduled Sources, queue backlog, 24-hour completion/failure activity and the size of the most recent successful knowledge view.
+Provider HTTP calls have a short retry layer for 408/425/429/5xx and transport errors. If the whole ingestion attempt still fails, the Job-level durable retry/backoff contract applies.
 
-### Source Catalog
+Important worker settings:
 
-```http
-GET /catalog/sources?tenant_id=engineering&status=active&limit=100
+```bash
+RAGBOT_WORKER_MAX_ATTEMPTS=3
+RAGBOT_WORKER_RETRY_BASE_SECONDS=5
+RAGBOT_WORKER_RETRY_MAX_SECONDS=300
+RAGBOT_RECONCILE_SECONDS=30
+RAGBOT_PROVIDER_MAX_ATTEMPTS=4
+RAGBOT_PROVIDER_BACKOFF_BASE_SECONDS=0.5
+RAGBOT_PROVIDER_BACKOFF_MAX_SECONDS=30
 ```
 
-Optional filters:
+`Retry-After` is honored when provider responses supply it.
 
-- `tenant_id`
-- `status`
-- `source_type`
-- `q`
-- `limit` (`1..500`)
+## 5. Failed Retry vs DLQ Requeue
 
-Catalog responses intentionally expose a sanitized location rather than the complete connector configuration. This is important for connectors that use secret references.
+### Failed Job
 
-### Job Catalog
+For a `failed` Job, the UI exposes **Retry**. The endpoint is:
 
 ```http
-GET /catalog/jobs?tenant_id=engineering&status=failed
+POST /ingest/jobs/{job_id}/retry
 ```
 
-`source_config` is deliberately removed from control-plane Job responses.
+This creates a fresh Job using the Source's **current** connector configuration.
 
-### Global queue metrics
+### Dead-lettered Job
 
-Admin principals can query:
+For `dead_lettered`, the UI exposes **Requeue snapshot**:
 
 ```http
-GET /admin/queue/metrics
+POST /ingest/jobs/{job_id}/requeue
+Content-Type: application/json
+
+{"use_current_source_config": false}
 ```
 
-Metrics include:
+Default behavior replays the immutable connector snapshot captured by the dead-letter Job. This is safer for incident analysis and reproducibility.
 
-- pending Jobs;
-- running Jobs;
-- failed Jobs;
-- oldest pending Job age;
-- expired/stale running leases;
-- completions and failures over the previous 24 hours;
-- scheduled Source count and next scheduled run.
+Use:
 
-## 3. Recurring Source sync
+```json
+{"use_current_source_config": true}
+```
 
-Recurring synchronization is first-class Source state, not connector configuration.
+only when an operator deliberately repaired/changed the Source and wants the next attempt to use that new configuration.
 
-Enable hourly sync:
+Do not repeatedly requeue a permanent authentication/configuration failure without fixing the underlying cause.
+
+## 6. Reconciliation
+
+The worker periodically reconciles queue state according to `RAGBOT_RECONCILE_SECONDS`.
+
+Global admins can also invoke:
+
+```bash
+curl -X POST 'https://ragbot.example.com/admin/queue/reconcile?max_attempts=3' \
+  -H "X-API-Key: $RAGBOT_ADMIN_KEY"
+```
+
+Reconciliation is for queue-state repair, including expired leases and stranded failures. It is not a substitute for fixing bad credentials, network policy, malformed Sources, or provider outages.
+
+## 7. Control-plane APIs
+
+Tenant-scoped:
+
+```text
+GET /catalog/session
+GET /catalog/overview
+GET /catalog/sources
+GET /catalog/jobs
+```
+
+Global admin:
+
+```text
+GET  /admin/overview
+GET  /admin/queue/metrics
+POST /admin/queue/reconcile
+```
+
+Catalog responses intentionally redact full Source/Job connector config and secret references.
+
+## 8. Recurring Source sync
+
+Configure:
 
 ```bash
 curl -X PUT http://localhost:8000/sources/<SOURCE_ID>/sync \
   -H 'Content-Type: application/json' \
-  -H "X-API-Key: $RAGBOT_API_KEY" \
+  -H "X-API-Key: $RAGBOT_OPERATOR_KEY" \
   -d '{"enabled":true,"interval_seconds":3600,"run_immediately":false}'
 ```
 
-Run one due window immediately and then continue hourly:
+Every durable worker may scan due Sources. Duplicate schedule windows are prevented using deterministic Job IDs plus atomic insert-if-absent.
+
+If Ragbot misses multiple schedule intervals, it collapses them into one current refresh rather than replaying every missed run. If another Job for the same Source is active, scheduled sync waits.
+
+## 9. Cloud and object-store Sources
+
+Supported product Sources include S3/MinIO, Google Drive, Notion, and Confluence.
+
+Secrets stay outside Source config. Example:
 
 ```json
-{"enabled":true,"interval_seconds":3600,"run_immediately":true}
+{"credential_ref":"env:RAGBOT_NOTION_TOKEN"}
 ```
 
-Disable:
+Docker Compose loads arbitrary SaaS credentials from the worker-only `RAGBOT_WORKER_ENV_FILE`. Helm uses `worker.extraEnv` / `worker.extraEnvFrom`.
 
-```json
-{"enabled":false}
-```
+Drive/Notion/Confluence currently use metadata-first synchronization: unchanged remote versions reuse chunks and skip body download/embedding. This is not yet a persistent provider delta/change-feed implementation.
 
-The minimum interval is 60 seconds.
+## 10. Backlog-driven autoscaling
 
-### Scheduler semantics
-
-Every durable worker may scan due Sources. This does **not** create duplicate scheduled Jobs because:
-
-1. each Source + schedule window derives a deterministic Job ID;
-2. PostgreSQL uses atomic `INSERT ... ON CONFLICT DO NOTHING`;
-3. the Job stores an immutable connector-config snapshot;
-4. normal worker lease/heartbeat/retry semantics execute the Job.
-
-If a manual or different Job for the Source is already pending/running, scheduled sync waits instead of running concurrent replacement ingestion.
-
-If Ragbot is unavailable for multiple schedule intervals, it collapses missed intervals into one current refresh and advances the next schedule into the future. It does not replay every missed interval and cause an ingestion storm.
-
-Worker scan frequency:
-
-```bash
-RAGBOT_SCHEDULER_SCAN_SECONDS=30
-```
-
-Set to `0` to disable recurring scheduling while retaining ordinary durable ingestion.
-
-## 4. S3 and MinIO knowledge Sources
-
-Quick Import accepts an S3 URI directly:
-
-```bash
-rag --server http://localhost:8000 \
-  --tenant engineering \
-  ingest s3://engineering-manuals/servo/ \
-  --wait
-```
-
-Or through the API:
-
-```bash
-curl -X POST http://localhost:8000/ingest/quick \
-  -H 'Content-Type: application/json' \
-  -H "X-API-Key: $RAGBOT_API_KEY" \
-  -d '{
-    "tenant_id":"engineering",
-    "location":"s3://engineering-manuals/servo/",
-    "tags":["manuals"]
-  }'
-```
-
-The connector currently indexes common text/Markdown/code/config formats and PDF objects. Each S3 object becomes a separate Ragbot Document. Object listing is paginated and individual reads have a configurable hard size limit.
-
-### AWS credentials
-
-For AWS S3, prefer the normal boto3 credential chain: workload identity/IAM role, environment credentials or other deployment-owned mechanisms.
-
-Do **not** write access keys into `Source.config`.
-
-### MinIO / S3-compatible endpoint
-
-A Source can include non-secret connector options:
-
-```json
-{
-  "endpoint_url":"http://minio.storage.svc:9000",
-  "credential_env_prefix":"RAGBOT_MINIO",
-  "region_name":"us-east-1"
-}
-```
-
-The worker resolves:
-
-```text
-RAGBOT_MINIO_ACCESS_KEY_ID
-RAGBOT_MINIO_SECRET_ACCESS_KEY
-RAGBOT_MINIO_SESSION_TOKEN
-```
-
-In production, every custom S3-compatible endpoint must be explicitly allowlisted:
-
-```bash
-RAGBOT_S3_ALLOWED_HOSTS=minio.storage.svc
-```
-
-This permits an intentionally private MinIO endpoint without reopening unrestricted worker-side SSRF. Native AWS S3 usage without a custom `endpoint_url` does not need this application allowlist.
-
-## 5. Backlog-driven worker autoscaling with KEDA
-
-The Helm chart can optionally create a KEDA `ScaledObject` for the ingestion worker. KEDA's PostgreSQL scaler reads `POSTGRES_DSN` from the target worker and queries the actual durable queue.
-
-Example values:
+Helm can create a KEDA PostgreSQL `ScaledObject`:
 
 ```yaml
 worker:
   enabled: true
-  schedulerScanSeconds: "30"
   autoscaling:
     enabled: true
     minReplicaCount: 1
@@ -206,35 +193,35 @@ worker:
     activationJobs: "1"
 ```
 
-The scaling query counts:
+The scaler counts ready pending Jobs plus expired running leases. Size maximum replicas against provider quotas; aggressive scaling can amplify 429 throttling.
 
-- pending Jobs whose `available_at` is ready; and
-- running Jobs whose worker lease has expired and is therefore reclaimable.
+## 11. Operational interpretation
 
-This makes worker scaling backlog-driven instead of using CPU as an indirect proxy for queue pressure.
-
-KEDA CRDs/operator must already be installed when `worker.autoscaling.enabled=true`. The option is disabled by default, so ordinary Kubernetes/Helm deployments have no KEDA dependency.
-
-## 6. Operational interpretation
-
-Useful signals:
-
-| Signal | Meaning | Typical response |
+| Signal | Meaning | Response |
 | --- | --- | --- |
-| pending increases steadily | ingestion capacity below arrival rate | increase workers / enable KEDA / inspect embedding provider latency |
-| oldest pending age increases | knowledge freshness SLA degrading | scale workers or reduce source frequency |
-| stale running leases > 0 | worker crash/network/process interruption | verify workers; reclaim occurs through durable queue |
-| failed 24h increases | connector/provider/config regression | inspect Job error, fix config, retry |
-| scheduled Sources high but queue stable | expected recurring workload | no action |
+| pending grows | arrival rate > ingestion capacity | scale workers; inspect embedding/provider latency |
+| oldest pending grows | freshness SLA degrading | scale/reduce schedule frequency |
+| stale leases > 0 | worker interruption | inspect worker health; reconcile/reclaim |
+| failed grows | transient/legacy failure state | inspect class/error, repair, Retry |
+| dead_lettered grows | permanent/exhausted failures | fix root cause, then Requeue |
+| provider 429 grows | upstream quota pressure | lower concurrency/worker max; increase backoff |
+| scheduled high, queue stable | expected recurring workload | no action |
 
-## 7. Connector roadmap and secret policy
+## 12. Disaster recovery
 
-S3/MinIO is the first remote object-store connector in the product control plane. Google Drive, Notion and Confluence should follow the same rule:
+Use `scripts/backup_ragbot.sh` and `scripts/restore_ragbot.sh` for PostgreSQL + Qdrant recovery. A real backup/restore CI smoke validates the mechanism.
 
-- Source configuration stores resource identifiers and a **secret reference**, never OAuth/access-token material itself;
-- worker deployments resolve that secret through environment/Kubernetes/secret-manager integration;
-- catalog and Job APIs do not mirror secret-bearing connector config;
-- refresh and rate-limit behavior stays inside the connector adapter;
-- scheduled sync uses the same durable scheduler rather than connector-specific cron processes.
+See [`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md) before running a production restore. Restore is destructive and should be performed with API write traffic and workers quiesced.
 
-This contract is intentionally established before adding the SaaS connectors so they do not create incompatible credential models.
+## 13. Incident triage order
+
+For a rising failure/DLQ rate:
+
+1. inspect `failure_class` and Job error;
+2. determine whether it is auth/config, provider throttle/outage, network policy, parsing, embedding, or storage;
+3. check worker/provider retry metrics/logs;
+4. fix credentials/config/network/provider issue;
+5. reconcile only if queue state is stranded;
+6. Retry failed or Requeue DLQ work deliberately;
+7. watch oldest pending age while backlog drains;
+8. avoid scaling workers if the bottleneck is an upstream rate limit.
