@@ -6,7 +6,8 @@ Run with::
 
 The API persists jobs as ``pending``. Workers atomically claim jobs using the
 repository lease contract, heartbeat while connectors/embedders run, recover
-expired leases, and periodically enqueue due recurring Source syncs.
+expired leases, retry bounded ingestion failures with backoff, dead-letter
+exhausted work, and periodically enqueue due recurring Source syncs.
 """
 from __future__ import annotations
 
@@ -18,10 +19,15 @@ import threading
 import time
 from copy import deepcopy
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from services.api.app.factory import build_services_from_env
 from services.worker.pipeline import run_ingest_pipeline
+from services.worker.reliability import (
+    classify_ingestion_error,
+    classify_persisted_failure,
+    durable_retry_delay,
+)
 from services.worker.scheduler import schedule_due_sources
 
 logger = logging.getLogger(__name__)
@@ -38,7 +44,10 @@ def main() -> int:
     poll_seconds = _positive_float("RAGBOT_WORKER_POLL_SECONDS", 1.0)
     lease_seconds = _positive_int("RAGBOT_WORKER_LEASE_SECONDS", 120)
     max_attempts = _positive_int("RAGBOT_WORKER_MAX_ATTEMPTS", 3)
+    retry_base_seconds = _positive_float("RAGBOT_WORKER_RETRY_BASE_SECONDS", 5.0)
+    retry_max_seconds = _positive_float("RAGBOT_WORKER_RETRY_MAX_SECONDS", 300.0)
     scheduler_scan_seconds = _nonnegative_float("RAGBOT_SCHEDULER_SCAN_SECONDS", 30.0)
+    reconcile_seconds = _nonnegative_float("RAGBOT_RECONCILE_SECONDS", 30.0)
     worker_id = os.getenv("RAGBOT_WORKER_ID") or f"{socket.gethostname()}:{os.getpid()}"
 
     services = build_services_from_env()
@@ -50,16 +59,24 @@ def main() -> int:
         raise RuntimeError("Configured repository does not implement durable ingestion/scheduling contracts")
 
     logger.info(
-        "Ingestion worker started: worker_id=%s lease=%ss max_attempts=%d scheduler_scan=%ss",
+        "Ingestion worker started: worker_id=%s lease=%ss max_attempts=%d retry=%s..%ss scheduler_scan=%ss reconcile=%ss",
         worker_id,
         lease_seconds,
         max_attempts,
+        retry_base_seconds,
+        retry_max_seconds,
         scheduler_scan_seconds,
+        reconcile_seconds,
     )
     next_schedule_scan = 0.0
+    next_reconcile = 0.0
     try:
         while not _STOP.is_set():
             monotonic_now = time.monotonic()
+            if reconcile_seconds > 0 and monotonic_now >= next_reconcile:
+                _reconcile_queue(services.repo, max_attempts=max_attempts)
+                next_reconcile = monotonic_now + reconcile_seconds
+
             if scheduler_scan_seconds > 0 and monotonic_now >= next_schedule_scan:
                 try:
                     stats = schedule_due_sources(services.repo)
@@ -78,6 +95,9 @@ def main() -> int:
                 services,
                 worker_id=worker_id,
                 lease_seconds=lease_seconds,
+                max_attempts=max_attempts,
+                retry_base_seconds=retry_base_seconds,
+                retry_max_seconds=retry_max_seconds,
             )
     finally:
         _close_services(services)
@@ -85,19 +105,26 @@ def main() -> int:
     return 0
 
 
-def _execute_claimed_job(job, services, *, worker_id: str, lease_seconds: int) -> None:
+def _execute_claimed_job(
+    job,
+    services,
+    *,
+    worker_id: str,
+    lease_seconds: int,
+    max_attempts: int,
+    retry_base_seconds: float = 5.0,
+    retry_max_seconds: float = 300.0,
+) -> None:
     current_source = services.repo.get_source(job.source_id)
     if current_source is None or current_source.status != "active" or current_source.tenant_id != job.tenant_id:
         reason = "Source unavailable, inactive, or tenant-mismatched at execution time"
-        services.repo.update_job(
-            job.job_id,
-            status="failed",
+        _dead_letter_job(
+            services.repo,
+            job,
             error=reason,
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            lease_owner=None,
-            lease_expires_at=None,
+            failure_class="source_unavailable",
         )
-        logger.error("Rejecting claimed job %s: %s", job.job_id, reason)
+        logger.error("Dead-lettering claimed job %s: %s", job.job_id, reason)
         return
 
     # Connector configuration is part of the durable job contract. A Source may
@@ -126,6 +153,19 @@ def _execute_claimed_job(job, services, *, worker_id: str, lease_seconds: int) -
             services.embedder,
             True,
         )
+        if result.status == "failed":
+            classification = classify_persisted_failure(result.error)
+            _retry_or_dead_letter(
+                services.repo,
+                result,
+                error=result.error or "Ingestion pipeline failed",
+                failure_class=classification.failure_class,
+                retryable=classification.retryable,
+                max_attempts=max_attempts,
+                retry_base_seconds=retry_base_seconds,
+                retry_max_seconds=retry_max_seconds,
+            )
+            return
         logger.info(
             "Ingestion job finished: job=%s status=%s attempts=%d",
             result.job_id,
@@ -134,18 +174,117 @@ def _execute_claimed_job(job, services, *, worker_id: str, lease_seconds: int) -
         )
     except Exception as exc:  # pipeline normally persists failures itself
         logger.exception("Unexpected worker failure for job=%s", job.job_id)
-        services.repo.update_job(
-            job.job_id,
-            status="failed",
+        classification = classify_ingestion_error(exc)
+        latest = services.repo.get_job(job.job_id) or job
+        _retry_or_dead_letter(
+            services.repo,
+            latest,
             error=f"Worker execution failure: {exc}",
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            lease_owner=None,
-            lease_expires_at=None,
+            failure_class=classification.failure_class,
+            retryable=classification.retryable,
+            max_attempts=max_attempts,
+            retry_base_seconds=retry_base_seconds,
+            retry_max_seconds=retry_max_seconds,
         )
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=max(1.0, lease_seconds / 3))
         services.repo.release_job_lease(job.job_id, worker_id)
+
+
+def _retry_or_dead_letter(
+    repo,
+    job,
+    *,
+    error: str,
+    failure_class: str,
+    retryable: bool,
+    max_attempts: int,
+    retry_base_seconds: float,
+    retry_max_seconds: float,
+) -> None:
+    if not retryable or int(job.attempts or 0) >= max_attempts:
+        _dead_letter_job(repo, job, error=error, failure_class=failure_class)
+        logger.error(
+            "Ingestion job dead-lettered: job=%s attempts=%d class=%s retryable=%s",
+            job.job_id,
+            int(job.attempts or 0),
+            failure_class,
+            retryable,
+        )
+        return
+
+    delay = durable_retry_delay(
+        int(job.attempts or 0),
+        base_seconds=retry_base_seconds,
+        max_seconds=retry_max_seconds,
+    )
+    now = datetime.now(timezone.utc)
+    stats = dict(job.stats or {})
+    history = list(stats.get("attempt_failures") or [])[-19:]
+    history.append(
+        {
+            "attempt": int(job.attempts or 0),
+            "at": now.isoformat(),
+            "failure_class": failure_class,
+            "error": str(error)[:1000],
+            "retry_delay_seconds": delay,
+        }
+    )
+    stats["attempt_failures"] = history
+    repo.update_job(
+        job.job_id,
+        status="pending",
+        error=error,
+        failure_class=failure_class,
+        completed_at=None,
+        dead_lettered_at=None,
+        available_at=(now + timedelta(seconds=delay)).isoformat(),
+        lease_owner=None,
+        lease_expires_at=None,
+        stats=stats,
+    )
+    logger.warning(
+        "Ingestion job scheduled for durable retry: job=%s attempt=%d/%d class=%s delay=%.1fs",
+        job.job_id,
+        int(job.attempts or 0),
+        max_attempts,
+        failure_class,
+        delay,
+    )
+
+
+def _dead_letter_job(repo, job, *, error: str, failure_class: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    stats = dict(job.stats or {})
+    stats["dead_letter"] = {
+        "at": now,
+        "attempts": int(job.attempts or 0),
+        "failure_class": failure_class,
+    }
+    repo.update_job(
+        job.job_id,
+        status="dead_lettered",
+        error=error,
+        failure_class=failure_class,
+        completed_at=job.completed_at or now,
+        dead_lettered_at=now,
+        lease_owner=None,
+        lease_expires_at=None,
+        stats=stats,
+    )
+
+
+def _reconcile_queue(repo, *, max_attempts: int) -> None:
+    reconcile = getattr(repo, "reconcile_ingestion_jobs", None)
+    if not callable(reconcile):
+        return
+    try:
+        stats = reconcile(max_attempts=max_attempts)
+        if any(int(value or 0) for value in stats.values()):
+            logger.warning("Ingestion queue reconciliation repaired state: %s", stats)
+    except Exception:
+        logger.exception("Ingestion queue reconciliation failed")
 
 
 def _heartbeat_loop(repo, job_id: str, worker_id: str, lease_seconds: int, stop: threading.Event) -> None:
