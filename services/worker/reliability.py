@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_HTTP_STATUS_RE = re.compile(r"\b([1-5][0-9]{2})\b")
 
 
 @dataclass(frozen=True)
@@ -99,10 +101,39 @@ def classify_ingestion_error(exc: BaseException) -> FailureClassification:
         return FailureClassification(type(exc).__name__.lower(), False)
     if isinstance(exc, ValueError):
         return FailureClassification("validation_error", False)
-    # Unknown runtime failures are retried at the durable-job layer. This is
-    # intentionally conservative: transient provider/library errors should heal,
-    # while bounded max_attempts prevents infinite loops.
     return FailureClassification(type(exc).__name__.lower() or "ingestion_error", True)
+
+
+def classify_persisted_failure(message: Optional[str]) -> FailureClassification:
+    """Classify a pipeline failure after it has already been persisted as text.
+
+    The pipeline intentionally sanitizes/serializes errors into the Job record.
+    This conservative classifier prevents obvious permanent auth/config failures
+    from being replayed repeatedly while leaving unknown runtime failures
+    retryable under the bounded durable-attempt budget.
+    """
+    text = str(message or "").strip()
+    lower = text.lower()
+    for match in _HTTP_STATUS_RE.finditer(text):
+        status = int(match.group(1))
+        if status in RETRYABLE_HTTP_STATUSES:
+            return FailureClassification(f"http_{status}", True)
+        if 400 <= status < 500:
+            return FailureClassification(f"http_{status}", False)
+    permanent_markers = (
+        "permission denied",
+        "no such file",
+        "not found:",
+        "requires non-empty",
+        "must not be empty",
+        "invalid source",
+        "unsupported source_type",
+        "credential reference environment variable is not set",
+        "api principal requires",
+    )
+    if any(marker in lower for marker in permanent_markers):
+        return FailureClassification("configuration_error", False)
+    return FailureClassification("pipeline_failure", True)
 
 
 def durable_retry_delay(
