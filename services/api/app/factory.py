@@ -24,9 +24,9 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
     postgres_dsn = os.getenv("POSTGRES_DSN")
     if repo is None:
         if postgres_dsn:
-            from .storage.pg_repo import PostgresRepo
-            repo = PostgresRepo(dsn=postgres_dsn)
-            logger.info("Using PostgresRepo")
+            from .storage.managed_pg_repo import ManagedPostgresRepo
+            repo = ManagedPostgresRepo(dsn=postgres_dsn)
+            logger.info("Using ManagedPostgresRepo")
         else:
             repo = InMemoryRepo()
             logger.info("Using InMemoryRepo")
