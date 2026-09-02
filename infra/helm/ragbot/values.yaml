@@ -39,17 +39,23 @@ autoscaling:
   targetCPUUtilizationPercentage: 70
 
 worker:
-  # Development can keep this disabled and run API ingestion inline. Production
-  # rendering fails unless the durable worker is enabled.
   enabled: false
   replicaCount: 1
   pollSeconds: "1"
   leaseSeconds: "120"
   maxAttempts: "3"
-  # Every worker may scan recurring Sources. Deterministic scheduled Job IDs and
-  # atomic insert-if-absent semantics make scans safe across replicas. Set 0 to
-  # disable the scheduler while retaining ordinary durable ingestion.
   schedulerScanSeconds: "30"
+  # Worker-only environment is the preferred way to expose cloud connector
+  # credential references. API pods do not need SaaS credentials.
+  # extraEnv accepts ordinary Kubernetes EnvVar objects; use secretKeyRef rather
+  # than literal secret values in committed values files.
+  extraEnv: []
+  # extraEnvFrom can import a dedicated connector Secret/ExternalSecret.
+  # Example:
+  # extraEnvFrom:
+  #   - secretRef:
+  #       name: ragbot-saas-connectors
+  extraEnvFrom: []
   autoscaling:
     # Optional KEDA PostgreSQL scaler. Requires the KEDA CRDs/operator to be
     # installed in the cluster. It reads POSTGRES_DSN from the worker target and
@@ -82,7 +88,6 @@ env:
   RAGBOT_ALLOW_PRIVATE_SOURCE_NETWORKS: "false"
   OTEL_SERVICE_NAME: ragbot-api
 
-# External services. Production/multi-replica deployments should configure both.
 postgres:
   dsn: ""
 qdrant:
@@ -92,33 +97,19 @@ qdrant:
 otel:
   endpoint: ""
 
-# Optional existing Secret keys used by the chart:
+# Optional existing Secret keys used by the core chart:
 #   postgres-dsn
 #   openai-api-key
 #   embedding-api-key
 #   api-keys
 #   api-key-principals
 #   qdrant-api-key
-# Object-store credentials should be injected as ordinary Kubernetes env/secret
-# variables matching Source credential_env_prefix; never place secret values in
-# Source.config.
+# Cloud/SaaS credentials should normally use worker.extraEnv/extraEnvFrom so
+# secret material is not exposed to the API deployment.
 existingSecret: ""
 
-# Optional data/config mounts for local_fs/local PDF/local Git sources. Production
-# paths must remain inside RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS. These mounts are
-# shared by the API and ingestion worker so source paths have identical meaning.
 extraVolumes: []
-# Example:
-# extraVolumes:
-#   - name: knowledge
-#     persistentVolumeClaim:
-#       claimName: ragbot-knowledge
 extraVolumeMounts: []
-# Example:
-# extraVolumeMounts:
-#   - name: knowledge
-#     mountPath: /data
-#     readOnly: true
 
 livenessProbe:
   httpGet:
