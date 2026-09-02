@@ -254,7 +254,7 @@ jobs:
       - name: Validate infra Docker Compose
         run: docker compose -f infra/docker/docker-compose.yml config -q
 
-      - name: Verify Compose worker-only secret isolation
+      - name: Verify Compose worker reliability and secret isolation
         run: |
           printf 'RAGBOT_CI_SAAS_SECRET=compose-worker-only-sentinel\n' > .ci-worker.env
           for compose_file in docker-compose.yml infra/docker/docker-compose.yml; do
@@ -276,7 +276,20 @@ jobs:
           assert 'RAGBOT_CI_SAAS_SECRET' not in api_env, (
               f'{compose_file}: worker-only secret leaked into API environment'
           )
-          print(f'{compose_file}: worker-only secret isolation OK')
+          expected_worker = {
+              'RAGBOT_WORKER_RETRY_BASE_SECONDS': '5',
+              'RAGBOT_WORKER_RETRY_MAX_SECONDS': '300',
+              'RAGBOT_RECONCILE_SECONDS': '30',
+              'RAGBOT_PROVIDER_MAX_ATTEMPTS': '4',
+              'RAGBOT_PROVIDER_BACKOFF_BASE_SECONDS': '0.5',
+              'RAGBOT_PROVIDER_BACKOFF_MAX_SECONDS': '30',
+          }
+          for key, value in expected_worker.items():
+              assert str(worker_env.get(key)) == value, f'{compose_file}: {key} mismatch'
+          assert config['services']['qdrant']['image'] == 'qdrant/qdrant:v1.19.0', (
+              f'{compose_file}: Qdrant runtime must be pinned to v1.19.0'
+          )
+          print(f'{compose_file}: worker reliability + secret isolation OK')
           PY
           done
           rm -f .ci-worker.env .ci-compose.json
@@ -295,6 +308,25 @@ jobs:
           --set postgres.dsn=postgresql://ragbot:ragbot@postgres/ragbot
           --set qdrant.url=http://qdrant:6333
           >/dev/null
+
+      - name: Verify Helm worker reliability environment
+        run: |
+          output="$(helm template ragbot infra/helm/ragbot \
+            --set worker.enabled=true \
+            --set worker.retryBaseSeconds=7 \
+            --set worker.retryMaxSeconds=301 \
+            --set worker.reconcileSeconds=31 \
+            --set worker.providerMaxAttempts=5 \
+            --set worker.providerBackoffBaseSeconds=0.75 \
+            --set worker.providerBackoffMaxSeconds=35 \
+            --set postgres.dsn=postgresql://ragbot:ragbot@postgres/ragbot \
+            --set qdrant.url=http://qdrant:6333)"
+          echo "$output" | grep -A1 'name: RAGBOT_WORKER_RETRY_BASE_SECONDS' | grep -q 'value: "7"'
+          echo "$output" | grep -A1 'name: RAGBOT_WORKER_RETRY_MAX_SECONDS' | grep -q 'value: "301"'
+          echo "$output" | grep -A1 'name: RAGBOT_RECONCILE_SECONDS' | grep -q 'value: "31"'
+          echo "$output" | grep -A1 'name: RAGBOT_PROVIDER_MAX_ATTEMPTS' | grep -q 'value: "5"'
+          echo "$output" | grep -A1 'name: RAGBOT_PROVIDER_BACKOFF_BASE_SECONDS' | grep -q 'value: "0.75"'
+          echo "$output" | grep -A1 'name: RAGBOT_PROVIDER_BACKOFF_MAX_SECONDS' | grep -q 'value: "35"'
 
       - name: Render KEDA queue autoscaling
         run: |
