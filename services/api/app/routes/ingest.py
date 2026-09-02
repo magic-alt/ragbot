@@ -1,4 +1,4 @@
-"""Ingestion jobs API routes.
+"""Ingestion jobs API routes and reusable queue helpers.
 
 With PostgreSQL, jobs are persisted first and consumed by the independent
 ``services.worker.main`` process. In-memory development keeps the historical
@@ -31,45 +31,68 @@ class TriggerJobResponse(BaseModel):
     source_id: str
 
 
-def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
-    router = APIRouter(prefix="/ingest", tags=["ingest"])
-
-    def _assert_source_ingestible(source) -> None:
-        if source.status != "active":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Source is not active: {source.source_id} ({source.status})",
-            )
-
-    def _enqueue(source, services, job_id: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
-        services.repo.add_job(
-            IngestionJob(
-                job_id=job_id,
-                tenant_id=source.tenant_id,
-                source_id=source.source_id,
-                source_type=source.source_type,
-                source_config=source.config,
-                status="pending",
-                created_at=now,
-                available_at=now,
-            )
+def assert_source_ingestible(source) -> None:
+    """Reject ingestion for sources that are not currently active."""
+    if source.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Source is not active: {source.source_id} ({source.status})",
         )
 
-        if not _use_durable_worker():
-            from services.worker.pipeline import run_ingest_pipeline
 
-            loop = asyncio.get_running_loop()
-            loop.run_in_executor(
-                None,
-                run_ingest_pipeline,
-                source,
-                services.repo,
-                services.qdrant,
-                job_id,
-                services.embedder,
-                True,
-            )
+def latest_active_ingestion_job(repo, *, tenant_id: str, source_id: str) -> Optional[IngestionJob]:
+    """Return the newest pending/running job for a source, if one exists."""
+    active = [
+        job
+        for job in repo.list_jobs(tenant_id=tenant_id, source_id=source_id)
+        if job.status in {"pending", "running"}
+    ]
+    if not active:
+        return None
+    return max(active, key=lambda job: (job.created_at or "", job.job_id))
+
+
+def enqueue_ingestion_job(source, services, job_id: Optional[str] = None) -> IngestionJob:
+    """Persist an ingestion job and schedule inline execution when configured.
+
+    This helper is shared by the low-level job endpoint and higher-level product
+    surfaces such as quick import. Production deployments continue to rely on
+    the durable worker; development deployments can execute in-process.
+    """
+    assert_source_ingestible(source)
+    job_id = job_id or uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    job = IngestionJob(
+        job_id=job_id,
+        tenant_id=source.tenant_id,
+        source_id=source.source_id,
+        source_type=source.source_type,
+        source_config=source.config,
+        status="pending",
+        created_at=now,
+        available_at=now,
+    )
+    services.repo.add_job(job)
+
+    if not _use_durable_worker():
+        from services.worker.pipeline import run_ingest_pipeline
+
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(
+            None,
+            run_ingest_pipeline,
+            source,
+            services.repo,
+            services.qdrant,
+            job_id,
+            services.embedder,
+            True,
+        )
+    return job
+
+
+def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
+    router = APIRouter(prefix="/ingest", tags=["ingest"])
 
     @router.post("/jobs", status_code=202, response_model=TriggerJobResponse)
     async def trigger_job(
@@ -83,11 +106,9 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if source.tenant_id != payload.tenant_id:
             raise HTTPException(403, "Tenant mismatch")
         authorize_tenant(_key, source.tenant_id)
-        _assert_source_ingestible(source)
 
-        job_id = uuid.uuid4().hex
-        _enqueue(source, services, job_id)
-        return TriggerJobResponse(status="accepted", job_id=job_id, source_id=source.source_id)
+        job = enqueue_ingestion_job(source, services)
+        return TriggerJobResponse(status="accepted", job_id=job.job_id, source_id=source.source_id)
 
     @router.get("/jobs")
     async def list_jobs(
@@ -127,11 +148,9 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if not source or source.status == "deleted":
             raise HTTPException(404, f"Source not found: {old_job.source_id}")
         authorize_tenant(_key, source.tenant_id)
-        _assert_source_ingestible(source)
 
-        new_job_id = uuid.uuid4().hex
-        _enqueue(source, services, new_job_id)
-        return {"status": "accepted", "job_id": new_job_id, "retried_from": job_id}
+        job = enqueue_ingestion_job(source, services)
+        return {"status": "accepted", "job_id": job.job_id, "retried_from": job_id}
 
     return router
 
