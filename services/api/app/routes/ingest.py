@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -55,19 +55,20 @@ def latest_active_ingestion_job(repo, *, tenant_id: str, source_id: str) -> Opti
 def enqueue_ingestion_job(source, services, job_id: Optional[str] = None) -> IngestionJob:
     """Persist an ingestion job and schedule inline execution when configured.
 
-    This helper is shared by the low-level job endpoint and higher-level product
-    surfaces such as quick import. Production deployments continue to rely on
-    the durable worker; development deployments can execute in-process.
+    Connector type/config are snapshotted into the Job so queued/retried work
+    is not silently redirected by a later mutable Source config edit. This
+    helper is shared by the low-level Job API and higher-level Quick Import.
     """
     assert_source_ingestible(source)
     job_id = job_id or uuid.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
+    source_config = dict(source.config or {})
     job = IngestionJob(
         job_id=job_id,
         tenant_id=source.tenant_id,
         source_id=source.source_id,
         source_type=source.source_type,
-        source_config=source.config,
+        source_config=source_config,
         status="pending",
         created_at=now,
         available_at=now,
@@ -77,11 +78,16 @@ def enqueue_ingestion_job(source, services, job_id: Optional[str] = None) -> Ing
     if not _use_durable_worker():
         from services.worker.pipeline import run_ingest_pipeline
 
+        execution_source = replace(
+            source,
+            source_type=job.source_type,
+            config=dict(job.source_config),
+        )
         loop = asyncio.get_running_loop()
         loop.run_in_executor(
             None,
             run_ingest_pipeline,
-            source,
+            execution_source,
             services.repo,
             services.qdrant,
             job_id,
