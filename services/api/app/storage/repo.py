@@ -186,21 +186,56 @@ class InMemoryRepo:
                     setattr(job, key, value)
             return job
 
+    def reconcile_ingestion_jobs(self, max_attempts: int = 3) -> Dict[str, int]:
+        now = datetime.now(timezone.utc)
+        stats = {
+            "recovered_running": 0,
+            "recovered_failed": 0,
+            "dead_lettered_running": 0,
+            "dead_lettered_exhausted": 0,
+        }
+        with self._lock:
+            for job in self._jobs.values():
+                if job.status == "running" and _is_expired(job.lease_expires_at, now):
+                    if job.attempts >= max_attempts:
+                        job.status = "dead_lettered"
+                        job.failure_class = job.failure_class or "lease_exhausted"
+                        job.error = job.error or "Worker lease expired and maximum attempts were exhausted"
+                        job.completed_at = job.completed_at or now.isoformat()
+                        job.dead_lettered_at = job.dead_lettered_at or now.isoformat()
+                        job.lease_owner = None
+                        job.lease_expires_at = None
+                        stats["dead_lettered_running"] += 1
+                    else:
+                        job.status = "pending"
+                        job.lease_owner = None
+                        job.lease_expires_at = None
+                        job.available_at = min(_parse_time(job.available_at), now).isoformat() if job.available_at else now.isoformat()
+                        stats["recovered_running"] += 1
+                elif job.status == "failed":
+                    if job.attempts >= max_attempts:
+                        job.status = "dead_lettered"
+                        job.failure_class = job.failure_class or "attempts_exhausted"
+                        job.dead_lettered_at = job.dead_lettered_at or now.isoformat()
+                        stats["dead_lettered_exhausted"] += 1
+                    else:
+                        job.status = "pending"
+                        job.completed_at = None
+                        job.available_at = min(_parse_time(job.available_at), now).isoformat() if job.available_at else now.isoformat()
+                        stats["recovered_failed"] += 1
+                elif job.status == "pending" and job.attempts >= max_attempts:
+                    job.status = "dead_lettered"
+                    job.failure_class = job.failure_class or "attempts_exhausted"
+                    job.completed_at = job.completed_at or now.isoformat()
+                    job.dead_lettered_at = job.dead_lettered_at or now.isoformat()
+                    stats["dead_lettered_exhausted"] += 1
+        return stats
+
     def claim_next_job(self, worker_id: str, lease_seconds: int = 120, max_attempts: int = 3) -> Optional[IngestionJob]:
+        self.reconcile_ingestion_jobs(max_attempts=max_attempts)
         now = datetime.now(timezone.utc)
         with self._lock:
             for job in sorted(self._jobs.values(), key=lambda item: item.created_at or ""):
-                if job.status == "running" and _is_expired(job.lease_expires_at, now):
-                    if job.attempts >= max_attempts:
-                        job.status = "failed"
-                        job.error = "Worker lease expired and maximum attempts were exhausted"
-                        job.completed_at = now.isoformat()
-                        job.lease_owner = None
-                        job.lease_expires_at = None
-                        continue
-                    job.status = "pending"
-                    job.lease_owner = None
-                    job.lease_expires_at = None
                 if job.status != "pending" or job.attempts >= max_attempts:
                     continue
                 if job.available_at and _parse_time(job.available_at) > now:
@@ -211,6 +246,8 @@ class InMemoryRepo:
                 job.lease_owner = worker_id
                 job.heartbeat_at = now.isoformat()
                 job.lease_expires_at = (now + timedelta(seconds=lease_seconds)).isoformat()
+                job.failure_class = None
+                job.dead_lettered_at = None
                 return job
         return None
 

@@ -48,7 +48,7 @@ class ACLPolicy:
 class Source:
     source_id: str
     tenant_id: str
-    source_type: str  # local_fs, pdf, web, repo, s3
+    source_type: str  # local_fs, pdf, web, repo, s3, gdrive, notion, confluence
     name: str
     config: Dict[str, Any] = field(default_factory=dict)
     status: str = "active"  # active, paused, deleted
@@ -69,7 +69,7 @@ class IngestionJob:
     source_id: str
     source_type: str
     source_config: Dict[str, Any]
-    status: str = "pending"  # pending, running, completed, failed
+    status: str = "pending"  # pending, running, completed, failed, dead_lettered
     doc_count: int = 0
     chunk_count: int = 0
     error: Optional[str] = None
@@ -82,6 +82,8 @@ class IngestionJob:
     lease_owner: Optional[str] = None
     lease_expires_at: Optional[str] = None
     heartbeat_at: Optional[str] = None
+    failure_class: Optional[str] = None
+    dead_lettered_at: Optional[str] = None
 
 
 @dataclass

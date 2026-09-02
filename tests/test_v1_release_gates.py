@@ -55,7 +55,7 @@ class DurableInMemoryQueueTests(unittest.TestCase):
         self.assertEqual(reclaimed.attempts, 2)
         self.assertEqual(reclaimed.lease_owner, "worker-b")
 
-    def test_exhausted_expired_job_becomes_failed(self):
+    def test_exhausted_expired_job_becomes_dead_lettered(self):
         repo = InMemoryRepo()
         expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
         repo.add_job(
@@ -72,9 +72,11 @@ class DurableInMemoryQueueTests(unittest.TestCase):
             )
         )
         self.assertIsNone(repo.claim_next_job("worker-new", max_attempts=3))
-        failed = repo.get_job("job-exhausted")
-        self.assertEqual(failed.status, "failed")
-        self.assertIn("maximum attempts", failed.error)
+        dead = repo.get_job("job-exhausted")
+        self.assertEqual(dead.status, "dead_lettered")
+        self.assertEqual(dead.failure_class, "lease_exhausted")
+        self.assertIsNotNone(dead.dead_lettered_at)
+        self.assertIn("maximum attempts", dead.error)
 
 
 class ProductionIngestionModeTests(unittest.TestCase):

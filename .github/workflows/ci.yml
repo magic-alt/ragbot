@@ -107,12 +107,119 @@ jobs:
       - name: Run PostgreSQL integration tests
         env:
           POSTGRES_TEST_DSN: postgresql://ragbot:ragbot@127.0.0.1:5432/ragbot
-        run: python -m pytest -q tests/test_postgres_integration.py tests/test_postgres_control_plane.py
+        run: >-
+          python -m pytest -q
+          tests/test_postgres_integration.py
+          tests/test_postgres_control_plane.py
+          tests/test_postgres_reliability.py
 
       - name: Run CJK lexical retrieval benchmark
         env:
           POSTGRES_TEST_DSN: postgresql://ragbot:ragbot@127.0.0.1:5432/ragbot
         run: python -m eval.cjk_retrieval
+
+  recovery-smoke:
+    name: Backup + restore smoke
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ragbot
+          POSTGRES_PASSWORD: ragbot
+          POSTGRES_DB: ragbot
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U ragbot -d ragbot"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      qdrant:
+        image: qdrant/qdrant:v1.19.0
+        ports:
+          - 6333:6333
+
+    env:
+      POSTGRES_DSN: postgresql://ragbot:ragbot@127.0.0.1:55432/ragbot
+      QDRANT_URL: http://127.0.0.1:6333
+      QDRANT_COLLECTION: ragbot_recovery_smoke
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install recovery dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[postgres]"
+
+      - name: Wait for Qdrant
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS "$QDRANT_URL/readyz" >/dev/null; then exit 0; fi
+            sleep 1
+          done
+          echo "Qdrant did not become ready" >&2
+          exit 1
+
+      - name: Seed recoverable PostgreSQL and Qdrant state
+        run: |
+          python -m services.api.app.storage.migrations
+          python - <<'PY'
+          import os
+          from services.api.app.storage.managed_pg_repo import ManagedPostgresRepo
+          from services.api.app.storage.models import Source
+
+          repo = ManagedPostgresRepo(os.environ['POSTGRES_DSN'], pool_min=1, pool_max=2)
+          try:
+              repo.add_source(Source(
+                  source_id='recovery-source', tenant_id='recovery-tenant',
+                  source_type='local_fs', name='Recovery source',
+                  config={'path': '/data/recovery'}
+              ))
+          finally:
+              repo.close()
+          PY
+          curl -fsS -X PUT "$QDRANT_URL/collections/$QDRANT_COLLECTION" \
+            -H 'Content-Type: application/json' \
+            -d '{"vectors":{"size":4,"distance":"Cosine"}}' >/dev/null
+          curl -fsS -X PUT "$QDRANT_URL/collections/$QDRANT_COLLECTION/points?wait=true" \
+            -H 'Content-Type: application/json' \
+            -d '{"points":[{"id":1,"vector":[1.0,0.0,0.0,0.0],"payload":{"marker":"recovery-ok"}}]}' >/dev/null
+
+      - name: Backup PostgreSQL and Qdrant
+        run: bash scripts/backup_ragbot.sh "$RUNNER_TEMP/ragbot-backup"
+
+      - name: Destroy seeded state
+        run: |
+          psql "$POSTGRES_DSN" -v ON_ERROR_STOP=1 -c "DELETE FROM sources WHERE source_id='recovery-source'"
+          curl -fsS -X DELETE "$QDRANT_URL/collections/$QDRANT_COLLECTION" >/dev/null
+
+      - name: Restore PostgreSQL and Qdrant
+        run: bash scripts/restore_ragbot.sh "$RUNNER_TEMP/ragbot-backup"
+
+      - name: Verify restored state
+        run: |
+          count="$(psql "$POSTGRES_DSN" -Atc "SELECT COUNT(*) FROM sources WHERE source_id='recovery-source'")"
+          test "$count" = "1"
+          python - <<'PY'
+          import json, os, urllib.request
+          url = f"{os.environ['QDRANT_URL']}/collections/{os.environ['QDRANT_COLLECTION']}/points/1"
+          with urllib.request.urlopen(url, timeout=10) as response:
+              payload = json.load(response)
+          result = payload.get('result') or {}
+          assert (result.get('payload') or {}).get('marker') == 'recovery-ok', payload
+          print('PostgreSQL + Qdrant backup/restore verified')
+          PY
 
   node-client:
     name: Node client typecheck

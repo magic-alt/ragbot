@@ -97,6 +97,28 @@ def allowed_tenants(api_key: Optional[str]) -> Optional[frozenset[str]]:
     return principal.tenant_ids
 
 
+def require_role(api_key: Optional[str], *allowed_roles: str) -> Optional[ApiPrincipal]:
+    """Require one tenant-scoped capability role when principals are enabled.
+
+    ``admin=true`` bypasses tenant role checks. Development mode without
+    principal mappings remains backward compatible. ``owner`` is treated as a
+    tenant-level superset of operator capabilities.
+    """
+    principal = get_api_principal(api_key)
+    if principal is None or principal.admin:
+        return principal
+    wanted = {role.strip().lower() for role in allowed_roles if role.strip()}
+    actual = {role.strip().lower() for role in principal.roles}
+    if "owner" in actual or actual.intersection(wanted):
+        return principal
+    expected = ", ".join(sorted(wanted)) or "required role"
+    raise HTTPException(status_code=403, detail=f"API principal requires one of roles: {expected}")
+
+
+def require_operator(api_key: Optional[str]) -> Optional[ApiPrincipal]:
+    return require_role(api_key, "operator")
+
+
 def require_admin(api_key: Optional[str]) -> None:
     """Protect global operational endpoints when scoped principals are enabled."""
     principal = get_api_principal(api_key)

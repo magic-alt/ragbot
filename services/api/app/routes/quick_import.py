@@ -17,7 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from ..auth.principal import authorize_tenant
+from ..auth.principal import authorize_tenant, require_operator
 from ..storage.models import Source
 from .ingest import assert_source_ingestible, enqueue_ingestion_job, latest_active_ingestion_job
 from .sources import _validate_source_config, _validate_source_type
@@ -400,6 +400,7 @@ def create_quick_import_router(get_services: Callable, auth_dep: Any) -> APIRout
         _key: Optional[str] = Depends(auth_dep),
     ):
         authorize_tenant(_key, payload.tenant_id)
+        require_operator(_key)
         services = get_services()
         spec = QuickSourceSpec(**payload.model_dump(exclude={"tenant_id"}))
         return _run_quick_import(tenant_id=payload.tenant_id, spec=spec, services=services)
@@ -410,6 +411,7 @@ def create_quick_import_router(get_services: Callable, auth_dep: Any) -> APIRout
         _key: Optional[str] = Depends(auth_dep),
     ):
         authorize_tenant(_key, payload.tenant_id)
+        require_operator(_key)
         services = get_services()
         items = []
         failed = 0

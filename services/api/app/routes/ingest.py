@@ -17,7 +17,7 @@ from typing import Any, Callable, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from ..auth.principal import allowed_tenants, authorize_tenant
+from ..auth.principal import allowed_tenants, authorize_tenant, require_operator
 from ..storage.models import IngestionJob
 
 
@@ -30,6 +30,10 @@ class TriggerJobResponse(BaseModel):
     status: str
     job_id: str
     source_id: str
+
+
+class RequeueDeadLetterRequest(BaseModel):
+    use_current_source_config: bool = False
 
 
 def assert_source_ingestible(source) -> None:
@@ -113,6 +117,7 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if source.tenant_id != payload.tenant_id:
             raise HTTPException(403, "Tenant mismatch")
         authorize_tenant(_key, source.tenant_id)
+        require_operator(_key)
 
         job = enqueue_ingestion_job(source, services)
         return TriggerJobResponse(status="accepted", job_id=job.job_id, source_id=source.source_id)
@@ -148,8 +153,9 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if not old_job:
             raise HTTPException(404, f"Job not found: {job_id}")
         authorize_tenant(_key, old_job.tenant_id)
+        require_operator(_key)
         if old_job.status != "failed":
-            raise HTTPException(400, "Only failed jobs can be retried")
+            raise HTTPException(400, "Only failed jobs can be retried; use /requeue for dead-lettered jobs")
 
         source = services.repo.get_source(old_job.source_id)
         if not source or source.status == "deleted":
@@ -158,6 +164,40 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
 
         job = enqueue_ingestion_job(source, services)
         return {"status": "accepted", "job_id": job.job_id, "retried_from": job_id}
+
+    @router.post("/jobs/{job_id}/requeue", status_code=202)
+    async def requeue_dead_letter(
+        job_id: str,
+        payload: RequeueDeadLetterRequest,
+        _key: Optional[str] = Depends(auth_dep),
+    ):
+        services = get_services()
+        old_job = services.repo.get_job(job_id)
+        if not old_job:
+            raise HTTPException(404, f"Job not found: {job_id}")
+        authorize_tenant(_key, old_job.tenant_id)
+        require_operator(_key)
+        if old_job.status != "dead_lettered":
+            raise HTTPException(400, "Only dead-lettered jobs can be requeued")
+
+        source = services.repo.get_source(old_job.source_id)
+        if not source or source.status == "deleted":
+            raise HTTPException(404, f"Source not found: {old_job.source_id}")
+        assert_source_ingestible(source)
+        replay_source = source
+        if not payload.use_current_source_config:
+            replay_source = replace(
+                source,
+                source_type=old_job.source_type,
+                config=deepcopy(old_job.source_config or {}),
+            )
+        job = enqueue_ingestion_job(replay_source, services)
+        return {
+            "status": "accepted",
+            "job_id": job.job_id,
+            "requeued_from": job_id,
+            "config_mode": "current_source" if payload.use_current_source_config else "dead_letter_snapshot",
+        }
 
     return router
 
