@@ -176,6 +176,12 @@ def _upsert_source(repo, *, tenant_id: str, spec: QuickSourceSpec, source_type: 
 
 
 def _run_quick_import(*, tenant_id: str, spec: QuickSourceSpec, services) -> Dict[str, Any]:
+    if spec.idempotency_key and not spec.reuse_source:
+        raise HTTPException(
+            status_code=422,
+            detail="idempotency_key requires reuse_source=true so repeated requests keep the same source identity",
+        )
+
     source_type = spec.source_type or infer_source_type(spec.location)
     _validate_source_type(source_type)
     config = build_source_config(source_type, spec.location, spec.config)
