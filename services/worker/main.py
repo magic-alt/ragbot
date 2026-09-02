@@ -16,6 +16,7 @@ import signal
 import socket
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from services.api.app.factory import build_services_from_env
@@ -69,8 +70,8 @@ def main() -> int:
 
 
 def _execute_claimed_job(job, services, *, worker_id: str, lease_seconds: int) -> None:
-    source = services.repo.get_source(job.source_id)
-    if source is None or source.status != "active" or source.tenant_id != job.tenant_id:
+    current_source = services.repo.get_source(job.source_id)
+    if current_source is None or current_source.status != "active" or current_source.tenant_id != job.tenant_id:
         reason = "Source unavailable, inactive, or tenant-mismatched at execution time"
         services.repo.update_job(
             job.job_id,
@@ -82,6 +83,17 @@ def _execute_claimed_job(job, services, *, worker_id: str, lease_seconds: int) -
         )
         logger.error("Rejecting claimed job %s: %s", job.job_id, reason)
         return
+
+    # Connector configuration is part of the durable job contract. A Source may
+    # be edited while a job waits in the queue; executing the queued job against
+    # the mutable current config would make retries/non-immediate execution
+    # nondeterministic. Keep current Source metadata/ACL state, but execute the
+    # connector type/config snapshot captured when this job was submitted.
+    source = replace(
+        current_source,
+        source_type=job.source_type,
+        config=dict(job.source_config or {}),
+    )
 
     heartbeat_stop = threading.Event()
     heartbeat_thread = threading.Thread(
