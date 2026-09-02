@@ -64,8 +64,20 @@ spec:
               value: {{ .Values.worker.leaseSeconds | quote }}
             - name: RAGBOT_WORKER_MAX_ATTEMPTS
               value: {{ .Values.worker.maxAttempts | quote }}
+            - name: RAGBOT_WORKER_RETRY_BASE_SECONDS
+              value: {{ .Values.worker.retryBaseSeconds | quote }}
+            - name: RAGBOT_WORKER_RETRY_MAX_SECONDS
+              value: {{ .Values.worker.retryMaxSeconds | quote }}
+            - name: RAGBOT_RECONCILE_SECONDS
+              value: {{ .Values.worker.reconcileSeconds | quote }}
             - name: RAGBOT_SCHEDULER_SCAN_SECONDS
               value: {{ .Values.worker.schedulerScanSeconds | quote }}
+            - name: RAGBOT_PROVIDER_MAX_ATTEMPTS
+              value: {{ .Values.worker.providerMaxAttempts | quote }}
+            - name: RAGBOT_PROVIDER_BACKOFF_BASE_SECONDS
+              value: {{ .Values.worker.providerBackoffBaseSeconds | quote }}
+            - name: RAGBOT_PROVIDER_BACKOFF_MAX_SECONDS
+              value: {{ .Values.worker.providerBackoffMaxSeconds | quote }}
             - name: QDRANT_URL
               value: {{ .Values.qdrant.url | quote }}
             - name: QDRANT_COLLECTION
