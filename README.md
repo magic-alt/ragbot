@@ -9,7 +9,7 @@ Ragbot 是一个面向本地与企业知识库的 **Agentic RAG product/service*
 - **快速建库**：一个 `rag ingest ... --wait` 命令即可创建/复用 Source、提交任务并等待知识可用；也可用 manifest 批量导入。
 - **多源摄取**：PDF / Web / Git / local filesystem → chunk → dedup → embedding → PostgreSQL + Qdrant。
 - **可恢复摄取**：PostgreSQL durable queue、worker claim、lease、heartbeat、crash recovery、bounded retry。
-- **幂等与重复部署友好**：同 tenant/type/location 默认复用稳定 Source；pending/running Job 默认去重；支持显式 idempotency key。
+- **幂等与重复部署友好**：同 tenant/type/location 默认复用稳定 Source；同配置 active Job 做便利性去重；跨 replica/并发严格幂等使用 deterministic `idempotency_key`。
 - **混合检索**：Qdrant vector search + PostgreSQL FTS/CJK bigram + RRF，可选 cross-encoder rerank。
 - **Agentic RAG**：route → retrieve/sql/code/web → synthesize → verify → finalize，输出 citation。
 - **多租户与 ACL**：API-key principal 绑定 tenant/user/groups/roles，检索前置 ACL scope。
@@ -40,7 +40,8 @@ CLI / SDK / Other Agents / IDE / Applications
                               ▲
                               │ claim + lease + heartbeat
 ┌──────────────────── Ragbot Ingestion Worker ──────────────────┐
-│ PDF/Web/Git/local → chunk → dedup → shared Embedder           │
+│ Job connector snapshot → PDF/Web/Git/local → chunk → dedup   │
+│                         → shared Embedder                     │
 │                                  ├─ PostgreSQL metadata/FTS    │
 │                                  └─ Qdrant vectors             │
 └───────────────────────────────────────────────────────────────┘
@@ -51,6 +52,7 @@ CLI / SDK / Other Agents / IDE / Applications
 1. **摄取和查询使用同一 embedding contract。** 模型或向量维度变化必须重新索引；Ragbot 不会静默 truncate/zero-pad。
 2. **生产身份不能由请求自行扩大。** API key principal 决定可信 tenant/user/groups/roles。
 3. **生产摄取不依赖 API 进程生命周期。** production 禁止 inline ingestion，任务必须由 durable worker 执行。
+4. **排队 Job 的 connector 配置是 immutable snapshot。** Source 后续修改影响未来 Job，不会把已排队 Job 静默重定向到新的 path/ref/chunking 配置。
 
 ## 60 秒建立 RAG 数据库
 
@@ -159,10 +161,13 @@ curl -X POST http://localhost:8000/ingest/quick \
 默认行为：
 
 - Source ID 由 `tenant + source type + normalized location` 稳定派生；
-- 已存在 Source 默认复用，并同步本次提供的 config/name/tags；
-- 同一 Source 已有 `pending/running` Job 时默认返回该 Job，不重复排队；
-- `idempotency_key` 可让重复请求返回**完全相同的 Job**；
+- 已存在 Source 默认复用，并在可安全提交新 run 时同步本次提供的 config/name/tags；
+- 同一 Source 已有**相同 connector config** 的 `pending/running` Job 时默认返回该 Job；
+- 若 active Job 与新请求的 path/ref/chunking 等 connector config 不同，返回 `409`，不会把旧 Job 冒充为新请求；
+- `idempotency_key` 可让重复请求返回**完全相同的 Job**，适合多 API replica/并发自动化；
 - `idempotency_key` 要求稳定 Source identity，因此不能与 `reuse_source=false` 同时使用。
+
+普通 active-Job lookup 是便利性的 duplicate guard，不是分布式唯一性约束；需要 strict repeat-request semantics 时应显式提供 `idempotency_key`。
 
 ### 批量 Source
 
@@ -179,7 +184,7 @@ curl -X POST http://localhost:8000/ingest/batch \
   }'
 ```
 
-每个 Source 独立返回 submission 结果；某一项配置错误不会掩盖其他项状态。
+每个 Source 独立返回 submission 结果；某一项配置错误不会掩盖其他项状态。意外内部异常只记录在服务日志，HTTP item 返回通用错误，不暴露内部 exception 细节。
 
 ## Python 本地开发
 
@@ -258,7 +263,7 @@ RAGBOT_WORKER_MAX_ATTEMPTS=3
 python -m services.worker.main
 ```
 
-Job 和 lease 持久化于 PostgreSQL。API restart 不会丢失 pending Job；worker 崩溃后 lease 到期可被其他 worker reclaim。
+Job 和 lease 持久化于 PostgreSQL。API restart 不会丢失 pending Job；worker 崩溃后 lease 到期可被其他 worker reclaim。Job enqueue 时会复制 `source_type/source_config`，worker 按该 snapshot 执行 connector，因此 Source 后续改动不会改变已排队 Job 的 path/ref/chunking 目标。
 
 ## API
 
