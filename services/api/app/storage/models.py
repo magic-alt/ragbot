@@ -48,7 +48,7 @@ class ACLPolicy:
 class Source:
     source_id: str
     tenant_id: str
-    source_type: str  # local_fs, pdf, web, repo
+    source_type: str  # local_fs, pdf, web, repo, s3
     name: str
     config: Dict[str, Any] = field(default_factory=dict)
     status: str = "active"  # active, paused, deleted
@@ -56,6 +56,10 @@ class Source:
     tags: List[str] = field(default_factory=list)
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    sync_enabled: bool = False
+    sync_interval_seconds: Optional[int] = None
+    sync_next_at: Optional[str] = None
+    sync_last_enqueued_at: Optional[str] = None
 
 
 @dataclass
