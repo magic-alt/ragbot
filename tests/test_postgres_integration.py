@@ -10,13 +10,17 @@ import tempfile
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from services.api.app.retrieval.embedder import HashEmbedder
 from services.api.app.retrieval.pg_fts import fts_search
 from services.api.app.retrieval.qdrant import InMemoryQdrant
+from services.api.app.routes.quick_import import QuickSourceSpec, _run_quick_import
 from services.api.app.storage.migrations import apply_migrations
 from services.api.app.storage.models import ACLPolicy, IngestionJob, Source
 from services.api.app.storage.pg_repo import PostgresRepo
+from services.worker import main as worker_main
 from services.worker.pipeline import run_ingest_pipeline
 
 
@@ -194,3 +198,52 @@ class PostgresRepoIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(hits)
         self.assertIn("伺服驱动器", hits[0][0].text)
+
+    def test_quick_import_job_executes_original_postgres_config_snapshot(self):
+        repo = PostgresRepo(self.dsn, pool_min=1, pool_max=2)
+        self.addCleanup(repo.close)
+        suffix = uuid.uuid4().hex
+        tenant_id = f"tenant-quick-{suffix}"
+        services = SimpleNamespace(
+            repo=repo,
+            qdrant=InMemoryQdrant(dim=32),
+            embedder=HashEmbedder(dim=32),
+        )
+
+        with tempfile.TemporaryDirectory() as original_dir, tempfile.TemporaryDirectory() as replacement_dir:
+            with open(os.path.join(original_dir, "original.txt"), "w", encoding="utf-8") as handle:
+                handle.write("original durable snapshot knowledge " * 30)
+            with open(os.path.join(replacement_dir, "replacement.txt"), "w", encoding="utf-8") as handle:
+                handle.write("replacement mutable source knowledge " * 30)
+
+            spec = QuickSourceSpec(location=original_dir, source_type="local_fs")
+            with patch.dict(os.environ, {"RAGBOT_INGESTION_MODE": "worker"}, clear=False):
+                submission = _run_quick_import(tenant_id=tenant_id, spec=spec, services=services)
+
+            queued = repo.get_job(submission["job_id"])
+            self.assertIsNotNone(queued)
+            self.assertEqual(queued.status, "pending")
+            self.assertEqual(queued.source_config["path"], original_dir)
+
+            repo.update_source(submission["source_id"], config={"path": replacement_dir})
+            repo.update_job(
+                queued.job_id,
+                status="running",
+                attempts=1,
+                lease_owner="worker-snapshot",
+            )
+            claimed = repo.get_job(queued.job_id)
+            worker_main._execute_claimed_job(
+                claimed,
+                services,
+                worker_id="worker-snapshot",
+                lease_seconds=3,
+            )
+
+            finished = repo.get_job(queued.job_id)
+            self.assertEqual(finished.status, "completed", finished.error)
+            self.assertEqual(finished.doc_count, 1)
+            self.assertTrue(any(doc_id.endswith(":original.txt") for doc_id in finished.stats["doc_ids"]))
+            self.assertFalse(any(doc_id.endswith(":replacement.txt") for doc_id in finished.stats["doc_ids"]))
+            current_source = repo.get_source(submission["source_id"])
+            self.assertEqual(current_source.config["path"], replacement_dir)

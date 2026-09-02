@@ -25,6 +25,7 @@ from .observability.metrics import get_metrics_collector
 from .observability.tracing import setup_tracing
 from .routes.ingest import create_ingest_router
 from .routes.openai_compat import create_openai_compat_endpoint
+from .routes.quick_import import create_quick_import_router
 from .routes.search import create_search_endpoint
 from .routes.sources import create_sources_router
 from .runtime import validate_production_environment
@@ -86,6 +87,7 @@ app.include_router(create_search_endpoint(_get_services, verify_api_key))
 app.include_router(create_openai_compat_endpoint(_get_services, verify_api_key))
 app.include_router(create_sources_router(_get_services, verify_api_key))
 app.include_router(create_ingest_router(_get_services, verify_api_key))
+app.include_router(create_quick_import_router(_get_services, verify_api_key))
 
 
 class ConstraintsModel(BaseModel):
