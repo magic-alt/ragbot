@@ -111,7 +111,7 @@ def _execute_claimed_job(
     *,
     worker_id: str,
     lease_seconds: int,
-    max_attempts: int,
+    max_attempts: int = 3,
     retry_base_seconds: float = 5.0,
     retry_max_seconds: float = 300.0,
 ) -> None:
