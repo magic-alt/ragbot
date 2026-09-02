@@ -14,21 +14,30 @@ Do not hand-maintain a second OpenAPI schema. This guide explains product semant
 
 If `RAGBOT_API_KEYS` is non-empty, protected endpoints require `X-API-Key`.
 
-When `RAGBOT_API_KEY_PRINCIPALS` is configured, an API key maps to a trusted principal containing allowed tenant IDs, stable user ID, groups, roles and optional admin status. Application routes authorize the requested tenant against that mapping; `/search`, `/chat` and the OpenAI-compatible adapter derive ACL scope from the trusted principal rather than allowing request fields to expand access.
+When `RAGBOT_API_KEY_PRINCIPALS` is configured, an API key maps to a trusted principal containing allowed tenant IDs, stable user ID, groups, roles and optional admin status. Routes authorize the requested tenant against that mapping; `/search`, `/chat` and the OpenAI-compatible adapter derive ACL scope from the trusted principal rather than allowing request fields to expand access.
 
-Production startup requires principal coverage for configured API keys. Development mode can run without principals for local testing.
+Production startup requires principal coverage for configured API keys. `/admin/health` and `/admin/ready` remain probe endpoints. Global operational endpoints require an admin principal when scoped principals are enabled.
 
-`/admin/health` and `/admin/ready` are probe endpoints and do not require the application API key. Global operational endpoints such as metrics/cost/cache require an admin principal when scoped principals are enabled.
+## Source types
+
+Ingestible source types are:
+
+- `local_fs`
+- `pdf`
+- `web`
+- `repo`
+- `s3`
+- `gdrive`
+- `notion`
+- `confluence`
+
+SQL database querying is separate from ingestion and is configured through `POSTGRES_DSN`.
 
 ## Product ingestion API
 
-The recommended onboarding surface is Quick Import. The lower-level Source and Job APIs remain available when callers need explicit lifecycle orchestration.
-
 ### `POST /ingest/quick`
 
-Creates or reuses a Source and submits ingestion in one request.
-
-Example:
+Creates/reuses a Source and submits ingestion in one request.
 
 ```json
 {
@@ -41,17 +50,17 @@ Example:
 
 Fields:
 
-- `tenant_id`: required tenant.
-- `location`: required local path or remote URL.
-- `source_type`: optional `local_fs`, `pdf`, `web` or `repo`; inferred when omitted.
+- `tenant_id`: required.
+- `location`: local path, URL or connector product URI.
+- `source_type`: optional; inferred when possible.
 - `name`, `tags`, `acl_policy_id`: optional Source metadata.
-- `config`: optional connector configuration such as repository `ref` or chunking options.
+- `config`: connector configuration.
 - `reuse_source`: default `true`.
 - `sync_source_metadata`: default `true`.
 - `dedupe_active_job`: default `true`.
 - `idempotency_key`: optional explicit request idempotency key.
 
-Source type inference:
+Common inference:
 
 | location | inferred type |
 | --- | --- |
@@ -60,6 +69,10 @@ Source type inference:
 | other local path | `local_fs` |
 | HTTP(S) `*.pdf` | `pdf` |
 | GitHub/GitLab/Bitbucket or `*.git` URL | `repo` |
+| `s3://bucket/prefix` | `s3` |
+| `gdrive://folder-id` or Drive folder URL | `gdrive` |
+| `notion://page-id` or Notion page URL | `notion` |
+| `confluence://host/SPACE` or Atlassian space URL | `confluence` |
 | other HTTP(S) URL | `web` |
 
 Default Source identity is derived from:
@@ -68,11 +81,9 @@ Default Source identity is derived from:
 tenant_id + source_type + canonicalized location
 ```
 
-This allows deployment/bootstrap scripts to submit the same knowledge source repeatedly without creating an unbounded number of Source rows.
+If a same-config pending/running Job already exists, convenience dedupe can return it. If an active Job exists with a different connector config, the new request returns `409` rather than rewriting the Source and pretending the old Job represents the new request.
 
-If a matching Source already exists and no incompatible ingestion is active, Quick Import can reuse it and synchronize the connector config plus explicitly supplied name/tags/ACL metadata.
-
-If a pending/running Job already exists with the **same** connector configuration, the default convenience dedupe returns that Job. If an active Job exists with a **different** connector configuration, such as another Git `ref`, path or chunking configuration, the new request returns `409` instead of mutating the Source and pretending the old Job represents the new request.
+`idempotency_key` derives a deterministic Job ID and is the strict repeat-request mechanism across replicas. It requires `reuse_source=true`.
 
 Representative response:
 
@@ -80,7 +91,7 @@ Representative response:
 {
   "status": "accepted",
   "source_id": "...",
-  "source_type": "local_fs",
+  "source_type": "gdrive",
   "source_reused": false,
   "job_id": "...",
   "job_status": "pending",
@@ -88,186 +99,230 @@ Representative response:
 }
 ```
 
-Possible submission status values include:
+### SaaS credential contract
 
-- `accepted`: a Job was submitted.
-- `already_queued`: an active same-config Job was reused.
-- `idempotent_replay`: the exact Job associated with the explicit idempotency key already exists.
+Google Drive, Notion and Confluence never accept credential values as product configuration. Store only a reference:
 
-#### Strict idempotency
+```json
+{
+  "credential_ref": "env:RAGBOT_NOTION_TOKEN"
+}
+```
 
-`idempotency_key` derives a deterministic Job ID from stable Source identity + caller key. A replay is checked before Source metadata mutation and returns the exact existing Job even after completion.
+The API validates `env:VARIABLE` syntax without resolving it. The worker resolves the secret at execution time. This lets SaaS credentials exist only in worker pods/containers.
 
-`idempotency_key` requires `reuse_source=true`; the incompatible combination is rejected with `422` before persisting Source/Job state.
+For SaaS source types Ragbot rejects common inline secret fields including access/refresh tokens, API keys, passwords, private keys and client secrets.
 
-The ordinary active-Job lookup is a duplicate-prevention convenience, not a distributed uniqueness guarantee. If callers require strict repeat-request behavior across multiple API replicas or genuinely concurrent requests, they should provide an `idempotency_key`.
+Connector examples:
 
-### `POST /ingest/batch`
-
-Submits 1–100 Quick Import specifications under one tenant.
+Google Drive:
 
 ```json
 {
   "tenant_id": "engineering",
-  "sources": [
-    {"location": "/data/manuals"},
-    {"location": "https://example.com/guide.pdf"},
-    {
-      "location": "https://github.com/magic-alt/ragbot",
-      "config": {"ref": "main"}
-    }
-  ]
+  "location": "gdrive://1AbCdEfFolder",
+  "config": {
+    "credential_ref": "env:RAGBOT_DRIVE_CREDENTIALS_JSON",
+    "credential_type": "google_json"
+  }
 }
 ```
 
-Response contains `total`, `accepted`, `failed` and one result per input item. Expected request/config errors are isolated per item so callers can see which sources were accepted. Unexpected internal submission failures are logged server-side and returned as a generic error rather than exposing internal exception details.
+Notion:
 
-A `202` batch response does not imply every item succeeded; inspect `failed` and `items`. For large catalogs, send multiple bounded batches instead of bypassing the 100-source validation limit.
+```json
+{
+  "tenant_id": "engineering",
+  "location": "notion://0123456789abcdef0123456789abcdef",
+  "config": {
+    "credential_ref": "env:RAGBOT_NOTION_TOKEN"
+  }
+}
+```
+
+Confluence:
+
+```json
+{
+  "tenant_id": "engineering",
+  "location": "confluence://acme.atlassian.net/ENG",
+  "config": {
+    "credential_ref": "env:RAGBOT_CONFLUENCE_TOKEN",
+    "email": "ragbot@example.com",
+    "auth_type": "basic"
+  }
+}
+```
+
+Full connector semantics are documented in `docs/CLOUD_CONNECTORS.md`.
+
+### `POST /ingest/batch`
+
+Submits 1–100 Quick Import specifications under one tenant. Each item gets an independent result. A `202` batch response does not imply every item was accepted; inspect `failed` and `items`.
 
 ## Low-level Sources API
 
 ### `POST /sources`
 
-Creates a Source directly. Valid source/config pairs:
+Valid source/config contracts:
 
-| source_type | required config | purpose |
+| source_type | required config | notes |
 | --- | --- | --- |
-| `local_fs` | `path` | local mounted text/Markdown tree |
-| `pdf` | `path` | local or remote PDF path/URL |
+| `local_fs` | `path` | mounted text/Markdown tree |
+| `pdf` | `path` | local or remote PDF |
 | `web` | `url` | web content |
 | `repo` | `path` | repository path/URL; optional `ref` |
+| `s3` | `bucket` | optional `prefix`, endpoint/region options |
+| `gdrive` | `folder_id`, `credential_ref` | optional `credential_type=access_token|google_json` |
+| `notion` | `page_id`, `credential_ref` | optional recursive traversal/API version |
+| `confluence` | `base_url`, `space_key`, `credential_ref` | basic auth also requires `email`; bearer supported |
 
-Invalid or missing required config fails before a Source is persisted.
+Invalid/missing config is rejected before Source persistence.
 
 ### `GET /sources`
 
-Lists non-deleted sources. Optional `tenant_id` filter. Principal-enabled deployments restrict results to authorized tenant scope.
+Lists non-deleted sources within authorized tenant scope.
 
 ### `GET /sources/{source_id}`
 
-Gets one active/paused Source after tenant authorization.
+Returns one Source after tenant authorization. This low-level endpoint includes Source config, so use it only with appropriately authorized callers. Product catalog endpoints provide a safer redacted view for operator UIs.
 
 ### `PUT /sources/{source_id}`
 
-Updates name, config, status (`active` or `paused`), ACL policy or tags. Replacement config is validated against the existing source type.
+Updates name, connector config, status, ACL policy or tags. Replacement config is revalidated. A queued durable Job keeps the immutable `source_type/source_config` snapshot captured when it was submitted.
 
-A queued durable Job does **not** read mutable connector config at execution time. Its `source_type` and `source_config` are captured at submission and executed from that snapshot. Therefore changing a Source after a Job is queued affects future Jobs, not the connector configuration of the already queued Job.
+### `PUT /sources/{source_id}/sync`
 
-Current Source metadata/ACL state is still resolved at worker execution, so security-policy changes can apply to work that has not yet completed.
+Enables/disables periodic synchronization.
+
+```json
+{
+  "enabled": true,
+  "interval_seconds": 3600,
+  "run_immediately": false
+}
+```
+
+- minimum interval is 60 seconds;
+- due Sources enter the normal durable queue;
+- deterministic scheduled Job IDs plus atomic insert-if-absent make concurrent scheduler scans safe;
+- missed historical windows collapse to one current refresh instead of backfilling an ingestion storm;
+- active ingestion for the same Source delays scheduled refresh.
+
+For Drive/Notion/Confluence, a scheduled refresh is metadata-first: unchanged remote versions reuse prior chunks and skip content download/embedding.
 
 ### `DELETE /sources/{source_id}`
 
-Purges indexed Qdrant vectors and PostgreSQL/in-memory Documents/Chunks, then tombstones the Source. Cleanup occurs before the status transition so a cleanup failure leaves the Source retryable rather than silently searchable after deletion.
+Purges indexed Qdrant vectors and PostgreSQL Documents/Chunks, then tombstones the Source.
 
 ## Durable ingestion jobs
 
 ### `POST /ingest/jobs`
 
-Queues an ingestion run for an **active** Source. This is the lower-level alternative to `/ingest/quick`.
+Queues ingestion for an active Source. With PostgreSQL, the API persists a pending Job and an independent worker claims it with lease/heartbeat/recovery semantics. Production rejects inline ingestion.
 
-- paused Source → `409`
-- deleted/missing Source → `404`
-- tenant mismatch/unauthorized tenant → `403`
-
-With PostgreSQL, the API persists a `pending` Job and returns `202`; an independent worker owns execution. Workers claim jobs atomically with `FOR UPDATE SKIP LOCKED`, maintain lease/heartbeat state, reclaim expired leases after crashes and stop retrying after the configured maximum attempt count.
-
-At submission the Job records `source_type` and `source_config`. The worker reconstructs connector execution from this snapshot instead of silently switching to a later mutable Source config.
-
-Development/in-memory mode can execute inline for convenience. Production mode rejects inline ingestion.
+The Job records immutable connector config. Credential references may be present in that snapshot, but secret values are resolved only when a worker executes the Job.
 
 ### `GET /ingest/jobs`
 
-Lists Jobs with optional tenant/source filters and principal tenant isolation.
+Lists Jobs with optional tenant/source filters.
 
 ### `GET /ingest/jobs/{job_id}`
 
-Gets one Job after tenant authorization. Useful for CLI/UI progress polling.
+Gets one Job after tenant authorization. Low-level Job responses include `source_config`; product catalog endpoints deliberately remove it.
 
-Important fields include:
-
-- `status`: `pending`, `running`, `completed`, `failed`
-- `source_type`, `source_config`
-- `doc_count`, `chunk_count`
-- `error`
-- `attempts`
-- `started_at`, `completed_at`, `created_at`
-- `available_at`, `lease_owner`, `lease_expires_at`, `heartbeat_at`
-- `stats`
-
-Job stats include current document IDs/chunks, new writes, reused unchanged chunks and stale-data cleanup counts where applicable.
+Important fields include status, counts, error, attempts, timing/lease data and `stats` such as chunks written/reused/removed.
 
 ### `POST /ingest/jobs/{job_id}/retry`
 
-Creates a fresh Job for a failed ingestion if the Source still exists and is active. The retry captures the Source's current connector configuration as the new Job snapshot.
+Creates a fresh Job for a failed ingestion if the Source still exists and is active. The new Job snapshots the Source's current connector config.
+
+## Product control plane
+
+### `GET /catalog/overview`
+
+Tenant-scoped summary of Sources, indexed documents/chunks, queue state and schedules.
+
+### `GET /catalog/sources`
+
+Redacted Source Catalog. Supports tenant/status/source-type/search/limit filters. The response exposes a safe location such as `gdrive://...`, `notion://...` or `confluence://host/SPACE`, not full connector config or secret references.
+
+### `GET /catalog/jobs`
+
+Redacted ingestion progress/history. `source_config` is removed from product Job responses.
+
+### `GET /admin/overview`
+
+Global control-plane summary; admin principal required.
+
+### `GET /admin/queue/metrics`
+
+Admin queue/backlog metrics including pending/running/failed counts, oldest pending age, stale running leases, recent completion/failure activity and scheduled Source state.
+
+### `GET /admin/ui`
+
+Built-in zero-build operator UI. API key is kept in browser `sessionStorage`. Cloud Quick Import accepts a `credential_ref` and non-secret connector JSON; it explicitly warns operators not to paste token/private-key values.
+
+## Incremental cloud synchronization semantics
+
+The cloud connector result is still a complete replacement snapshot, so deletion/pruning semantics remain consistent with other Sources. The optimization happens before content download:
+
+1. enumerate remote metadata;
+2. compare `external_id + remote_version` against previous chunks;
+3. unchanged document -> return reusable chunks;
+4. changed/new document -> fetch content, chunk, embed and upsert;
+5. absent remote document -> previous chunks/doc are pruned after the new snapshot succeeds.
+
+Current remote version signals:
+
+- Google Drive: `modifiedTime + version + md5Checksum`;
+- Notion: page `last_edited_time`;
+- Confluence: page version number + last-updated time.
 
 ## Search
 
 ### `POST /search`
 
-Direct hybrid retrieval without running the Agent loop. Supports tenant/ACL scope plus source type, document ID, tag, path/URL prefix and time-range filters.
+Direct hybrid retrieval without the Agent loop. Supports tenant/ACL scope plus source type, document ID, tag, path/URL prefix and time-range filters.
 
-Production retrieval combines Qdrant vector search and PostgreSQL FTS/CJK lexical search, merges rankings with RRF and can optionally apply a cross-encoder reranker. Reranker provider failure falls back to RRF rather than making retrieval unavailable.
+Production retrieval combines Qdrant vector search and PostgreSQL FTS/CJK lexical search, RRF and optional reranking.
 
 ## Chat
 
 ### `POST /chat`
 
-Core Agentic RAG endpoint.
+Core Agentic RAG endpoint. Required: `query`, `tenant_id`, `user_id`; optional session/stream/constraints/client context.
 
-Required fields:
+Document retrieval `source_types` may include all ingestible source types listed above.
 
-- `query`
-- `tenant_id`
-- `user_id`
-
-Optional fields:
-
-- `session_id`
-- `stream` (default `false`)
-- `constraints`
-- `client_context`
-
-Supported document retrieval `source_types` are `pdf`, `web`, `repo`, `local_fs`. Database querying is a separate SQL tool configured by `POSTGRES_DSN`.
-
-### Streaming
-
-With `stream=true`, media type is `text/event-stream`. Events include:
-
-- `tool_call`
-- `tool_result`
-- `token`
-- `final`
-- `error`
-
-`final` contains the request ID, answer, citations, confidence and followups. Agent failures emit a sanitized `error` event and terminate the callback stream.
+With `stream=true`, SSE events include `tool_call`, `tool_result`, `token`, `final`, and `error`.
 
 ## OpenAI-compatible endpoint
 
 ### `POST /v1/chat/completions`
 
-Accepts an OpenAI-style messages payload and supports streaming. Tenant/user context can be supplied through the adapter's supported headers/fields and is checked against the trusted principal when principal mode is active.
+Accepts an OpenAI-style messages payload and supports streaming. Tenant/user context remains subject to trusted-principal authorization.
 
-Usage fields that are not backed by authoritative provider token accounting must remain clearly identified as estimates; Ragbot should not present character-count approximations as provider token truth.
-
-## Admin endpoints
+## Other admin endpoints
 
 - `GET /admin/health`: process liveness.
-- `GET /admin/ready`: repository/vector dependency readiness; returns 503 if dependencies are not ready.
-- `GET /admin/metrics`: aggregate request/retrieval/tool metrics.
-- `GET /admin/metrics/history`: recent request metric history.
-- `POST /admin/feedback`: positive/negative feedback for a known request.
-- `GET /admin/cost`: router cost tracker summary.
-- `GET /admin/cache`: retrieval/embedding cache status and statistics.
+- `GET /admin/ready`: storage/vector readiness.
+- `GET /admin/metrics`: aggregate quality/runtime metrics.
+- `GET /admin/metrics/history`: recent metric history.
+- `POST /admin/feedback`: feedback for a known request.
+- `GET /admin/cost`: model-router cost summary.
+- `GET /admin/cache`: retrieval/embedding cache statistics.
 
 ## Source security boundary
 
-Production connector policy is part of the API contract:
+Production connector policy is part of the contract:
 
-- Web/remote PDF/remote Git reject loopback, private, link-local and reserved destinations by default;
-- redirects are revalidated;
-- optional per-connector hostname allowlists can narrow egress;
-- local sources must be below `RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS`;
-- Web/PDF downloads have byte limits;
-- production remote Git uses HTTPS.
+- Web/remote PDF/remote Git block non-public destinations by default and revalidate redirects;
+- local sources must stay below `RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS`;
+- S3-compatible custom endpoints require explicit production host allowlisting;
+- Confluence production base URLs require `RAGBOT_CONFLUENCE_ALLOWED_HOSTS`;
+- private/self-hosted endpoints additionally require the explicit private-network opt-in when applicable;
+- remote downloads use hard byte limits;
+- SaaS secret values live in worker environment/secret stores, not Source config.
 
 Application validation is not a replacement for VPC/firewall/service-mesh egress policy.
