@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import io
 import sys
-from types import SimpleNamespace
+
+import pytest
 
 from services.api.app.routes.quick_import import (
     build_source_config,
     canonical_location,
     infer_source_type,
 )
-from services.worker.jobs.ingest_s3 import ingest_s3
+from services.worker.jobs.ingest_s3 import _validate_custom_endpoint, ingest_s3
 
 
 class _Body:
@@ -81,6 +81,7 @@ def test_s3_connector_lists_supported_objects_and_never_requires_config_secrets(
     monkeypatch.setitem(sys.modules, "boto3", fake)
     monkeypatch.setenv("MINIO_ACCESS_KEY_ID", "access")
     monkeypatch.setenv("MINIO_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.setenv("RAGBOT_S3_ALLOWED_HOSTS", "minio")
 
     chunks = list(
         ingest_s3(
@@ -113,3 +114,13 @@ def test_s3_connector_lists_supported_objects_and_never_requires_config_secrets(
     # Secret values are deployment environment data, never written into chunks.
     assert "access" not in str([chunk.metadata for chunk in chunks])
     assert "secret" not in str([chunk.metadata for chunk in chunks])
+
+
+def test_production_custom_s3_endpoint_requires_explicit_allowlist(monkeypatch):
+    monkeypatch.setenv("RAGBOT_ENV", "production")
+    monkeypatch.delenv("RAGBOT_S3_ALLOWED_HOSTS", raising=False)
+    with pytest.raises(ValueError, match="RAGBOT_S3_ALLOWED_HOSTS"):
+        _validate_custom_endpoint("http://minio.internal:9000")
+
+    monkeypatch.setenv("RAGBOT_S3_ALLOWED_HOSTS", "minio.internal")
+    assert _validate_custom_endpoint("http://minio.internal:9000") == "http://minio.internal:9000"
