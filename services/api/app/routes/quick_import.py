@@ -7,7 +7,7 @@ one idempotent call and provides a batch surface suitable for manifests.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import asdict
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -156,7 +156,11 @@ def _upsert_source(repo, *, tenant_id: str, spec: QuickSourceSpec, source_type: 
         return existing, True
 
     source = Source(
-        source_id=deterministic_source_id(tenant_id, source_type, spec.location),
+        source_id=(
+            deterministic_source_id(tenant_id, source_type, spec.location)
+            if spec.reuse_source
+            else uuid.uuid4().hex
+        ),
         tenant_id=tenant_id,
         source_type=source_type,
         name=spec.name or spec.location,
