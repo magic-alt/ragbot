@@ -162,6 +162,15 @@ jobs:
           --set qdrant.url=http://qdrant:6333
           >/dev/null
 
+      - name: Render KEDA queue autoscaling
+        run: |
+          helm template ragbot infra/helm/ragbot \
+            --set worker.enabled=true \
+            --set worker.autoscaling.enabled=true \
+            --set postgres.dsn=postgresql://ragbot:ragbot@postgres/ragbot \
+            --set qdrant.url=http://qdrant:6333 \
+            | grep -q 'kind: ScaledObject'
+
       - name: Reject production Helm without worker
         run: |
           if helm template ragbot infra/helm/ragbot \
