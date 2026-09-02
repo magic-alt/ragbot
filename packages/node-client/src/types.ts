@@ -28,7 +28,7 @@ export interface PatchResult {
   modified_lines: number;
 }
 
-export type SourceType = "pdf" | "web" | "repo" | "local_fs";
+export type SourceType = "pdf" | "web" | "repo" | "local_fs" | "s3";
 export type RouteType = "doc_rag" | "sql" | "code" | "mixed" | "web_fallback";
 export type Confidence = "high" | "medium" | "low";
 export type ToolName =
