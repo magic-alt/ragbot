@@ -68,6 +68,11 @@ services:
       dockerfile: infra/docker/Dockerfile
     image: ragbot:local
     command: ["python", "-m", "services.worker.main"]
+    # Arbitrary cloud/SaaS credentials are loaded only into the worker. Keep
+    # real values in an ignored local file and point RAGBOT_WORKER_ENV_FILE at
+    # it. The default points back to the repository's checked-in example file.
+    env_file:
+      - ${RAGBOT_WORKER_ENV_FILE:-../../.env.worker.example}
     environment:
       RAGBOT_ENV: ${RAGBOT_ENV:-development}
       RAGBOT_INGESTION_MODE: worker

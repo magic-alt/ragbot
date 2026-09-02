@@ -122,17 +122,23 @@ rag --server http://localhost:8000 \
   --wait
 ```
 
-Google Drive：
+Google Drive（Docker Compose）：
 
 ```bash
-# token 只存在于 worker 环境；CLI 只传 secret reference
-export RAGBOT_DRIVE_TOKEN='...'
+# credential 只进入 worker；真实 .env.worker 已被 gitignore
+cp .env.worker.example .env.worker
+# 编辑 .env.worker，例如：RAGBOT_DRIVE_TOKEN=...
+RAGBOT_WORKER_ENV_FILE="$PWD/.env.worker" docker compose up -d --build
+
+# CLI 只提交 secret reference，不传 token 值
 rag --server http://localhost:8000 \
   --tenant engineering \
   ingest gdrive://1AbCdEfFolder \
   --credential-ref env:RAGBOT_DRIVE_TOKEN \
   --wait
 ```
+
+如果直接在宿主机运行 `python -m services.worker.main`，则普通 `export RAGBOT_DRIVE_TOKEN=...` 即可；Compose 场景必须显式把 credential 注入 worker container。
 
 默认可自动判断 `local_fs` / `pdf` / `repo` / `web` / `s3` / `gdrive` / `notion` / `confluence`。云端连接、安全 credential reference 和增量同步详见 [`docs/CLOUD_CONNECTORS.md`](docs/CLOUD_CONNECTORS.md)。
 
@@ -229,7 +235,7 @@ Google Drive、Notion 与 Confluence 都使用 metadata-first incremental sync�
 }
 ```
 
-Ragbot API 只校验 reference，不解析真实 secret；worker 执行时才读取环境变量。生产 Kubernetes 推荐用 `worker.extraEnv` 或 `worker.extraEnvFrom` 从 Secret / ExternalSecret 注入这些变量，而不是把 secret 暴露给 API Pod。完整配置见 [`docs/CLOUD_CONNECTORS.md`](docs/CLOUD_CONNECTORS.md)。
+Ragbot API 只校验 reference，不解析真实 secret；worker 执行时才读取环境变量。Docker Compose 使用 `RAGBOT_WORKER_ENV_FILE` 把任意 connector credential 仅加载到 worker；Kubernetes 推荐用 `worker.extraEnv` 或 `worker.extraEnvFrom` 从 Secret / ExternalSecret 注入，同样不把 secret 暴露给 API Pod。完整配置见 [`docs/CLOUD_CONNECTORS.md`](docs/CLOUD_CONNECTORS.md)。
 
 ## Python 本地开发
 
@@ -326,7 +332,7 @@ HTTP contract 的 source of truth 是 FastAPI `/openapi.json`。详细说明见 
 
 ## 部署与运维
 
-- **Docker Compose**：API + worker + migration + PostgreSQL + Qdrant；可选 Ollama/Jaeger。
+- **Docker Compose**：API + worker + migration + PostgreSQL + Qdrant；`RAGBOT_WORKER_ENV_FILE` 支持 worker-only connector secrets；可选 Ollama/Jaeger。
 - **Helm**：API/worker Deployments、migration initContainer、readiness/liveness、Ingress、HPA、source mounts、worker-only connector secret injection；production render 强制 durable worker。
 - **KEDA**：可选基于 PostgreSQL durable queue backlog 的 worker autoscaling，而不是用 CPU 间接估计 backlog。
 - **Staging Smoke**：真实 provider credential + PostgreSQL + Qdrant；SaaS connector 使用独立可选 staging credentials。
@@ -349,7 +355,7 @@ python -m compileall -q contracts services cli eval
 python -m pytest -q
 ```
 
-GitHub Actions 覆盖 Python 3.10/3.12、PostgreSQL migrations/queue/FTS/CJK retrieval、SaaS incremental protocol regressions、Node SDK、Docker Compose、Helm、production/security regression 和 bundled example。正式 release 仍以 **exact release commit** 对应的 CI 与 staging evidence 为准。
+GitHub Actions 覆盖 Python 3.10/3.12、PostgreSQL migrations/queue/FTS/CJK retrieval、SaaS incremental protocol regressions、Node SDK、Docker Compose worker secret isolation、Helm、production/security regression 和 bundled example。正式 release 仍以 **exact release commit** 对应的 CI 与 staging evidence 为准。
 
 ## License
 
