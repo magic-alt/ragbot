@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..auth.principal import allowed_tenants, authorize_tenant, require_admin
 
@@ -96,6 +96,22 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
             "next_sync_at": overview["sources"]["next_sync_at"],
         }
 
+    @router.post("/admin/queue/reconcile")
+    async def admin_queue_reconcile(
+        max_attempts: int = Query(default=3, ge=1, le=100),
+        _key: Optional[str] = Depends(auth_dep),
+    ):
+        require_admin(_key)
+        reconcile = getattr(get_services().repo, "reconcile_ingestion_jobs", None)
+        if not callable(reconcile):
+            raise HTTPException(status_code=501, detail="Repository does not support queue reconciliation")
+        repaired = reconcile(max_attempts=max_attempts)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "max_attempts": max_attempts,
+            "repaired": repaired,
+        }
+
     return router
 
 
@@ -111,6 +127,7 @@ def build_overview(repo, tenant_scope: Optional[set[str] | frozenset[str]]) -> d
     pending = [job for job in jobs if job.status == "pending"]
     running = [job for job in jobs if job.status == "running"]
     failed = [job for job in jobs if job.status == "failed"]
+    dead_lettered = [job for job in jobs if job.status == "dead_lettered"]
     completed = [job for job in jobs if job.status == "completed"]
     scheduled = [source for source in sources if source.sync_enabled]
 
@@ -132,6 +149,10 @@ def build_overview(repo, tenant_scope: Optional[set[str] | frozenset[str]]) -> d
         1 for job in failed
         if job.completed_at and (now - _parse_time(job.completed_at)).total_seconds() <= 86400
     )
+    dead_lettered_24h = sum(
+        1 for job in dead_lettered
+        if job.dead_lettered_at and (now - _parse_time(job.dead_lettered_at)).total_seconds() <= 86400
+    )
 
     latest_completed_by_source = {}
     for job in sorted(completed, key=_job_sort_key, reverse=True):
@@ -143,6 +164,7 @@ def build_overview(repo, tenant_scope: Optional[set[str] | frozenset[str]]) -> d
     )
 
     next_syncs = [_parse_time(source.sync_next_at) for source in scheduled if source.sync_next_at]
+    failures = sorted([*failed, *dead_lettered], key=_job_sort_key, reverse=True)
     return {
         "generated_at": now.isoformat(),
         "sources": {
@@ -157,13 +179,15 @@ def build_overview(repo, tenant_scope: Optional[set[str] | frozenset[str]]) -> d
             "pending": len(pending),
             "running": len(running),
             "failed": len(failed),
+            "dead_lettered": len(dead_lettered),
             "oldest_pending_age_seconds": round(oldest_pending_age, 3),
             "stale_running_leases": stale_running,
             "completed_24h": completed_24h,
             "failed_24h": failed_24h,
+            "dead_lettered_24h": dead_lettered_24h,
         },
         "knowledge": {"documents": indexed_docs, "chunks": indexed_chunks},
-        "recent_failures": [_job_item(job) for job in sorted(failed, key=_job_sort_key, reverse=True)[:10]],
+        "recent_failures": [_job_item(job) for job in failures[:10]],
     }
 
 
@@ -219,7 +243,10 @@ def _source_catalog_item(source, latest, jobs) -> dict[str, Any]:
 def _job_item(job) -> dict[str, Any]:
     data = asdict(job)
     data.pop("source_config", None)
-    for key in ("created_at", "started_at", "completed_at", "available_at", "lease_expires_at", "heartbeat_at"):
+    for key in (
+        "created_at", "started_at", "completed_at", "available_at", "lease_expires_at",
+        "heartbeat_at", "dead_lettered_at",
+    ):
         data[key] = _iso(data.get(key))
     return data
 
