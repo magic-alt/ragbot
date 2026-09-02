@@ -37,7 +37,8 @@ All notable project changes intended for release are recorded here. Ragbot still
 ### Changed
 
 - the default onboarding workflow is now Quick Import/CLI instead of requiring callers to manually orchestrate Source creation followed by Job creation;
-- repeated product bootstrap calls reuse an existing Source and pending/running Job by default;
+- repeated product bootstrap calls reuse an existing Source and same-config pending/running Job by default;
+- durable ingestion Jobs execute the connector `source_type/source_config` snapshot captured at enqueue time, rather than silently switching to a later mutable Source config;
 - local CLI ingestion explicitly uses the configured shared embedder, preserving the same embedding contract as retrieval;
 - FastAPI `/openapi.json` is the canonical HTTP API schema instead of a separately maintained static OpenAPI file;
 - ingestion/query paths share one embedding contract and reject incompatible vector dimensions;
@@ -55,6 +56,9 @@ All notable project changes intended for release are recorded here. Ragbot still
 ### Fixed
 
 - strict quick-import idempotency can no longer be combined with non-reusable Source identity;
+- Quick Import no longer mutates/reuses an active Source Job when the newly requested connector configuration differs;
+- batch Quick Import no longer returns raw unexpected exception text to clients;
+- queued durable Jobs are no longer redirected by Source config edits made after submission;
 - hybrid RRF modality crowd-out that could suppress an exact lexical candidate behind the vector candidate window;
 - invalid single-marker identity assumptions in the deterministic 1000-PDF hash-embedding benchmark;
 - stable deterministic hash embeddings for development/testing;
