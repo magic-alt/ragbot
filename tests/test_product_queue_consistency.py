@@ -28,17 +28,24 @@ def test_enqueue_copies_connector_config_snapshot():
         source_id="source-1",
         tenant_id="t1",
         source_type="repo",
-        config={"path": "https://example.com/repo.git", "ref": "main"},
+        name="repo",
+        config={
+            "path": "https://example.com/repo.git",
+            "ref": "main",
+            "options": {"depth": 1},
+        },
         status="active",
     )
     services.repo.add_source(source)
 
     job = enqueue_ingestion_job(source, services, job_id="job-snapshot")
     source.config["ref"] = "release"
+    source.config["options"]["depth"] = 99
 
     persisted = services.repo.get_job(job.job_id)
     assert persisted is not None
     assert persisted.source_config["ref"] == "main"
+    assert persisted.source_config["options"]["depth"] == 1
     assert services.repo.get_source(source.source_id).config["ref"] == "release"
 
 
