@@ -82,7 +82,7 @@ def test_quick_import_idempotency_key_replays_exact_job():
     assert len(services.repo.list_jobs(tenant_id="t1")) == 1
 
 
-def test_quick_import_syncs_metadata_for_reused_source():
+def test_quick_import_syncs_metadata_for_reused_source_after_active_job_finishes():
     services = _services()
     first = QuickSourceSpec(
         location="https://example.com/team/repo.git",
@@ -100,10 +100,14 @@ def test_quick_import_syncs_metadata_for_reused_source():
     )
 
     one = _run_quick_import(tenant_id="t1", spec=first, services=services)
+    services.repo.update_job(one["job_id"], status="completed")
+
     two = _run_quick_import(tenant_id="t1", spec=second, services=services)
     source = services.repo.get_source(one["source_id"])
 
     assert two["source_reused"] is True
+    assert two["job_reused"] is False
+    assert two["job_id"] != one["job_id"]
     assert source is not None
     assert source.name == "Team repo v2"
     assert source.tags == ["v2"]
