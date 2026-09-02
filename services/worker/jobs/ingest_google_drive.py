@@ -19,6 +19,7 @@ from services.worker.connectors.credentials import resolve_json_secret, resolve_
 from services.worker.connectors.incremental import previous_by_external_id, reusable_chunks, stable_document_id
 from services.worker.dedup.hashing import content_hash
 from services.worker.jobs.ingest_text import _extract_section, _split_text
+from services.worker.reliability import provider_request
 
 logger = logging.getLogger(__name__)
 _DRIVE_API = "https://www.googleapis.com/drive/v3"
@@ -121,7 +122,9 @@ def _list_folder_files(client: requests.Session, root_folder_id: str, *, recursi
             }
             if page_token:
                 params["pageToken"] = page_token
-            response = client.get(f"{_DRIVE_API}/files", params=params, timeout=30)
+            response = provider_request(
+                client, "get", f"{_DRIVE_API}/files", params=params, timeout=30
+            )
             response.raise_for_status()
             payload = response.json()
             for item in payload.get("files", []):
@@ -138,7 +141,9 @@ def _list_folder_files(client: requests.Session, root_folder_id: str, *, recursi
 def _download_text(client: requests.Session, file_id: str, name: str, mime: str, max_bytes: int) -> str:
     export_mime = _GOOGLE_EXPORTS.get(mime)
     if export_mime:
-        response = client.get(
+        response = provider_request(
+            client,
+            "get",
             f"{_DRIVE_API}/files/{file_id}/export",
             params={"mimeType": export_mime},
             stream=True,
@@ -154,7 +159,9 @@ def _download_text(client: requests.Session, file_id: str, name: str, mime: str,
     if mime != "application/pdf" and not mime.startswith("text/") and suffix not in _TEXT_SUFFIXES:
         logger.info("Skipping unsupported Drive file: %s mime=%s", name, mime)
         return ""
-    response = client.get(
+    response = provider_request(
+        client,
+        "get",
         f"{_DRIVE_API}/files/{file_id}",
         params={"alt": "media", "supportsAllDrives": "true"},
         stream=True,
