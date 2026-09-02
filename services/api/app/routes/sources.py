@@ -12,7 +12,7 @@ from services.worker.connectors.credentials import validate_secret_ref
 from services.worker.pipeline import purge_source_knowledge
 from services.worker.scheduler import configure_source_sync
 
-from ..auth.principal import allowed_tenants, authorize_tenant
+from ..auth.principal import allowed_tenants, authorize_tenant, require_operator
 from ..storage.models import Source
 
 
@@ -137,6 +137,7 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         _validate_source_type(payload.source_type)
         _validate_source_config(payload.source_type, payload.config)
         authorize_tenant(_key, payload.tenant_id)
+        require_operator(_key)
         services = get_services()
         now = datetime.now(timezone.utc).isoformat()
         source = Source(
@@ -189,6 +190,7 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if not source or source.status == "deleted":
             raise HTTPException(404, "Source not found")
         authorize_tenant(_key, source.tenant_id)
+        require_operator(_key)
         if payload.config is not None:
             _validate_source_config(source.source_type, payload.config)
         updates = {
@@ -211,6 +213,7 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if not source or source.status == "deleted":
             raise HTTPException(404, "Source not found")
         authorize_tenant(_key, source.tenant_id)
+        require_operator(_key)
         if payload.enabled and payload.interval_seconds is None:
             raise HTTPException(status_code=422, detail="enabled sync requires interval_seconds")
         try:
@@ -232,6 +235,7 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if not source or source.status == "deleted":
             raise HTTPException(404, "Source not found")
         authorize_tenant(_key, source.tenant_id)
+        require_operator(_key)
         purge_source_knowledge(source, services.repo, services.qdrant)
         if not services.repo.delete_source(source_id):
             raise HTTPException(404, "Source not found")
