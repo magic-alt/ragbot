@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ..auth.principal import allowed_tenants, authorize_tenant, require_admin
+from ..auth.principal import allowed_tenants, authorize_tenant, get_api_principal, require_admin
 
 
 def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRouter:
@@ -79,6 +79,28 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
             jobs = [job for job in jobs if job.status == status]
         jobs.sort(key=_job_sort_key, reverse=True)
         return {"total": len(jobs), "jobs": [_job_item(job) for job in jobs[:limit]]}
+
+    @router.get("/catalog/session")
+    async def catalog_session(_key: Optional[str] = Depends(auth_dep)):
+        """Return non-secret capability metadata for the current API principal."""
+        principal = get_api_principal(_key)
+        if principal is None:
+            return {
+                "principal_mode": "development",
+                "admin": True,
+                "roles": ["owner"],
+                "tenant_ids": [],
+                "capabilities": {"read": True, "operate": True, "admin": True},
+            }
+        roles = sorted({role.strip().lower() for role in principal.roles if role.strip()})
+        operate = principal.admin or "owner" in roles or "operator" in roles
+        return {
+            "principal_mode": "scoped",
+            "admin": principal.admin,
+            "roles": roles,
+            "tenant_ids": sorted(principal.tenant_ids),
+            "capabilities": {"read": True, "operate": operate, "admin": principal.admin},
+        }
 
     @router.get("/admin/overview")
     async def admin_overview(_key: Optional[str] = Depends(auth_dep)):
