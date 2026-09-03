@@ -28,6 +28,7 @@ data/
 logs/
 tmp/
 tmpclaude*
+reports/
 
 # IDE / OS
 .vscode/
