@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
+from pathlib import Path
 from typing import Iterable, Optional
 
 from ..connectors.pdf import fetch_pdf
@@ -26,7 +28,18 @@ def ingest_pdf(
 ) -> Iterable[Chunk]:
     """Extract text from a PDF and yield Chunk objects."""
     logger.info("Ingesting PDF: %s (doc_id=%s)", path, doc_id)
-    text = fetch_pdf(path)
+    try:
+        text = fetch_pdf(path)
+    except ValueError as exc:
+        if "Local source is outside RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS" not in str(exc):
+            raise
+        requested = str(path)
+        resolved = str(Path(requested).expanduser().resolve())
+        allowed = os.getenv("RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS", "")
+        raise ValueError(
+            "PDF local path rejected: "
+            f"requested={requested!r}, resolved={resolved!r}, allowed_roots={allowed!r}; {exc}"
+        ) from exc
     if not text or text == path:
         logger.warning("No text extracted from PDF: %s", path)
         return

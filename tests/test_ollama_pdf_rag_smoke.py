@@ -75,7 +75,7 @@ def test_embedding_probe_auto_detects_8b_dimension_and_collection(tmp_path: Path
     args = _args(tmp_path)
     fake = {"data": [{"index": 0, "embedding": [0.0] * 4096}]}
 
-    with patch.object(mod, "_request_json", return_value=fake):
+    with patch.object(mod._impl, "_request_json", return_value=fake):
         actual = mod._probe_embedding(args)
 
     assert actual == 4096
@@ -88,7 +88,7 @@ def test_embedding_probe_rejects_explicit_dimension_mismatch(tmp_path: Path) -> 
     args.embedding_dim = 1024
     fake = {"data": [{"index": 0, "embedding": [0.0] * 4096}]}
 
-    with patch.object(mod, "_request_json", return_value=fake):
+    with patch.object(mod._impl, "_request_json", return_value=fake):
         with pytest.raises(mod.UserError, match="dimension mismatch"):
             mod._probe_embedding(args)
 
@@ -98,7 +98,7 @@ def test_explicit_collection_is_preserved_after_auto_dimension(tmp_path: Path) -
     args.collection = "my_qdrant_collection"
     fake = {"data": [{"index": 0, "embedding": [0.0] * 4096}]}
 
-    with patch.object(mod, "_request_json", return_value=fake):
+    with patch.object(mod._impl, "_request_json", return_value=fake):
         mod._probe_embedding(args)
 
     assert args.embedding_dim == 4096
@@ -120,6 +120,19 @@ def test_compose_env_uses_resolved_ollama_embedding_contract(tmp_path: Path) -> 
     assert env["QDRANT_DIM"] == "4096"
     assert env["QDRANT_COLLECTION"] == "rag_chunks_smoke_qwen3_embedding_8b_4096"
     assert env["RAGBOT_DATA_DIR"] == str(args.data_dir.resolve())
+    assert env["RAGBOT_INGESTION_MODE"] == "worker"
+    assert env["RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS"] == "/data"
+
+
+def test_runtime_contract_checks_durable_mode_and_real_pdf_paths() -> None:
+    code = mod._runtime_contract_code("api")
+
+    assert "RAGBOT_INGESTION_MODE" in code
+    assert "POSTGRES_DSN" in code
+    assert "RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS" in code
+    assert "_use_durable_worker() is True" in code
+    assert "validate_local_source_path" in code
+    assert 'Path("/data")' in code
 
 
 def test_compose_env_rejects_unresolved_dimension(tmp_path: Path) -> None:
@@ -139,7 +152,7 @@ def test_search_requires_real_semantic_results(tmp_path: Path) -> None:
         },
     }
 
-    with patch.object(mod, "_request_json", return_value=response):
+    with patch.object(mod._impl, "_request_json", return_value=response):
         result = mod._search(args)
 
     assert result["chunks"][0]["chunk_id"] == "c1"
@@ -155,13 +168,14 @@ def test_search_rejects_hash_fallback(tmp_path: Path) -> None:
         },
     }
 
-    with patch.object(mod, "_request_json", return_value=response):
+    with patch.object(mod._impl, "_request_json", return_value=response):
         with pytest.raises(mod.UserError, match="not using semantic embeddings"):
             mod._search(args)
 
 
 def test_manifest_written_with_selected_tenant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mod, "TMP_DIR", tmp_path)
+    monkeypatch.setattr(mod._impl, "TMP_DIR", tmp_path)
     path = mod._write_manifest(
         [
             {

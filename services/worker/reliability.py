@@ -130,6 +130,8 @@ def classify_persisted_failure(message: Optional[str]) -> FailureClassification:
         "unsupported source_type",
         "credential reference environment variable is not set",
         "api principal requires",
+        "outside ragbot_allowed_local_source_roots",
+        "pdf local path rejected:",
     )
     if any(marker in lower for marker in permanent_markers):
         return FailureClassification("configuration_error", False)
