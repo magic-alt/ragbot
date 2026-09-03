@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -77,6 +78,19 @@ def test_wait_job_reports_dead_letter_and_stale_worker_hint() -> None:
     assert "attempts=1" in message
     assert "failure_class='configuration_error'" in message
     assert '"path": "/data/sample.pdf"' in message
+
+
+def test_competing_macos_host_worker_is_rejected() -> None:
+    fake_ps = SimpleNamespace(
+        returncode=0,
+        stdout="4242 python -m services.worker.main\n",
+    )
+
+    with patch.object(mod.sys, "platform", "darwin"), patch.object(
+        mod.subprocess, "run", return_value=fake_ps
+    ):
+        with pytest.raises(mod.UserError, match="Competing host Ragbot worker detected"):
+            mod._assert_no_competing_host_worker()
 
 
 def test_local_path_policy_failure_is_permanent_configuration_error() -> None:
