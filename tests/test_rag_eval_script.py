@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 
@@ -8,6 +9,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "rag_eval.py"
 SPEC = importlib.util.spec_from_file_location("rag_eval_script", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 rag_eval = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = rag_eval
 SPEC.loader.exec_module(rag_eval)
 
 
