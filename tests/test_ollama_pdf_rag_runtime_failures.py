@@ -28,6 +28,7 @@ def _job(status: str, **overrides):
         "doc_count": 0,
         "chunk_count": 0,
         "attempts": 1,
+        "lease_owner": None,
         "failure_class": None,
         "source_type": "pdf",
         "source_config": {"path": "/data/sample.pdf"},
@@ -80,17 +81,79 @@ def test_wait_job_reports_dead_letter_and_stale_worker_hint() -> None:
     assert '"path": "/data/sample.pdf"' in message
 
 
+def test_running_job_requires_durable_claim_metadata() -> None:
+    job = _job("running", attempts=0, lease_owner=None)
+    message = mod._claim_invariant_error(job)
+    assert message is not None
+    assert "attempts>=1" in message
+    assert "inline execution or a stale/legacy executor" in message
+
+
+def test_running_job_rejects_foreign_worker_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mod, "_EXPECTED_WORKER_ID", "smoke-worker")
+    job = _job("running", attempts=1, lease_owner="other-worker")
+    message = mod._claim_invariant_error(job)
+    assert message is not None
+    assert "Foreign worker claimed" in message
+    assert "other-worker" in message
+
+
+def test_running_job_accepts_expected_worker_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mod, "_EXPECTED_WORKER_ID", "smoke-worker")
+    job = _job("running", attempts=1, lease_owner="smoke-worker")
+    assert mod._claim_invariant_error(job) is None
+
+
 def test_competing_macos_host_worker_is_rejected() -> None:
     fake_ps = SimpleNamespace(
         returncode=0,
         stdout="4242 python -m services.worker.main\n",
     )
+    fake_lsof = SimpleNamespace(returncode=1, stdout="")
 
     with patch.object(mod.sys, "platform", "darwin"), patch.object(
-        mod.subprocess, "run", return_value=fake_ps
+        mod.subprocess, "run", side_effect=[fake_ps, fake_lsof]
     ):
-        with pytest.raises(mod.UserError, match="Competing host Ragbot worker detected"):
+        with pytest.raises(mod.UserError, match="Competing host Ragbot/PostgreSQL Python process detected"):
             mod._assert_no_competing_host_worker()
+
+
+def test_macos_python_postgres_client_is_rejected_even_without_worker_command() -> None:
+    fake_ps = SimpleNamespace(returncode=0, stdout="")
+    fake_lsof = SimpleNamespace(
+        returncode=0,
+        stdout=(
+            "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+            "Python 5151 user 10u IPv4 0t0 TCP 127.0.0.1:60000->127.0.0.1:5432 (ESTABLISHED)\n"
+        ),
+    )
+
+    with patch.object(mod.sys, "platform", "darwin"), patch.object(
+        mod.subprocess, "run", side_effect=[fake_ps, fake_lsof]
+    ):
+        with pytest.raises(mod.UserError, match="Competing host Ragbot/PostgreSQL Python process detected"):
+            mod._assert_no_competing_host_worker()
+
+
+def test_compose_env_assigns_unique_smoke_worker_id(tmp_path: Path) -> None:
+    args = SimpleNamespace(
+        model="qwen3.8:27b-mlx",
+        ollama_timeout=300.0,
+        reasoning_effort="none",
+        docker_ollama_url="http://host.docker.internal:11434",
+        embedding_model="qwen3-embedding:8b",
+        embedding_dim=4096,
+        collection="rag_chunks_smoke_qwen3_embedding_8b_4096",
+        data_dir=tmp_path,
+        port=8000,
+    )
+
+    env = mod._compose_env(args)
+
+    assert env["RAGBOT_INGESTION_MODE"] == "worker"
+    assert env["RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS"] == "/data"
+    assert env["RAGBOT_WORKER_ID"].startswith("ollama-pdf-smoke-")
+    assert mod._EXPECTED_WORKER_ID == env["RAGBOT_WORKER_ID"]
 
 
 def test_local_path_policy_failure_is_permanent_configuration_error() -> None:
