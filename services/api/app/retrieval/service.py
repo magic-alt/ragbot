@@ -39,15 +39,19 @@ class Retriever:
             and self._reranker.enabled
         )
         warnings: List[str] = []
+        fusion_mode = "balanced-hybrid"
         if not semantic:
+            fusion_mode = "lexical-first-development"
             warnings.append(
                 "HashEmbedder is a development fallback, not a semantic embedding model. "
-                "Configure EMBEDDING_MODEL + EMBEDDING_API_KEY and re-ingest before judging semantic quality."
+                "Local English search is therefore lexical-first. Configure EMBEDDING_MODEL + "
+                "EMBEDDING_API_KEY and re-ingest before judging semantic quality."
             )
             if query and contains_cjk(query):
                 warnings.append(
                     "The current CJK query is not meaningfully represented by HashEmbedder; "
-                    "cross-lingual Chinese-to-English retrieval requires a multilingual semantic embedding model."
+                    "the invalid hash-vector branch is disabled for this query. Cross-lingual "
+                    "Chinese-to-English retrieval requires a multilingual semantic embedding model."
                 )
         return {
             "embedding_backend": type(embedder).__name__,
@@ -58,13 +62,24 @@ class Retriever:
             "repository": type(self._repo).__name__,
             "reranker": type(self._reranker).__name__ if self._reranker is not None else None,
             "reranker_enabled": reranker_enabled,
+            "fusion_mode": fusion_mode,
             "warnings": warnings,
         }
 
     def retrieve(self, query: str, filters: Dict[str, Any], top_k: int = 20) -> List[RetrievalChunk]:
         embedder = self._embedder or HashEmbedder(dim=self._qdrant.dim)
-        query_vector = embedder.embed(query)
-        qdrant_hits = self._qdrant.search(query_vector, filters, top_k * 2)
+        is_hash_fallback = isinstance(embedder, HashEmbedder)
+        cjk_query = contains_cjk(query)
+
+        # HashEmbedder tokenizes only ASCII identifiers. A pure/mostly CJK query
+        # therefore becomes a zero vector and Qdrant returns arbitrary ties. Do
+        # not surface those misleading candidates; CJK lexical retrieval can
+        # still work when the indexed corpus itself contains CJK text.
+        if is_hash_fallback and cjk_query:
+            qdrant_hits = []
+        else:
+            query_vector = embedder.embed(query)
+            qdrant_hits = self._qdrant.search(query_vector, filters, top_k * 2)
         fts_hits = fts_search(self._repo, query, filters, top_k * 2)
 
         # Qdrant point IDs are storage UUIDs; ranking/fusion operates on Ragbot's
@@ -85,7 +100,18 @@ class Retriever:
             fts_ranked.append((chunk.chunk_id, score))
             lexical_trace[chunk.chunk_id] = {"rank": rank, "score": float(score)}
 
-        fused = rrf_fuse(qdrant_ranked, fts_ranked)
+        # A deterministic hash vector is useful for tests but should not receive
+        # equal authority with real lexical matches in development. With a real
+        # embedding backend, preserve the calibrated 50/50 hybrid default.
+        if is_hash_fallback:
+            fused = rrf_fuse(
+                qdrant_ranked,
+                fts_ranked,
+                weight_primary=0.2,
+                weight_secondary=0.8,
+            )
+        else:
+            fused = rrf_fuse(qdrant_ranked, fts_ranked)
         rrf_scores = {chunk_id: float(score) for chunk_id, score in fused}
         rerank_scores: Dict[str, float] = {}
 
@@ -121,6 +147,7 @@ class Retriever:
                 "lexical": lexical_trace.get(chunk_id),
                 "rerank_score": rerank_scores.get(chunk_id),
                 "embedding_model": embedder.model_name,
+                "fusion_mode": "lexical-first-development" if is_hash_fallback else "balanced-hybrid",
             }
             chunk = self._repo.get_chunk(chunk_id)
             if not chunk:
