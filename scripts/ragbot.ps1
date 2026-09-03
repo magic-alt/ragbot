@@ -1,8 +1,3 @@
-param(
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$RemainingArgs
-)
-
 $ErrorActionPreference = "Stop"
 $scriptPath = Join-Path $PSScriptRoot "ragbot.py"
 $python = Get-Command python -ErrorAction SilentlyContinue
@@ -12,5 +7,5 @@ if (-not $python) {
     exit 1
 }
 
-& $python.Source $scriptPath @RemainingArgs
+& $python.Source $scriptPath @args
 exit $LASTEXITCODE
