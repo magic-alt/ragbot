@@ -1,244 +1,289 @@
 # Ragbot Quickstart: from files to a queryable RAG database
 
-This guide focuses on the shortest product path: start Ragbot, verify that its dependencies are healthy, ingest one or many knowledge sources, wait until indexing is complete, and query the resulting knowledge base.
+This guide focuses on the shortest product path: bootstrap Ragbot, verify readiness, ingest knowledge, and query it. For the full Windows/Linux/macOS operations guide, see [`CLI_DEPLOYMENT.md`](CLI_DEPLOYMENT.md).
 
-## 1. Start the service
+## 1. One-command bootstrap
 
-```bash
-cp .env.example .env
-mkdir -p data
-# Put local documents below ./data and configure LLM/embedding credentials in .env.
-docker compose up -d --build
-```
-
-The default Compose topology starts:
-
-- Ragbot API;
-- independent durable ingestion worker;
-- PostgreSQL and migrations;
-- Qdrant.
-
-Local sources below host `./data` are visible to the API and worker as `/data`.
-
-## 2. Verify deployment readiness
-
-After installing the package/CLI:
+Requires Python 3.10+:
 
 ```bash
-python -m pip install -e ".[postgres,qdrant,worker]"
-rag --server http://localhost:8000 doctor
+python scripts/ragbot.py up --mode auto
 ```
 
-Expected result:
+`auto` chooses the full Docker Compose stack when Docker Compose and a healthy Docker daemon are available. Otherwise it falls back to the no-Docker Python development mode.
+
+Explicit modes:
+
+```bash
+python scripts/ragbot.py up --mode local
+python scripts/ragbot.py up --mode docker
+```
+
+The helper:
+
+- creates `.env` from `.env.example` when needed;
+- creates `data/`, `logs/`, `tmp/`, and `.venv/`;
+- repairs a venv missing `pip` with `ensurepip`;
+- installs Ragbot and the required extras;
+- starts the service;
+- waits for `/admin/ready`;
+- records runtime mode/PID state for later commands.
+
+Windows users can run the same Python command from PowerShell without activating the venv:
+
+```powershell
+python .\scripts\ragbot.py up --mode auto
+```
+
+Optional wrappers:
+
+```powershell
+.\scripts\ragbot.ps1 up --mode auto
+```
+
+```bash
+bash scripts/ragbot.sh up --mode auto
+```
+
+## 2. Deployment modes
+
+| Mode | Storage | Ingestion | Persistence | Best for |
+| --- | --- | --- | --- | --- |
+| `local` | InMemoryRepo + InMemoryQdrant | inline | API process lifetime | fast functional tests |
+| `docker` | PostgreSQL + Qdrant | independent durable worker | Docker volumes | long-lived local knowledge bases |
+
+Local mode deliberately removes `POSTGRES_DSN` and `QDRANT_URL`, forces development + inline ingestion, and constrains local sources to the repository `data/` directory.
+
+## 3. Verify readiness
+
+```bash
+python scripts/ragbot.py status
+python scripts/ragbot.py doctor
+```
+
+Expected doctor result:
 
 ```text
 ragbot doctor: READY
-  liveness: {'status': 'ok'}
-  readiness: {'status': 'ready', ...}
 ```
 
-`doctor` checks process liveness and storage dependency readiness. It does not establish the semantic quality of an external model; production deployments should still run staging smoke with real providers.
+Admin UI:
 
-## 3. Build a RAG database from one source
+```text
+http://127.0.0.1:8000/admin/ui
+```
 
-### Local directory
+## 4. Configure semantic embeddings and an LLM
+
+The first bootstrap creates `.env`. For real semantic retrieval, configure at least:
+
+```dotenv
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_API_KEY=<your-key>
+EMBEDDING_BASE_URL=https://api.openai.com
+QDRANT_DIM=1536
+```
+
+For Agentic RAG answers:
+
+```dotenv
+RAGBOT_LLM_PROVIDER=openai
+OPENAI_API_KEY=<your-key>
+OPENAI_BASE_URL=https://api.openai.com
+OPENAI_MODEL=gpt-4o-mini
+```
+
+Restart after editing `.env`:
 
 ```bash
-rag --server http://localhost:8000 \
+python scripts/ragbot.py restart --mode local
+```
+
+or:
+
+```bash
+python scripts/ragbot.py restart --mode docker
+```
+
+When `EMBEDDING_API_KEY` is empty, development mode can use the deterministic HashEmbedder fallback. That is useful for pipeline smoke tests, not for Chinese or real semantic retrieval evaluation.
+
+## 5. Build a RAG database from local files
+
+Put local sources below `./data`:
+
+```text
+data/
+├─ manuals/
+│  ├─ architecture.md
+│  └─ notes.txt
+└─ pdf/
+   └─ product_manual.pdf
+```
+
+The local filesystem connector currently scans text-like files (`.txt`, `.md`, `.markdown`, `.rst`, `.csv`, `.log`). PDFs use the separate PDF connector.
+
+Text directory:
+
+```bash
+python scripts/ragbot.py ingest data/manuals \
   --tenant engineering \
-  ingest /data/manuals \
   --name "Engineering manuals" \
-  --tag manuals \
-  --wait
+  --tag manuals
 ```
 
-### Remote PDF
+PDF:
 
 ```bash
-rag --server http://localhost:8000 \
+python scripts/ragbot.py ingest data/pdf/product_manual.pdf \
   --tenant engineering \
-  ingest https://example.com/product/guide.pdf \
-  --wait
+  --type pdf
 ```
 
-### Git repository
+The helper automatically translates host `./data/...` into container `/data/...` when the active deployment is Docker.
+
+## 6. Remote PDF, Git, and Web
+
+Remote PDF:
 
 ```bash
-rag --server http://localhost:8000 \
+python scripts/ragbot.py ingest https://example.com/product/guide.pdf \
   --tenant engineering \
-  ingest https://github.com/magic-alt/ragbot \
+  --type pdf
+```
+
+Git:
+
+```bash
+python scripts/ragbot.py ingest https://github.com/magic-alt/ragbot \
+  --tenant engineering \
+  --type repo \
   --ref main \
-  --tag code \
-  --wait
+  --tag code
 ```
 
-### Web page
+Web:
 
 ```bash
-rag --server http://localhost:8000 \
+python scripts/ragbot.py ingest https://example.com/knowledge-base/ \
   --tenant engineering \
-  ingest https://example.com/knowledge-base/ \
-  --wait
+  --type web
 ```
 
-When `--type` is omitted, the CLI and Quick Import API infer `local_fs`, `pdf`, `repo`, or `web` from the location. Use `--type` when a location is ambiguous.
+By default the helper waits for ingestion completion. Add `--no-wait` to return immediately after submission.
 
-`--wait` polls the durable ingestion Job until it is `completed` or `failed` and prints final document/chunk counts. Without `--wait`, submission returns immediately.
-
-## 4. Build a knowledge base from a manifest
-
-Start with [`examples/ragbot-manifest.json`](../examples/ragbot-manifest.json):
-
-```json
-{
-  "tenant_id": "engineering",
-  "sources": [
-    {"location": "/data/manuals", "tags": ["manuals"]},
-    {"location": "https://example.com/product/guide.pdf", "tags": ["product"]},
-    {
-      "location": "https://github.com/magic-alt/ragbot",
-      "config": {"ref": "main"},
-      "tags": ["code"]
-    }
-  ]
-}
-```
-
-Submit and wait for all Jobs:
+## 7. Manifest import
 
 ```bash
-rag --server http://localhost:8000 import examples/ragbot-manifest.json --wait
+python scripts/ragbot.py import examples/ragbot-manifest.json \
+  --tenant engineering
 ```
 
-The batch API accepts up to 100 sources per request. Each item returns its own Source/Job result, so one submission error does not hide the state of the other items.
+The HTTP batch API accepts up to 100 sources per request.
 
-## 5. Query the knowledge base
+For Docker deployments, local paths inside a manifest must already use container-visible `/data/...` paths. The helper rewrites single-source `ingest` paths, but does not mutate manifest JSON.
+
+## 8. Query the knowledge base
 
 Pure retrieval:
 
 ```bash
-rag --server http://localhost:8000 \
+python scripts/ragbot.py search \
+  "How is the ingestion worker lease recovered?" \
   --tenant engineering \
-  search "How is the ingestion worker lease recovered?" \
   --top-k 5
 ```
 
 Agentic answer:
 
 ```bash
+python scripts/ragbot.py ask \
+  "Summarize the ingestion architecture and cite the relevant sources" \
+  --tenant engineering
+```
+
+## 9. Daily operations
+
+```bash
+python scripts/ragbot.py status
+python scripts/ragbot.py doctor
+python scripts/ragbot.py logs --lines 200
+python scripts/ragbot.py logs -f
+python scripts/ragbot.py restart --mode local
+python scripts/ragbot.py down
+```
+
+Docker `down` keeps PostgreSQL/Qdrant volumes by default. To intentionally destroy Compose volumes:
+
+```bash
+python scripts/ragbot.py down --mode docker --volumes
+```
+
+## 10. Native `rag` CLI
+
+The bootstrap helper does not replace the product CLI. It orchestrates installation/deployment and delegates knowledge operations to `cli.rag`.
+
+After setup, native commands remain available:
+
+```bash
+rag --server http://localhost:8000 doctor
+
 rag --server http://localhost:8000 \
   --tenant engineering \
-  ask "Summarize the ingestion architecture and cite the relevant sources"
-```
-
-## 6. Quick Import API
-
-For applications that do not want to orchestrate `POST /sources` followed by `POST /ingest/jobs`, Ragbot exposes a high-level product endpoint.
-
-```bash
-curl -X POST http://localhost:8000/ingest/quick \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "tenant_id": "engineering",
-    "location": "/data/manuals",
-    "name": "Engineering manuals",
-    "tags": ["manuals"]
-  }'
-```
-
-Representative response:
-
-```json
-{
-  "status": "accepted",
-  "source_id": "...",
-  "source_type": "local_fs",
-  "source_reused": false,
-  "job_id": "...",
-  "job_status": "pending",
-  "job_reused": false
-}
-```
-
-Batch import:
-
-```bash
-curl -X POST http://localhost:8000/ingest/batch \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "tenant_id": "engineering",
-    "sources": [
-      {"location": "/data/manuals"},
-      {"location": "https://example.com/guide.pdf"}
-    ]
-  }'
-```
-
-## 7. Source reuse, configuration safety, and idempotency
-
-Quick Import uses a stable Source identity derived from:
-
-```text
-tenant + source type + normalized location
-```
-
-By default:
-
-1. a matching existing Source is reused;
-2. supplied Source metadata/config is synchronized when it is safe to submit a new run;
-3. if a `pending` or `running` Job already exists with the same connector configuration, that active Job is returned instead of creating an obvious duplicate;
-4. if an active Job exists but the requested connector configuration differs (for example `ref=main` versus `ref=release`), the request returns `409` instead of silently treating the old Job as the new request.
-
-Each durable Job stores the connector `source_type` and `source_config` captured at submission. The worker executes that snapshot even if the Source record is edited while the Job waits in the queue. This makes retries and delayed execution deterministic for connector path/ref/chunking settings.
-
-### Strict idempotency
-
-For deployment automation or concurrent callers, provide an explicit key:
-
-```bash
-rag --server http://localhost:8000 \
   ingest /data/manuals \
-  --idempotency-key nightly-2026-09-02
+  --wait
+
+rag --server http://localhost:8000 \
+  --tenant engineering \
+  search "query" \
+  --top-k 5
+
+rag --server http://localhost:8000 \
+  --tenant engineering \
+  ask "question"
 ```
 
-Submitting the same stable Source + idempotency key returns the exact same Job, including after completion. This is the recommended mechanism when callers need strict repeat-request behavior across multiple API replicas.
+On Windows, without activating the venv:
 
-The ordinary active-Job check is an ergonomic duplicate guard, not a distributed uniqueness primitive. Without an explicit idempotency key, two truly concurrent requests reaching different API replicas may still both enqueue before either observes the other.
-
-`idempotency_key` requires Source reuse; combining it with `--no-reuse-source` is rejected because a newly generated Source ID would make strict replay impossible.
-
-Advanced overrides:
-
-```text
---no-reuse-source   create a distinct Source record
---force-new-job     bypass the active-Job convenience dedupe
+```powershell
+.\.venv\Scripts\python.exe -m cli.rag --server http://127.0.0.1:8000 doctor
 ```
 
-Use these deliberately; the default behavior is designed for repeatable product bootstrap.
+## 11. Troubleshooting
 
-## 8. Production authentication
-
-When production API-key principals are enabled, add the API key to CLI operations:
+### `No module named pip`
 
 ```bash
-rag --server https://rag.example.com \
-  --api-key "$RAGBOT_API_KEY" \
-  --tenant tenant-a \
-  doctor
+python scripts/ragbot.py setup --mode local --force-install
 ```
 
-The tenant requested by ingest/search/chat must be inside the API-key principal's allowed tenant scope.
+The helper checks `.venv` and runs `python -m ensurepip --upgrade` when pip is missing.
 
-## 9. Production checklist
+### `No module named uvicorn` / `No module named requests`
 
-Quick Import shortens data onboarding; it does not remove production release requirements. Before exposing Ragbot as a shared service, verify at minimum:
+```bash
+python scripts/ragbot.py setup --mode local --force-install
+```
 
-- `RAGBOT_ENV=production` and durable worker mode;
-- real semantic embedding and LLM providers;
-- PostgreSQL/Qdrant persistence and backup/restore;
-- API-key principal mappings;
-- source path mounts and Web/PDF/Git egress allowlists;
-- TLS/Ingress/rate limiting;
-- the repository's real-provider staging smoke workflow.
+This reinstalls the editable Ragbot package and its dependencies into the repository `.venv`.
 
-See [`DEPLOYMENT.md`](DEPLOYMENT.md), [`CONFIGURATION.md`](CONFIGURATION.md), and [`V1_RELEASE_READINESS.md`](V1_RELEASE_READINESS.md) for the complete production gates.
+### PowerShell blocks `Activate.ps1`
+
+Do not activate the environment. Run:
+
+```powershell
+python .\scripts\ragbot.py up --mode local
+```
+
+### Docker is unavailable
+
+```bash
+python scripts/ragbot.py up --mode local
+```
+
+No PostgreSQL, Qdrant server, Docker daemon, or separate worker is required for this development path.
+
+## 12. Production note
+
+The no-Docker local mode is intentionally a development/testing path. Production still requires durable worker mode, PostgreSQL, Qdrant, semantic embeddings, scoped API principals, networking controls, backup/restore, and real-provider staging gates.
+
+See [`DEPLOYMENT.md`](DEPLOYMENT.md), [`CONFIGURATION.md`](CONFIGURATION.md), [`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md), and [`V1_RELEASE_READINESS.md`](V1_RELEASE_READINESS.md).
