@@ -10,23 +10,60 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+_REASONING_EFFORTS = {"none", "low", "medium", "high", "max"}
+
 
 class OllamaAdapter:
-    """LLM adapter for Ollama using the OpenAI-compatible API."""
+    """LLM adapter for Ollama using its OpenAI-compatible API.
+
+    Ragbot uses structured JSON for several agent nodes. Ollama's native API
+    accepts ``format``/``options`` fields, while the OpenAI-compatible
+    ``/v1/chat/completions`` endpoint accepts ``response_format`` and
+    ``max_tokens``. Keep those request shapes separate so structured routing and
+    synthesis work reliably with current Ollama models such as Qwen3.8.
+    """
 
     def __init__(
         self,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
-        timeout: int = 60,
+        timeout: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> None:
-        self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434").rstrip("/")
+        self.base_url = (
+            base_url or os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434"
+        ).rstrip("/")
         self.model = model or os.getenv("OLLAMA_MODEL", "llama3")
-        self.timeout = timeout
+        if timeout is None:
+            timeout = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "300"))
+        self.timeout = float(timeout)
+
+        configured_reasoning = reasoning_effort
+        if configured_reasoning is None:
+            configured_reasoning = os.getenv("OLLAMA_REASONING_EFFORT", "").strip() or None
+        if configured_reasoning is not None:
+            configured_reasoning = configured_reasoning.lower()
+            if configured_reasoning not in _REASONING_EFFORTS:
+                allowed = ", ".join(sorted(_REASONING_EFFORTS))
+                raise ValueError(
+                    f"Unsupported OLLAMA_REASONING_EFFORT={configured_reasoning!r}; "
+                    f"expected one of: {allowed}"
+                )
+        self.reasoning_effort = configured_reasoning
 
     @property
     def enabled(self) -> bool:
         return True
+
+    def _apply_completion_options(
+        self,
+        payload: Dict[str, Any],
+        max_output_tokens: Optional[int],
+    ) -> None:
+        if max_output_tokens:
+            payload["max_tokens"] = max_output_tokens
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
 
     async def chat_json(
         self,
@@ -47,11 +84,13 @@ class OllamaAdapter:
                 {"role": "user", "content": user},
             ],
             "temperature": temperature,
-            "format": "json",
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": schema},
+            },
             "stream": False,
         }
-        if max_output_tokens:
-            payload["options"] = {"num_predict": max_output_tokens}
+        self._apply_completion_options(payload, max_output_tokens)
         data = await self._post_json("/v1/chat/completions", payload)
         content = data["choices"][0]["message"]["content"]
         return _extract_json(content)
@@ -72,8 +111,7 @@ class OllamaAdapter:
             "temperature": temperature,
             "stream": True,
         }
-        if max_output_tokens:
-            payload["options"] = {"num_predict": max_output_tokens}
+        self._apply_completion_options(payload, max_output_tokens)
         url = f"{self.base_url}/v1/chat/completions"
         try:
             async with httpx.AsyncClient() as client:
@@ -84,7 +122,7 @@ class OllamaAdapter:
                     async for line in response.aiter_lines():
                         if not line or not line.startswith("data: "):
                             continue
-                        data = line[len("data: "):].strip()
+                        data = line[len("data: ") :].strip()
                         if data == "[DONE]":
                             break
                         try:
@@ -106,7 +144,7 @@ class OllamaAdapter:
         allowed_domains: Optional[List[str]] = None,
         recency_days: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        # Ollama does not support web search natively
+        # Ollama does not support web search natively.
         return []
 
     async def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
