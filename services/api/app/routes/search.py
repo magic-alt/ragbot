@@ -44,6 +44,7 @@ class SearchResponse(BaseModel):
     request_id: str
     chunks: List[ChunkResult]
     total: int
+    diagnostics: Dict[str, Any] = {}
 
 
 def _build_retrieval_filters(
@@ -111,10 +112,15 @@ def create_search_endpoint(get_services, verify_api_key):
             )
             for c in chunks
         ]
+        diagnostics = {}
+        describe = getattr(services.retriever, "diagnostics", None)
+        if callable(describe):
+            diagnostics = describe(payload.query)
         return SearchResponse(
             request_id=uuid.uuid4().hex,
             chunks=chunk_results,
             total=len(chunk_results),
+            diagnostics=diagnostics,
         )
 
     return router
