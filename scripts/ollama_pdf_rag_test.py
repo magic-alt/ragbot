@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import ModuleType
+from typing import Any, Dict
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 IMPL = SCRIPT_DIR / "ollama_pdf_rag_test_impl.py"
 DEFAULT_OLLAMA_EMBEDDING_MODEL = "qwen3-embedding:0.6b"
+_FAILED_SETTLE_SECONDS = 3.0
 
 
 def _installed_embedding_models() -> list[str]:
@@ -98,6 +102,25 @@ for path in pdfs:
 """
 
 
+def _failure_detail(job: Dict[str, Any]) -> str:
+    error = str(job.get("error") or "Ingestion failed")
+    source_config = job.get("source_config") or {}
+    detail = (
+        f"Ingestion {job.get('job_id')}: status={job.get('status')}, "
+        f"attempts={job.get('attempts', 0)}, failure_class={job.get('failure_class')!r}, "
+        f"source_type={job.get('source_type')!r}, "
+        f"source_config={json.dumps(source_config, ensure_ascii=False)}; error={error}"
+    )
+    if "Local source is outside RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS" in error:
+        if "PDF local path rejected:" not in error:
+            detail += (
+                ". The API/worker preflight passed the mounted /data PDFs, but this failure lacks "
+                "the current PDF path diagnostics. This strongly suggests a stale or foreign worker "
+                "is consuming the same PostgreSQL ingestion queue."
+            )
+    return detail
+
+
 _impl = _load_impl()
 _impl_compose_env = _impl._compose_env
 _impl_verify_container_contract = _impl._verify_container_contract
@@ -122,10 +145,58 @@ def _verify_container_contract(args, env) -> None:
         )
 
 
-# The implementation's main() resolves these helpers from its own module globals,
-# so replace them there as well as exporting them through this stable entrypoint.
+def _wait_job(
+    server: str,
+    job_id: str,
+    *,
+    headers: Dict[str, str],
+    timeout: float,
+) -> Dict[str, Any]:
+    """Wait through the worker's short failed->retry/dead-letter transition."""
+    deadline = time.monotonic() + timeout
+    previous = None
+    failed_since: float | None = None
+    while True:
+        job = _impl._request_json(
+            "GET",
+            f"{server.rstrip('/')}/ingest/jobs/{job_id}",
+            headers=headers,
+            timeout=min(60.0, timeout),
+        )
+        status = str(job.get("status") or "unknown")
+        if status != previous:
+            print(
+                f"Ingestion {job_id}: {status} "
+                f"(docs={job.get('doc_count', 0)}, chunks={job.get('chunk_count', 0)}, "
+                f"attempts={job.get('attempts', 0)}, failure_class={job.get('failure_class')!r})"
+            )
+            previous = status
+
+        if status == "completed":
+            return job
+        if status == "dead_lettered":
+            raise _impl.UserError(_failure_detail(job))
+
+        now = time.monotonic()
+        if status == "failed":
+            if failed_since is None:
+                failed_since = now
+            if now - failed_since >= _FAILED_SETTLE_SECONDS:
+                raise _impl.UserError(_failure_detail(job))
+            time.sleep(0.2)
+            continue
+        failed_since = None
+
+        if now >= deadline:
+            raise _impl.UserError(f"Timed out waiting for ingestion job {job_id}; last status={status}")
+        time.sleep(1.0)
+
+
+# The implementation's main() resolves helpers from its own module globals, so
+# replace them there as well as exporting them through this stable entrypoint.
 _impl._compose_env = _compose_env
 _impl._verify_container_contract = _verify_container_contract
+_impl._wait_job = _wait_job
 
 for _name, _value in vars(_impl).items():
     if _name not in {"__name__", "__file__", "__spec__", "__loader__", "__package__"}:
