@@ -120,6 +120,19 @@ def test_compose_env_uses_resolved_ollama_embedding_contract(tmp_path: Path) -> 
     assert env["QDRANT_DIM"] == "4096"
     assert env["QDRANT_COLLECTION"] == "rag_chunks_smoke_qwen3_embedding_8b_4096"
     assert env["RAGBOT_DATA_DIR"] == str(args.data_dir.resolve())
+    assert env["RAGBOT_INGESTION_MODE"] == "worker"
+    assert env["RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS"] == "/data"
+
+
+def test_runtime_contract_checks_durable_mode_and_real_pdf_paths() -> None:
+    code = mod._runtime_contract_code("api")
+
+    assert "RAGBOT_INGESTION_MODE" in code
+    assert "POSTGRES_DSN" in code
+    assert "RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS" in code
+    assert "_use_durable_worker() is True" in code
+    assert "validate_local_source_path" in code
+    assert 'Path("/data")' in code
 
 
 def test_compose_env_rejects_unresolved_dimension(tmp_path: Path) -> None:
