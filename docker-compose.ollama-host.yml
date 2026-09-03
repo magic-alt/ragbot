@@ -24,6 +24,7 @@ services:
     environment:
       RAGBOT_INGESTION_MODE: worker
       RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS: /data
+      RAGBOT_WORKER_ID: ${RAGBOT_WORKER_ID:-}
       RAGBOT_LLM_PROVIDER: ollama
       OLLAMA_BASE_URL: ${RAGBOT_DOCKER_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.8:27b}
