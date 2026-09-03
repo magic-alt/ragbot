@@ -104,38 +104,43 @@ def test_running_job_accepts_expected_worker_claim(monkeypatch: pytest.MonkeyPat
     assert mod._claim_invariant_error(job) is None
 
 
-def test_competing_macos_host_worker_is_rejected() -> None:
-    fake_ps = SimpleNamespace(
-        returncode=0,
-        stdout="4242 python -m services.worker.main\n",
-    )
-    fake_lsof = SimpleNamespace(returncode=1, stdout="")
-
-    with patch.object(mod.sys, "platform", "darwin"), patch.object(
-        mod.subprocess, "run", side_effect=[fake_ps, fake_lsof]
-    ):
-        with pytest.raises(mod.UserError, match="Competing host Ragbot/PostgreSQL Python process detected"):
-            mod._assert_no_competing_host_worker()
-
-
-def test_macos_python_postgres_client_is_rejected_even_without_worker_command() -> None:
-    fake_ps = SimpleNamespace(returncode=0, stdout="")
+def test_macos_python_client_on_isolated_postgres_port_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod, "_SMOKE_POSTGRES_PORT", 55432)
     fake_lsof = SimpleNamespace(
         returncode=0,
         stdout=(
             "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
-            "Python 5151 user 10u IPv4 0t0 TCP 127.0.0.1:60000->127.0.0.1:5432 (ESTABLISHED)\n"
+            "Python 5151 user 10u IPv4 0t0 TCP 127.0.0.1:60000->127.0.0.1:55432 (ESTABLISHED)\n"
         ),
     )
 
     with patch.object(mod.sys, "platform", "darwin"), patch.object(
-        mod.subprocess, "run", side_effect=[fake_ps, fake_lsof]
+        mod.subprocess, "run", return_value=fake_lsof
     ):
-        with pytest.raises(mod.UserError, match="Competing host Ragbot/PostgreSQL Python process detected"):
+        with pytest.raises(mod.UserError, match="Competing host PostgreSQL Python process detected"):
             mod._assert_no_competing_host_worker()
 
 
-def test_compose_env_assigns_unique_smoke_worker_id(tmp_path: Path) -> None:
+def test_macos_python_client_on_default_postgres_port_does_not_block_isolated_smoke(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod, "_SMOKE_POSTGRES_PORT", 55432)
+    fake_lsof = SimpleNamespace(returncode=1, stdout="")
+
+    with patch.object(mod.sys, "platform", "darwin"), patch.object(
+        mod.subprocess, "run", return_value=fake_lsof
+    ) as run_mock:
+        mod._assert_no_competing_host_worker()
+
+    command = run_mock.call_args.args[0]
+    assert "-iTCP:55432" in command
+
+
+def test_compose_env_assigns_unique_worker_and_isolated_postgres_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     args = SimpleNamespace(
         model="qwen3.8:27b-mlx",
         ollama_timeout=300.0,
@@ -147,6 +152,7 @@ def test_compose_env_assigns_unique_smoke_worker_id(tmp_path: Path) -> None:
         data_dir=tmp_path,
         port=8000,
     )
+    monkeypatch.delenv("RAGBOT_SMOKE_POSTGRES_PORT", raising=False)
 
     env = mod._compose_env(args)
 
@@ -154,6 +160,30 @@ def test_compose_env_assigns_unique_smoke_worker_id(tmp_path: Path) -> None:
     assert env["RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS"] == "/data"
     assert env["RAGBOT_WORKER_ID"].startswith("ollama-pdf-smoke-")
     assert mod._EXPECTED_WORKER_ID == env["RAGBOT_WORKER_ID"]
+    assert env["RAGBOT_POSTGRES_PORT"] == "55432"
+    assert mod._SMOKE_POSTGRES_PORT == 55432
+
+
+def test_compose_env_allows_custom_smoke_postgres_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = SimpleNamespace(
+        model="qwen3.8:27b-mlx",
+        ollama_timeout=300.0,
+        reasoning_effort="none",
+        docker_ollama_url="http://host.docker.internal:11434",
+        embedding_model="qwen3-embedding:8b",
+        embedding_dim=4096,
+        collection="rag_chunks_smoke_qwen3_embedding_8b_4096",
+        data_dir=tmp_path,
+        port=8000,
+    )
+    monkeypatch.setenv("RAGBOT_SMOKE_POSTGRES_PORT", "56432")
+
+    env = mod._compose_env(args)
+
+    assert env["RAGBOT_POSTGRES_PORT"] == "56432"
+    assert mod._SMOKE_POSTGRES_PORT == 56432
 
 
 def test_local_path_policy_failure_is_permanent_configuration_error() -> None:
