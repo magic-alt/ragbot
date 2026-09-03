@@ -17,6 +17,7 @@ IMPL = SCRIPT_DIR / "ollama_pdf_rag_test_impl.py"
 DEFAULT_OLLAMA_EMBEDDING_MODEL = "qwen3-embedding:0.6b"
 _FAILED_SETTLE_SECONDS = 3.0
 _EXPECTED_WORKER_ID: str | None = None
+_SMOKE_POSTGRES_PORT = 55432
 
 
 def _installed_embedding_models() -> list[str]:
@@ -124,19 +125,18 @@ def _failure_detail(job: Dict[str, Any]) -> str:
             detail += (
                 ". The API/worker preflight passed the mounted /data PDFs, but this failure lacks "
                 "the current PDF path diagnostics. This strongly suggests a stale or foreign worker "
-                "is consuming the same PostgreSQL ingestion queue. Stop any extra ragbot workers "
-                "before rerunning the smoke test."
+                "is consuming the same PostgreSQL ingestion queue."
             )
     return detail
 
 
-def _host_postgres_python_clients() -> list[str]:
-    """Return host Python processes with an established connection to PostgreSQL:5432."""
+def _host_postgres_python_clients(port: int) -> list[str]:
+    """Return host Python processes connected to the smoke stack's PostgreSQL port."""
     if sys.platform != "darwin":
         return []
     try:
         result = subprocess.run(
-            ["lsof", "-nP", "-iTCP:5432", "-sTCP:ESTABLISHED"],
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:ESTABLISHED"],
             text=True,
             capture_output=True,
             timeout=10,
@@ -158,36 +158,21 @@ def _host_postgres_python_clients() -> list[str]:
 
 
 def _assert_no_competing_host_worker() -> None:
-    """Reject host-side workers/clients that can consume the Docker PostgreSQL queue."""
+    """Reject host-side Python clients connected to the isolated smoke PostgreSQL port."""
     if sys.platform != "darwin":
         return
-    process_matches: list[str] = []
-    try:
-        result = subprocess.run(
-            ["ps", "-axo", "pid=,command="],
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-        if result.returncode == 0:
-            process_matches = [
-                line.strip()
-                for line in result.stdout.splitlines()
-                if "services.worker.main" in line and line.strip()
-            ]
-    except (OSError, subprocess.SubprocessError):
-        pass
-
-    postgres_python = _host_postgres_python_clients()
-    if process_matches or postgres_python:
-        preview = " | ".join((process_matches + postgres_python)[:8])
+    postgres_python = _host_postgres_python_clients(_SMOKE_POSTGRES_PORT)
+    if postgres_python:
+        preview = " | ".join(postgres_python[:8])
         raise _impl.UserError(
-            "Competing host Ragbot/PostgreSQL Python process detected. A host process connected to "
-            "the smoke stack can claim jobs without the Docker /data mount. Stop it before running "
-            f"this smoke test: {preview}"
+            "Competing host PostgreSQL Python process detected on the isolated smoke port. "
+            "It can claim jobs without the Docker /data mount. Stop it before running this smoke "
+            f"test: {preview}"
         )
-    print("host-worker-contract ok: no competing macOS Ragbot/PostgreSQL Python process")
+    print(
+        "host-worker-contract ok: no host Python client connected to "
+        f"PostgreSQL port {_SMOKE_POSTGRES_PORT}"
+    )
 
 
 _impl = _load_impl()
@@ -196,18 +181,25 @@ _impl_verify_container_contract = _impl._verify_container_contract
 
 
 def _compose_env(args):
-    """Force a uniquely identifiable durable worker and /data source contract."""
-    global _EXPECTED_WORKER_ID
+    """Force an isolated PostgreSQL host port and uniquely identifiable durable worker."""
+    global _EXPECTED_WORKER_ID, _SMOKE_POSTGRES_PORT
     env = _impl_compose_env(args)
     env["RAGBOT_INGESTION_MODE"] = "worker"
     env["RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS"] = "/data"
     _EXPECTED_WORKER_ID = f"ollama-pdf-smoke-{os.getpid()}-{int(time.time())}"
     env["RAGBOT_WORKER_ID"] = _EXPECTED_WORKER_ID
+    try:
+        _SMOKE_POSTGRES_PORT = int(os.getenv("RAGBOT_SMOKE_POSTGRES_PORT", "55432"))
+    except ValueError as exc:
+        raise _impl.UserError("RAGBOT_SMOKE_POSTGRES_PORT must be an integer") from exc
+    if not 1 <= _SMOKE_POSTGRES_PORT <= 65535:
+        raise _impl.UserError("RAGBOT_SMOKE_POSTGRES_PORT must be between 1 and 65535")
+    env["RAGBOT_POSTGRES_PORT"] = str(_SMOKE_POSTGRES_PORT)
     return env
 
 
 def _verify_container_contract(args, env) -> None:
-    """Validate API/worker runtime and reject competing host workers before ingestion."""
+    """Validate API/worker runtime and isolated queue ownership before ingestion."""
     _impl_verify_container_contract(args, env)
     for service in ("api", "worker"):
         _impl._run(
@@ -223,7 +215,10 @@ def _verify_container_contract(args, env) -> None:
             env=env,
         )
     _assert_no_competing_host_worker()
-    print(f"queue-claim-contract expected_worker_id={_EXPECTED_WORKER_ID}")
+    print(
+        f"queue-claim-contract expected_worker_id={_EXPECTED_WORKER_ID} "
+        f"postgres_host_port={_SMOKE_POSTGRES_PORT}"
+    )
 
 
 def _claim_invariant_error(job: Dict[str, Any]) -> str | None:
@@ -240,8 +235,9 @@ def _claim_invariant_error(job: Dict[str, Any]) -> str | None:
     if _EXPECTED_WORKER_ID and lease_owner != _EXPECTED_WORKER_ID:
         return (
             "Foreign worker claimed the smoke-test job: "
-            f"lease_owner={lease_owner!r}, expected={_EXPECTED_WORKER_ID!r}. Stop the competing "
-            "worker/container before rerunning."
+            f"lease_owner={lease_owner!r}, expected={_EXPECTED_WORKER_ID!r}. The smoke stack uses "
+            f"isolated PostgreSQL host port {_SMOKE_POSTGRES_PORT}; inspect extra Docker workers if "
+            "this still occurs."
         )
     return None
 
