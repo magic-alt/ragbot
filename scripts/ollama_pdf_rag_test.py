@@ -122,6 +122,37 @@ def _failure_detail(job: Dict[str, Any]) -> str:
     return detail
 
 
+def _assert_no_competing_host_worker() -> None:
+    """Reject a manually started macOS worker that could consume the Docker queue."""
+    if sys.platform != "darwin":
+        return
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    if result.returncode != 0:
+        return
+    matches = [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if "services.worker.main" in line and line.strip()
+    ]
+    if matches:
+        preview = " | ".join(matches[:5])
+        raise _impl.UserError(
+            "Competing host Ragbot worker detected. A host worker can claim jobs from the same "
+            "PostgreSQL queue without the Docker /data mount. Stop it before running this smoke test: "
+            f"{preview}"
+        )
+    print("host-worker-contract ok: no competing macOS Ragbot worker")
+
+
 _impl = _load_impl()
 _impl_compose_env = _impl._compose_env
 _impl_verify_container_contract = _impl._verify_container_contract
@@ -136,7 +167,7 @@ def _compose_env(args):
 
 
 def _verify_container_contract(args, env) -> None:
-    """Validate both API and worker before any ingestion job is submitted."""
+    """Validate API/worker runtime and reject competing host workers before ingestion."""
     _impl_verify_container_contract(args, env)
     for service in ("api", "worker"):
         _impl._run(
@@ -144,6 +175,7 @@ def _verify_container_contract(args, env) -> None:
             + ["exec", "-T", service, "python", "-c", _runtime_contract_code(service)],
             env=env,
         )
+    _assert_no_competing_host_worker()
 
 
 def _wait_job(
