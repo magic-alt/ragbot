@@ -1,0 +1,57 @@
+{
+  "name": "pdf-retrieval-smoke",
+  "description": "Starter Golden Dataset for validating an indexed technical PDF corpus. Replace or extend the relevance rules with exact pages/chunk IDs as the corpus is curated.",
+  "defaults": {
+    "top_k": 10,
+    "filters": {
+      "source_types": ["pdf"]
+    }
+  },
+  "thresholds": {
+    "hit_at_5_min": 0.66,
+    "mrr_at_10_min": 0.4,
+    "p95_search_ms_max": 5000
+  },
+  "cases": [
+    {
+      "id": "lora-vs-qlora-en",
+      "category": "english-technical",
+      "query": "What is the difference between LoRA and QLoRA?",
+      "relevance": {
+        "all_terms": ["LoRA", "QLoRA"],
+        "max_rank": 5
+      },
+      "answer": {
+        "contains_all": ["LoRA", "QLoRA"],
+        "min_citations": 1
+      }
+    },
+    {
+      "id": "quantization-gpu-memory-en",
+      "category": "english-technical",
+      "query": "How can quantization reduce GPU memory usage during LLM deployment?",
+      "relevance": {
+        "all_terms": ["memory"],
+        "any_terms": ["quantization", "FP8", "BF16", "precision"],
+        "max_rank": 5
+      },
+      "answer": {
+        "contains_any": ["quantization", "precision", "FP8", "BF16"],
+        "min_citations": 1
+      }
+    },
+    {
+      "id": "gpu-memory-zh-to-en",
+      "category": "cross-lingual-zh-en",
+      "query": "大模型部署时如何减少显存占用？",
+      "relevance": {
+        "any_terms": ["quantization", "memory", "FP8", "BF16", "precision"],
+        "max_rank": 5
+      },
+      "answer": {
+        "contains_any": ["量化", "quantization", "精度", "precision", "FP8", "BF16"],
+        "min_citations": 1
+      }
+    }
+  ]
+}
