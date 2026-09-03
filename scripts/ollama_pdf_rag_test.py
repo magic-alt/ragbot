@@ -116,7 +116,8 @@ def _failure_detail(job: Dict[str, Any]) -> str:
             detail += (
                 ". The API/worker preflight passed the mounted /data PDFs, but this failure lacks "
                 "the current PDF path diagnostics. This strongly suggests a stale or foreign worker "
-                "is consuming the same PostgreSQL ingestion queue."
+                "is consuming the same PostgreSQL ingestion queue. Stop any extra ragbot workers "
+                "before rerunning the smoke test."
             )
     return detail
 
