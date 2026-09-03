@@ -75,7 +75,7 @@ def test_embedding_probe_auto_detects_8b_dimension_and_collection(tmp_path: Path
     args = _args(tmp_path)
     fake = {"data": [{"index": 0, "embedding": [0.0] * 4096}]}
 
-    with patch.object(mod, "_request_json", return_value=fake):
+    with patch.object(mod._impl, "_request_json", return_value=fake):
         actual = mod._probe_embedding(args)
 
     assert actual == 4096
@@ -88,7 +88,7 @@ def test_embedding_probe_rejects_explicit_dimension_mismatch(tmp_path: Path) -> 
     args.embedding_dim = 1024
     fake = {"data": [{"index": 0, "embedding": [0.0] * 4096}]}
 
-    with patch.object(mod, "_request_json", return_value=fake):
+    with patch.object(mod._impl, "_request_json", return_value=fake):
         with pytest.raises(mod.UserError, match="dimension mismatch"):
             mod._probe_embedding(args)
 
@@ -98,7 +98,7 @@ def test_explicit_collection_is_preserved_after_auto_dimension(tmp_path: Path) -
     args.collection = "my_qdrant_collection"
     fake = {"data": [{"index": 0, "embedding": [0.0] * 4096}]}
 
-    with patch.object(mod, "_request_json", return_value=fake):
+    with patch.object(mod._impl, "_request_json", return_value=fake):
         mod._probe_embedding(args)
 
     assert args.embedding_dim == 4096
@@ -139,7 +139,7 @@ def test_search_requires_real_semantic_results(tmp_path: Path) -> None:
         },
     }
 
-    with patch.object(mod, "_request_json", return_value=response):
+    with patch.object(mod._impl, "_request_json", return_value=response):
         result = mod._search(args)
 
     assert result["chunks"][0]["chunk_id"] == "c1"
@@ -155,13 +155,14 @@ def test_search_rejects_hash_fallback(tmp_path: Path) -> None:
         },
     }
 
-    with patch.object(mod, "_request_json", return_value=response):
+    with patch.object(mod._impl, "_request_json", return_value=response):
         with pytest.raises(mod.UserError, match="not using semantic embeddings"):
             mod._search(args)
 
 
 def test_manifest_written_with_selected_tenant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mod, "TMP_DIR", tmp_path)
+    monkeypatch.setattr(mod._impl, "TMP_DIR", tmp_path)
     path = mod._write_manifest(
         [
             {
