@@ -1,0 +1,29 @@
+# Compose overlay for using a host-installed Ollama with Ragbot's durable
+# PostgreSQL + Qdrant stack.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.ollama-host.yml up -d --build
+#
+# Override when needed:
+#   OLLAMA_MODEL=qwen3.8:27b
+#   RAGBOT_DOCKER_OLLAMA_BASE_URL=http://host.docker.internal:11434
+services:
+  api:
+    environment:
+      RAGBOT_LLM_PROVIDER: ollama
+      OLLAMA_BASE_URL: ${RAGBOT_DOCKER_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.8:27b}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-300}
+      OLLAMA_REASONING_EFFORT: ${OLLAMA_REASONING_EFFORT:-none}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  worker:
+    environment:
+      RAGBOT_LLM_PROVIDER: ollama
+      OLLAMA_BASE_URL: ${RAGBOT_DOCKER_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.8:27b}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-300}
+      OLLAMA_REASONING_EFFORT: ${OLLAMA_REASONING_EFFORT:-none}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
