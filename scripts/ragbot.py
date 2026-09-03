@@ -32,6 +32,62 @@ for _name in dir(_impl):
     if not _name.startswith("__"):
         globals().setdefault(_name, getattr(_impl, _name))
 
+# The compatibility module intentionally exposes the implementation's path and
+# runtime constants. Tests and downstream callers historically monkeypatch
+# these names on scripts/ragbot.py. Since function objects imported from
+# ragbot_impl.py retain ragbot_impl.py as their globals namespace, copy the
+# current wrapper values back before delegated calls so monkeypatching keeps the
+# same semantics it had before the implementation split.
+_SYNCED_GLOBALS = (
+    "ROOT",
+    "VENV",
+    "DATA_DIR",
+    "LOG_DIR",
+    "TMP_DIR",
+    "LOCAL_LOG",
+    "LOCAL_PID",
+    "STATE_FILE",
+    "ENV_FILE",
+    "ENV_EXAMPLE",
+    "DEFAULT_SERVER",
+)
+
+
+def _sync_impl_state() -> None:
+    for name in _SYNCED_GLOBALS:
+        if name in globals():
+            setattr(_impl, name, globals()[name])
+
+
+def _base_env():
+    _sync_impl_state()
+    return _impl._base_env()
+
+
+def _local_env():
+    _sync_impl_state()
+    return _impl._local_env()
+
+
+def _copy_default_env():
+    _sync_impl_state()
+    return _impl._copy_default_env()
+
+
+def _ensure_dirs():
+    _sync_impl_state()
+    return _impl._ensure_dirs()
+
+
+def _docker_location(location: str) -> str:
+    _sync_impl_state()
+    return _impl._docker_location(location)
+
+
+def _local_location(location: str) -> str:
+    _sync_impl_state()
+    return _impl._local_location(location)
+
 
 def _normalize_ingest_argv(argv: Sequence[str]) -> List[str]:
     """Join split ingest-location tokens while leaving all options untouched."""
@@ -56,6 +112,7 @@ def _normalize_ingest_argv(argv: Sequence[str]) -> List[str]:
 
 def main(argv: Optional[List[str]] = None) -> int:
     raw = sys.argv[1:] if argv is None else argv
+    _sync_impl_state()
     return _impl.main(_normalize_ingest_argv(raw))
 
 
