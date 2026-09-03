@@ -1,21 +1,34 @@
 from __future__ import annotations
 
 import math
-import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from .lexical import lexicalize
 from ..storage.models import Chunk
 from ..storage.protocol import Repo
+
+# The in-memory development backend intentionally stays lightweight, but common
+# question words should not outrank domain terms such as LoRA, QLoRA, GPU or
+# quantization. PostgreSQL keeps using its native FTS implementation.
+_ENGLISH_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "being", "between",
+    "by", "can", "could", "did", "do", "does", "for", "from", "had", "has",
+    "have", "how", "i", "if", "in", "into", "is", "it", "its", "of", "on",
+    "or", "our", "should", "that", "the", "their", "them", "there", "these",
+    "this", "those", "to", "was", "were", "what", "when", "where", "which",
+    "who", "why", "will", "with", "would", "you", "your",
+}
 
 
 def fts_search(repo: Repo, query: str, filters: Dict[str, Any], top_k: int) -> List[Tuple[Chunk, float]]:
     """Run lexical retrieval using the repository's native backend when available.
 
     Production PostgresRepo exposes ``search_chunks_fts`` and uses the GIN index
-    created by migration 001. In-memory repositories intentionally use a small
-    scan implementation with no process-global cache, avoiding stale/cross-repo
-    index state during tests and local development.
+    created by migration 001. In-memory repositories use a deterministic scan
+    implementation. The fallback removes high-frequency English question words
+    and reuses Ragbot's CJK bigram lexicalizer so local testing is substantially
+    less noisy without introducing an external search dependency.
     """
     native = getattr(repo, "search_chunks_fts", None)
     if callable(native):
@@ -37,7 +50,11 @@ def fts_search(repo: Repo, query: str, filters: Dict[str, Any], top_k: int) -> L
 
 
 def _tokenize(text: str) -> List[str]:
-    return re.findall(r"[A-Za-z0-9_\-]+", text.lower())
+    terms = lexicalize(text).split()
+    filtered = [term for term in terms if term not in _ENGLISH_STOPWORDS]
+    # If a query consists entirely of stopwords, retaining the original terms is
+    # more useful than returning no lexical candidates at all.
+    return filtered or terms
 
 
 def _tf_score(tokens: List[str], text: str) -> float:
