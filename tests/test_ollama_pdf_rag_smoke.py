@@ -23,13 +23,13 @@ def _args(tmp_path: Path) -> SimpleNamespace:
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     return SimpleNamespace(
-        model="qwen3.8:27b",
+        model="qwen3.8:27b-mlx",
         ollama_timeout=300.0,
         reasoning_effort="none",
         docker_ollama_url="http://host.docker.internal:11434",
-        embedding_model="qwen3-embedding:0.6b",
-        embedding_dim=1024,
-        collection="rag_chunks_qwen3_embedding_0_6b_1024",
+        embedding_model="qwen3-embedding:8b",
+        embedding_dim=None,
+        collection=None,
         data_dir=data_dir,
         port=8000,
         ollama_url="http://127.0.0.1:11434",
@@ -71,35 +71,61 @@ def test_manifest_forces_fresh_vectorization_and_container_paths(tmp_path: Path)
     ]
 
 
-def test_compose_env_uses_local_ollama_for_generation_and_embeddings(tmp_path: Path) -> None:
+def test_embedding_probe_auto_detects_8b_dimension_and_collection(tmp_path: Path) -> None:
     args = _args(tmp_path)
+    fake = {"data": [{"index": 0, "embedding": [0.0] * 4096}]}
 
-    env = mod._compose_env(args)
+    with patch.object(mod, "_request_json", return_value=fake):
+        actual = mod._probe_embedding(args)
 
-    assert env["RAGBOT_LLM_PROVIDER"] == "ollama"
-    assert env["OLLAMA_MODEL"] == "qwen3.8:27b"
-    assert env["EMBEDDING_MODEL"] == "qwen3-embedding:0.6b"
-    assert env["EMBEDDING_API_KEY"] == "ollama"
-    assert env["EMBEDDING_BASE_URL"] == "http://host.docker.internal:11434"
-    assert env["QDRANT_DIM"] == "1024"
-    assert env["QDRANT_COLLECTION"] == "rag_chunks_qwen3_embedding_0_6b_1024"
-    assert env["RAGBOT_DATA_DIR"] == str(args.data_dir.resolve())
+    assert actual == 4096
+    assert args.embedding_dim == 4096
+    assert args.collection == "rag_chunks_smoke_qwen3_embedding_8b_4096"
 
 
-def test_embedding_probe_rejects_dimension_mismatch(tmp_path: Path) -> None:
+def test_embedding_probe_rejects_explicit_dimension_mismatch(tmp_path: Path) -> None:
     args = _args(tmp_path)
-    fake = {
-        "data": [
-            {
-                "index": 0,
-                "embedding": [0.0] * 768,
-            }
-        ]
-    }
+    args.embedding_dim = 1024
+    fake = {"data": [{"index": 0, "embedding": [0.0] * 4096}]}
 
     with patch.object(mod, "_request_json", return_value=fake):
         with pytest.raises(mod.UserError, match="dimension mismatch"):
             mod._probe_embedding(args)
+
+
+def test_explicit_collection_is_preserved_after_auto_dimension(tmp_path: Path) -> None:
+    args = _args(tmp_path)
+    args.collection = "my_qdrant_collection"
+    fake = {"data": [{"index": 0, "embedding": [0.0] * 4096}]}
+
+    with patch.object(mod, "_request_json", return_value=fake):
+        mod._probe_embedding(args)
+
+    assert args.embedding_dim == 4096
+    assert args.collection == "my_qdrant_collection"
+
+
+def test_compose_env_uses_resolved_ollama_embedding_contract(tmp_path: Path) -> None:
+    args = _args(tmp_path)
+    args.embedding_dim = 4096
+    args.collection = "rag_chunks_smoke_qwen3_embedding_8b_4096"
+
+    env = mod._compose_env(args)
+
+    assert env["RAGBOT_LLM_PROVIDER"] == "ollama"
+    assert env["OLLAMA_MODEL"] == "qwen3.8:27b-mlx"
+    assert env["EMBEDDING_MODEL"] == "qwen3-embedding:8b"
+    assert env["EMBEDDING_API_KEY"] == "ollama"
+    assert env["EMBEDDING_BASE_URL"] == "http://host.docker.internal:11434"
+    assert env["QDRANT_DIM"] == "4096"
+    assert env["QDRANT_COLLECTION"] == "rag_chunks_smoke_qwen3_embedding_8b_4096"
+    assert env["RAGBOT_DATA_DIR"] == str(args.data_dir.resolve())
+
+
+def test_compose_env_rejects_unresolved_dimension(tmp_path: Path) -> None:
+    args = _args(tmp_path)
+    with pytest.raises(ValueError, match="must be resolved"):
+        mod._compose_env(args)
 
 
 def test_search_requires_real_semantic_results(tmp_path: Path) -> None:
@@ -108,7 +134,7 @@ def test_search_requires_real_semantic_results(tmp_path: Path) -> None:
         "chunks": [{"chunk_id": "c1", "score": 0.8, "text": "evidence"}],
         "diagnostics": {
             "semantic_embedding": True,
-            "embedding_model": "qwen3-embedding:0.6b",
+            "embedding_model": "qwen3-embedding:8b",
             "vector_store": "QdrantClientAdapter",
         },
     }
@@ -125,7 +151,7 @@ def test_search_rejects_hash_fallback(tmp_path: Path) -> None:
         "chunks": [{"chunk_id": "c1", "score": 0.1, "text": "lexical"}],
         "diagnostics": {
             "semantic_embedding": False,
-            "embedding_model": "hash-1024",
+            "embedding_model": "hash-4096",
         },
     }
 
