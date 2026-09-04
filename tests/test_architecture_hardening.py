@@ -14,6 +14,7 @@ from services.api.app.agent.graph import build_default_services, run_agent
 from services.api.app.api import ChatRequest
 from services.api.app.retrieval.qdrant import InMemoryQdrant, QdrantClientAdapter
 from services.api.app.storage.models import Source
+from services.worker.main import _drain_publication_outbox
 from services.worker.pipeline import purge_source_knowledge, run_ingest_pipeline
 
 
@@ -115,14 +116,40 @@ class IngestionLifecycleTests(unittest.TestCase):
         self.assertEqual(second.chunk_count, 0)
         self.assertEqual(second.stats["chunks_reused"], 1)
         self.assertEqual(second.stats["documents_removed"], 1)
+        self.assertEqual(second.stats["vector_cleanup_enqueued"], 1)
         documents = services.repo.list_documents("tenant-a")
         self.assertEqual([doc.doc_id for doc in documents], ["doc-src-reconcile:keep.txt"])
-        hits = qdrant.search(
+
+        # Staged-generation cutover makes the new PG manifest authoritative
+        # immediately. The retired physical point may remain in Qdrant until the
+        # durable publication outbox is drained.
+        raw_hits_before_cleanup = qdrant.search(
             [1.0] + [0.0] * 63,
             {"tenant_id": "tenant-a"},
             top_k=10,
         )
-        self.assertTrue(all(hit[2]["doc_id"] == "doc-src-reconcile:keep.txt" for hit in hits))
+        self.assertTrue(
+            any(hit[2]["doc_id"] == "doc-src-reconcile:remove.txt" for hit in raw_hits_before_cleanup)
+        )
+
+        processed = _drain_publication_outbox(
+            services.repo,
+            qdrant,
+            worker_id="lifecycle-test-worker",
+            lease_seconds=30,
+            max_attempts=5,
+            retry_base_seconds=0.01,
+            retry_max_seconds=1.0,
+        )
+        self.assertEqual(processed, 1)
+        hits_after_cleanup = qdrant.search(
+            [1.0] + [0.0] * 63,
+            {"tenant_id": "tenant-a"},
+            top_k=10,
+        )
+        self.assertTrue(
+            all(hit[2]["doc_id"] == "doc-src-reconcile:keep.txt" for hit in hits_after_cleanup)
+        )
 
     def test_purge_source_removes_documents_chunks_and_vectors(self):
         services = build_default_services()
