@@ -211,6 +211,7 @@ def cmd_ask(args: argparse.Namespace) -> None:
 
 def cmd_search(args: argparse.Namespace) -> None:
     query = " ".join(args.query)
+    rerank = not args.no_rerank
     if args.server:
         result = _api_request(
             args.server,
@@ -223,6 +224,7 @@ def cmd_search(args: argparse.Namespace) -> None:
                 "top_k": args.top_k,
                 "mode": args.mode,
                 "candidate_pool": args.candidate_pool,
+                "rerank": rerank,
                 "explain": args.explain,
             },
             _auth_headers(args.api_key),
@@ -242,6 +244,7 @@ def cmd_search(args: argparse.Namespace) -> None:
             top_k=args.top_k,
             mode=args.mode,
             candidate_pool=args.candidate_pool,
+            rerank=rerank,
         )
         context = {}
         if chunks:
@@ -557,6 +560,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--candidate-pool",
         type=int,
         help="Pre-rerank candidate budget; final results still use --top-k",
+    )
+    search.add_argument(
+        "--no-rerank",
+        action="store_true",
+        help="Disable configured reranker to isolate first-stage retrieval/fusion",
     )
     search.add_argument(
         "--explain",
