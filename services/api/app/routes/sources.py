@@ -236,9 +236,17 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
             raise HTTPException(404, "Source not found")
         authorize_tenant(_key, source.tenant_id)
         require_operator(_key)
-        purge_source_knowledge(source, services.repo, services.qdrant)
-        if not services.repo.delete_source(source_id):
+
+        # Fence first, purge second. Running workers observe the tombstone/new
+        # updated_at generation and cannot republish knowledge after the purge.
+        tombstoned = services.repo.update_source(
+            source_id,
+            status="deleted",
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        if tombstoned is None:
             raise HTTPException(404, "Source not found")
+        purge_source_knowledge(tombstoned, services.repo, services.qdrant)
         return None
 
     return router
