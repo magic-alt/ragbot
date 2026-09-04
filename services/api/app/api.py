@@ -17,11 +17,18 @@ from .agent.context import process_client_context
 from .agent.graph import run_agent
 from .agent.state import Constraints, SourceType
 from .auth.acl import compute_security_scope
-from .auth.principal import authorize_identity, require_admin
+from .auth.principal import (
+    CAP_FEEDBACK_WRITE,
+    CAP_KNOWLEDGE_QUERY,
+    authorize_identity,
+    require_admin,
+    require_capability,
+)
 from .factory import build_services_from_env
 from .main import chat
 from .middleware import setup_middleware
 from .observability.metrics import get_metrics_collector
+from .observability.otel_metrics import setup_otel_metrics
 from .observability.prometheus import render_prometheus
 from .observability.tracing import setup_tracing
 from .routes.admin_ui import create_admin_ui_router
@@ -43,7 +50,7 @@ def _load_api_keys() -> Optional[set]:
     raw = os.getenv("RAGBOT_API_KEYS", "")
     if not raw.strip():
         return None
-    return {k.strip() for k in raw.split(",") if k.strip()}
+    return {key.strip() for key in raw.split(",") if key.strip()}
 
 
 async def verify_api_key(api_key: Optional[str] = Depends(_API_KEY_HEADER)) -> Optional[str]:
@@ -70,6 +77,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     validate_production_environment()
     _VALID_API_KEYS = _load_api_keys()
     setup_tracing()
+    setup_otel_metrics()
     yield
 
     if _services is not None:
@@ -120,6 +128,7 @@ class ChatRequest(BaseModel):
 
 @app.post("/chat")
 async def chat_endpoint(payload: ChatRequest, _key: Optional[str] = Depends(verify_api_key)):
+    require_capability(_key, CAP_KNOWLEDGE_QUERY)
     services = _get_services()
     constraints = _constraints_from_model(payload.constraints)
     constraints, initial_evidence = process_client_context(payload.client_context, constraints)
@@ -182,29 +191,34 @@ async def prometheus_metrics_endpoint(_key: Optional[str] = Depends(verify_api_k
 
 @app.get("/admin/metrics")
 async def metrics_endpoint(_key: Optional[str] = Depends(verify_api_key)) -> dict:
+    """Return process-local diagnostic aggregation, not production monitoring state."""
     require_admin(_key)
-    collector = get_metrics_collector()
-    agg = collector.aggregate()
+    aggregate = get_metrics_collector().aggregate()
     return {
-        "total_requests": agg.total_requests,
-        "citation_coverage": round(agg.citation_coverage, 4),
-        "retrieval_hit_rate": round(agg.retrieval_hit_rate, 4),
-        "tool_failure_rate": round(agg.tool_failure_rate, 4),
-        "avg_duration_ms": round(agg.avg_duration_ms, 1),
-        "p95_duration_ms": round(agg.p95_duration_ms, 1),
-        "avg_iterations": round(agg.avg_iterations, 2),
-        "confidence_distribution": agg.confidence_distribution,
-        "tool_stats": agg.tool_stats,
-        "feedback_score": round(agg.feedback_score, 4),
-        "positive_feedback": agg.positive_feedback,
-        "negative_feedback": agg.negative_feedback,
+        "scope": "process-local-diagnostics",
+        "production_metrics": "/metrics",
+        "total_requests": aggregate.total_requests,
+        "citation_coverage": round(aggregate.citation_coverage, 4),
+        "retrieval_hit_rate": round(aggregate.retrieval_hit_rate, 4),
+        "tool_failure_rate": round(aggregate.tool_failure_rate, 4),
+        "avg_duration_ms": round(aggregate.avg_duration_ms, 1),
+        "p95_duration_ms": round(aggregate.p95_duration_ms, 1),
+        "avg_iterations": round(aggregate.avg_iterations, 2),
+        "confidence_distribution": aggregate.confidence_distribution,
+        "tool_stats": aggregate.tool_stats,
+        "feedback_score": round(aggregate.feedback_score, 4),
+        "positive_feedback": aggregate.positive_feedback,
+        "negative_feedback": aggregate.negative_feedback,
     }
 
 
 @app.get("/admin/metrics/history")
 async def metrics_history_endpoint(last_n: int = 100, _key: Optional[str] = Depends(verify_api_key)) -> dict:
     require_admin(_key)
-    return {"requests": get_metrics_collector().get_history(last_n)}
+    return {
+        "scope": "process-local-diagnostics",
+        "requests": get_metrics_collector().get_history(last_n),
+    }
 
 
 class FeedbackRequest(BaseModel):
@@ -214,10 +228,11 @@ class FeedbackRequest(BaseModel):
 
 @app.post("/admin/feedback")
 async def feedback_endpoint(payload: FeedbackRequest, _key: Optional[str] = Depends(verify_api_key)):
+    require_capability(_key, CAP_FEEDBACK_WRITE)
     collector = get_metrics_collector()
     found = collector.record_feedback(payload.request_id, payload.feedback)
     if not found:
-        raise HTTPException(status_code=404, detail="Request not found")
+        raise HTTPException(status_code=404, detail="Request not found in this API replica's diagnostic history")
     return {"status": "ok"}
 
 
@@ -226,17 +241,6 @@ async def cost_endpoint(_key: Optional[str] = Depends(verify_api_key)) -> dict:
     require_admin(_key)
     from .llm.router import CostTracker
     return CostTracker().summary()
-
-
-@app.get("/admin/cache")
-async def cache_endpoint(_key: Optional[str] = Depends(verify_api_key)) -> dict:
-    require_admin(_key)
-    from .cache.cache import get_embedding_cache, get_retrieval_cache, is_cache_enabled
-    return {
-        "enabled": is_cache_enabled(),
-        "retrieval": get_retrieval_cache().stats(),
-        "embedding": get_embedding_cache().stats(),
-    }
 
 
 def _constraints_from_model(model: Optional[ConstraintsModel]) -> Optional[Constraints]:
@@ -321,8 +325,8 @@ async def _chat_stream_realtime(
 def _iter_tokens(text: str, size: int = 8) -> Iterator[str]:
     if not text:
         return
-    for i in range(0, len(text), size):
-        yield text[i : i + size]
+    for index in range(0, len(text), size):
+        yield text[index : index + size]
 
 
 def _sse(event: str, data: dict) -> str:
