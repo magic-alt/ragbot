@@ -15,6 +15,15 @@ _VALID_STRATEGIES = {
     "docling": {"document"},
     "unstructured": {"elements"},
 }
+_OFFICE_SUFFIXES = {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
+_OFFICE_MEDIA_TYPES = {
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
 
 
 def resolve_parser_spec(
@@ -30,7 +39,10 @@ def resolve_parser_spec(
         raise ValueError(
             f"Unsupported parser provider {provider!r}; expected one of {sorted(_VALID_STRATEGIES)}"
         )
-    strategy = str(raw.get("strategy") or (default_strategy if provider == default_provider else _default_strategy(provider))).strip().lower()
+    strategy = str(
+        raw.get("strategy")
+        or (default_strategy if provider == default_provider else _default_strategy(provider))
+    ).strip().lower()
     if strategy not in _VALID_STRATEGIES[provider]:
         raise ValueError(
             f"Unsupported parser strategy {provider}/{strategy}; expected one of {sorted(_VALID_STRATEGIES[provider])}"
@@ -88,6 +100,8 @@ def _default_parser(*, name: str, media_type: str) -> tuple[str, str]:
     normalized_media = (media_type or "").split(";", 1)[0].strip().lower()
     if suffix == ".pdf" or normalized_media == "application/pdf":
         return "ragbot", "pypdf2"
+    if suffix in _OFFICE_SUFFIXES or normalized_media in _OFFICE_MEDIA_TYPES:
+        return "docling", "document"
     if suffix in {".html", ".htm"} or normalized_media in {"text/html", "application/xhtml+xml"}:
         return "ragbot", "html"
     return "ragbot", "text"
