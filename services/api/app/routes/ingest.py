@@ -19,7 +19,14 @@ from pydantic import BaseModel, Field
 
 from services.worker.source_fence import job_stats_for_source
 
-from ..auth.principal import allowed_tenants, authorize_tenant, require_operator
+from ..auth.principal import (
+    CAP_CATALOG_READ,
+    CAP_INGEST_RETRY,
+    CAP_INGEST_RUN,
+    allowed_tenants,
+    authorize_tenant,
+    require_capability,
+)
 from ..storage.models import IngestionJob
 
 
@@ -121,7 +128,7 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if source.tenant_id != payload.tenant_id:
             raise HTTPException(403, "Tenant mismatch")
         authorize_tenant(_key, source.tenant_id)
-        require_operator(_key)
+        require_capability(_key, CAP_INGEST_RUN)
 
         job = enqueue_ingestion_job(source, services)
         return TriggerJobResponse(status="accepted", job_id=job.job_id, source_id=source.source_id)
@@ -132,6 +139,7 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         source_id: Optional[str] = None,
         _key: Optional[str] = Depends(auth_dep),
     ):
+        require_capability(_key, CAP_CATALOG_READ)
         services = get_services()
         if tenant_id:
             authorize_tenant(_key, tenant_id)
@@ -148,6 +156,7 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if not job:
             raise HTTPException(404, f"Job not found: {job_id}")
         authorize_tenant(_key, job.tenant_id)
+        require_capability(_key, CAP_CATALOG_READ)
         return asdict(job)
 
     @router.post("/jobs/{job_id}/retry", status_code=202)
@@ -157,7 +166,7 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if not old_job:
             raise HTTPException(404, f"Job not found: {job_id}")
         authorize_tenant(_key, old_job.tenant_id)
-        require_operator(_key)
+        require_capability(_key, CAP_INGEST_RETRY)
         if old_job.status != "failed":
             raise HTTPException(400, "Only failed jobs can be retried; use /requeue for dead-lettered jobs")
 
@@ -180,7 +189,7 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if not old_job:
             raise HTTPException(404, f"Job not found: {job_id}")
         authorize_tenant(_key, old_job.tenant_id)
-        require_operator(_key)
+        require_capability(_key, CAP_INGEST_RETRY)
         if old_job.status != "dead_lettered":
             raise HTTPException(400, "Only dead-lettered jobs can be requeued")
 
