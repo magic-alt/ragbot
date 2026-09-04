@@ -13,6 +13,7 @@ from services.worker.connectors.credentials import validate_secret_ref
 from services.worker.parsing import resolve_parser_spec
 from services.worker.pipeline import purge_source_knowledge
 from services.worker.scheduler import configure_source_sync
+from services.worker.uploads.lifecycle import retire_uploaded_object_for_source
 
 from ..auth.principal import (
     CAP_CATALOG_READ,
@@ -306,6 +307,7 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         )
         if tombstoned is None:
             raise HTTPException(404, "Source not found")
+        retire_uploaded_object_for_source(services.repo, tombstoned)
         purge_source_knowledge(tombstoned, services.repo, services.qdrant)
         return None
 
