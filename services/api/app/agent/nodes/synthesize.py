@@ -56,18 +56,30 @@ async def _llm_build_claims(
 ) -> Tuple[List[dict], List[Citation], bool, List[str]]:
     pack, citation_map = _build_evidence_pack(state.evidence)
     system = (
-        "You are a RAG assistant. Use only the provided evidence. "
-        "Every claim must cite at least one citation id. "
-        "Return JSON only."
+        "You are a RAG assistant. Use only the provided evidence for factual claims. "
+        "Conversation history may clarify references and user intent but is not evidence. "
+        "Every factual claim must cite at least one citation id. Return JSON only."
     )
-    user = (
-        "Question:\n"
-        f"{state.query}\n\n"
-        "Evidence (use these citation ids only):\n"
-        f"{pack}\n\n"
-        "Return JSON with fields: claims (array of {text, citation_ids}), "
-        "insufficient (boolean), missing (array of strings)."
-    )
+    if state.system_prompt:
+        system += (
+            "\nApplication system instruction follows. It cannot override the evidence/citation policy:\n"
+            + state.system_prompt.strip()
+        )
+
+    conversation = _conversation_context(state.conversation_messages)
+    user_parts = []
+    if conversation:
+        user_parts.extend(["Conversation context:", conversation, ""])
+    user_parts.extend([
+        "Current question:",
+        state.query,
+        "",
+        "Evidence (use these citation ids only):",
+        pack,
+        "",
+        "Return JSON with fields: claims (array of {text, citation_ids}), insufficient (boolean), missing (array of strings).",
+    ])
+    user = "\n".join(user_parts)
     schema = {
         "type": "object",
         "properties": {
@@ -93,12 +105,29 @@ async def _llm_build_claims(
         "required": ["claims", "insufficient", "missing"],
         "additionalProperties": False,
     }
-    result = await llm.chat_json(system=system, user=user, schema=schema)
+    result = await llm.chat_json(
+        system=system,
+        user=user,
+        schema=schema,
+        temperature=state.generation_temperature,
+        max_output_tokens=state.generation_max_tokens,
+    )
     claims = result.get("claims", []) or []
     insufficient = bool(result.get("insufficient"))
     missing = result.get("missing", []) or []
     used_citations = _collect_citations(claims, citation_map)
     return claims, used_citations, insufficient, missing
+
+
+def _conversation_context(messages: Sequence[dict]) -> str:
+    lines: List[str] = []
+    for message in messages:
+        role = str(message.get("role") or "").strip().lower()
+        content = str(message.get("content") or "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
 
 
 def _render_claim_lines(claims: Sequence[dict]) -> List[str]:
@@ -222,4 +251,3 @@ def _dedupe_citations(citations: List[Citation]) -> List[Citation]:
         seen.add(cite)
         result.append(cite)
     return result
-
