@@ -50,6 +50,18 @@ def test_runtime_location_maps_docker_data_mount(tmp_path: Path, monkeypatch: py
     assert MODULE._runtime_location(pdf, "local") == str(pdf.resolve())
 
 
+def test_source_location_is_executor_independent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data = tmp_path / "data"
+    pdf = data / "manuals" / "Deep Seek 入门.pdf"
+    pdf.parent.mkdir(parents=True)
+    pdf.write_bytes(b"pdf")
+    monkeypatch.setattr(MODULE, "DATA_DIR", data)
+
+    assert MODULE._source_location(pdf) == (
+        "ragbot-data:///manuals/Deep%20Seek%20%E5%85%A5%E9%97%A8.pdf"
+    )
+
+
 def test_resolve_runtime_mode_recovers_stale_saved_docker_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(MODULE, "_docker_stack_running", lambda: False)
     monkeypatch.setattr(MODULE, "_local_runtime_running", lambda: True)
@@ -93,7 +105,7 @@ def test_competing_host_python_client_blocks_docker_submission(monkeypatch: pyte
         MODULE._assert_no_competing_host_worker()
 
 
-def test_docker_source_contract_probes_worker_container_path(
+def test_docker_source_contract_uses_production_validator_with_portable_uri(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data = tmp_path / "Users" / "kaermax" / "ragbot" / "data"
@@ -113,7 +125,8 @@ def test_docker_source_contract_probes_worker_container_path(
 
     command, kwargs = captured[0]
     assert command[:5] == ["docker", "compose", "exec", "-T", "worker"]
-    assert command[-1] == "/data/manuals/guide.pdf"
+    assert command[-1] == "ragbot-data:///manuals/guide.pdf"
+    assert "validate_local_source_path" in command[-2]
     assert kwargs["cwd"] == tmp_path
     assert kwargs["capture_output"] is True
 
@@ -138,7 +151,7 @@ def test_docker_source_contract_probes_every_pdf_in_batch(
     monkeypatch.setattr(MODULE.subprocess, "run", fake_run)
     MODULE._docker_source_contract([first, second])
 
-    assert captured[0][-2:] == ["/data/a.pdf", "/data/nested/b.pdf"]
+    assert captured[0][-2:] == ["ragbot-data:///a.pdf", "ragbot-data:///nested/b.pdf"]
 
 
 def test_docker_source_contract_fails_early_with_recreate_command(
@@ -165,7 +178,7 @@ def test_docker_source_contract_fails_early_with_recreate_command(
         MODULE._docker_source_contract(pdf)
 
 
-def test_source_spec_builds_pdf_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_source_spec_builds_portable_pdf_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     data = tmp_path / "data"
     pdf = data / "docs" / "guide.pdf"
     pdf.parent.mkdir(parents=True)
@@ -181,12 +194,39 @@ def test_source_spec_builds_pdf_source(tmp_path: Path, monkeypatch: pytest.Monke
     )
 
     assert spec == {
-        "location": "/data/docs/guide.pdf",
+        "location": "ragbot-data:///docs/guide.pdf",
         "source_type": "pdf",
         "name": "docs/guide.pdf",
         "tags": ["manuals", "pdf"],
         "config": {"chunk_size": 900, "chunk_overlap": 120},
     }
+
+
+def test_source_spec_is_identical_in_local_and_docker_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data"
+    pdf = data / "guide.pdf"
+    data.mkdir()
+    pdf.write_bytes(b"pdf")
+    monkeypatch.setattr(MODULE, "DATA_DIR", data)
+
+    local = MODULE._source_spec(
+        pdf,
+        mode="local",
+        tags=[],
+        chunk_size=None,
+        chunk_overlap=None,
+    )
+    docker = MODULE._source_spec(
+        pdf,
+        mode="docker",
+        tags=[],
+        chunk_size=None,
+        chunk_overlap=None,
+    )
+
+    assert local["location"] == docker["location"] == "ragbot-data:///guide.pdf"
 
 
 def test_batches_preserve_every_pdf() -> None:
