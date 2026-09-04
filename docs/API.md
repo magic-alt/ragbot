@@ -8,69 +8,77 @@ The running FastAPI application is the canonical HTTP contract:
 - OpenAPI JSON: `GET /openapi.json`
 - Offline export: `python scripts/export_openapi.py --output build/openapi.json`
 
-This guide explains product and security semantics that are easier to understand in prose.
+This guide documents security and operational semantics that are easier to understand in prose.
 
 ## Authentication, trusted identity, and RBAC
 
 If `RAGBOT_API_KEYS` is non-empty, protected endpoints require `X-API-Key`.
 
-`RAGBOT_API_KEY_PRINCIPALS` maps each API key to trusted tenant/user/groups/roles/admin state. Production startup requires complete principal coverage for configured API keys. Request payloads and headers cannot expand the tenant/user/ACL scope beyond the principal.
+`RAGBOT_API_KEY_PRINCIPALS` maps each key to trusted tenant/user/groups/roles/admin state. Production startup requires complete principal coverage and every non-admin production principal must carry at least one platform role: `reader`, `operator`, or `owner`. Request payloads/headers cannot expand tenant or user identity beyond that principal.
 
-v1 tenant roles:
+Platform capabilities are explicit and hierarchical:
 
-| Principal | Intended capability |
-| --- | --- |
-| `reader` | retrieval/chat/catalog/job read |
-| `operator` | reader capabilities plus Source, ingestion, retry/requeue and schedule mutations |
-| `owner` | tenant-level superset of operator |
-| `admin=true` | global operational/admin surfaces; also bypasses tenant role checks |
+| Capability | reader | operator | owner | `admin=true` |
+|---|:---:|:---:|:---:|:---:|
+| `knowledge.query` | ✓ | ✓ | ✓ | ✓ |
+| `catalog.read` | ✓ | ✓ | ✓ | ✓ |
+| `feedback.write` | ✓ | ✓ | ✓ | ✓ |
+| `source.create` |  | ✓ | ✓ | ✓ |
+| `source.update` |  | ✓ | ✓ | ✓ |
+| `source.sync` |  | ✓ | ✓ | ✓ |
+| `ingestion.run` |  | ✓ | ✓ | ✓ |
+| `ingestion.retry` |  | ✓ | ✓ | ✓ |
+| `source.delete` |  |  | ✓ | ✓ |
+| global admin/metrics/reconcile |  |  |  | ✓ |
 
-Development mode without principal mappings remains backward compatible and exposes owner/admin-like local capabilities. Do not use that mode as an authorization model in production.
+`admin=true` is a global operational identity, not a synonym for tenant owner. Additional role strings may still be used by document ACL policies; custom ACL roles do **not** grant platform capabilities.
 
-Probe endpoints `/admin/health` and `/admin/ready` remain available for liveness/readiness checks.
+Development mode without principal mappings remains backward compatible and has unrestricted local tenant capabilities. Do not use that mode as a production authorization model.
 
 ### `GET /catalog/session`
 
-Returns non-secret capability metadata for the authenticated API key. The Admin UI uses this endpoint to render read-only vs operator controls without exposing principal configuration or secret values.
-
-Representative reader response:
+Returns non-secret RBAC metadata for the authenticated principal. The response preserves the legacy UI summary and adds the authoritative capability set:
 
 ```json
 {
   "principal_mode": "scoped",
   "admin": false,
-  "roles": ["reader"],
+  "roles": ["operator"],
   "tenant_ids": ["engineering"],
   "capabilities": {
     "read": true,
-    "operate": false,
+    "operate": true,
     "admin": false
+  },
+  "effective_capabilities": [
+    "catalog.read",
+    "feedback.write",
+    "ingestion.retry",
+    "ingestion.run",
+    "knowledge.query",
+    "source.create",
+    "source.sync",
+    "source.update"
+  ],
+  "role_capability_matrix": {
+    "reader": ["catalog.read", "feedback.write", "knowledge.query"],
+    "operator": ["... reader + non-destructive source/ingestion capabilities ..."],
+    "owner": ["... operator + source.delete ..."]
   }
 }
 ```
 
 ## Source types
 
-Ingestible source types:
+Ingestible source types: `local_fs`, `pdf`, `web`, `repo`, `s3`, `gdrive`, `notion`, `confluence`.
 
-- `local_fs`
-- `pdf`
-- `web`
-- `repo`
-- `s3`
-- `gdrive`
-- `notion`
-- `confluence`
-
-SQL querying is separate from ingestion and uses `POSTGRES_DSN` plus allowed-schema policy.
+Agent SQL is a separate, fail-closed capability. It uses an isolated `RAGBOT_SQL_DSN`, never the internal `POSTGRES_DSN` control-plane database.
 
 ## Product ingestion API
 
 ### `POST /ingest/quick`
 
-Requires `operator`, `owner`, or global admin when scoped principals are enabled.
-
-Creates/reuses a Source and submits ingestion in one request:
+Requires operator-or-owner ingestion capability. Creates/reuses a Source and submits ingestion in one request:
 
 ```json
 {
@@ -81,17 +89,7 @@ Creates/reuses a Source and submits ingestion in one request:
 }
 ```
 
-Important fields:
-
-- `tenant_id`: required;
-- `location`: local path, URL, or connector product URI;
-- `source_type`: optional; inferred when possible;
-- `name`, `tags`, `acl_policy_id`: optional Source metadata;
-- `config`: non-secret connector configuration;
-- `reuse_source`: default `true`;
-- `sync_source_metadata`: default `true`;
-- `dedupe_active_job`: default `true`;
-- `idempotency_key`: optional deterministic request idempotency key.
+Important fields: `tenant_id`, `location`, optional `source_type`, Source metadata, non-secret connector `config`, `reuse_source`, `sync_source_metadata`, `dedupe_active_job`, and optional `idempotency_key`.
 
 Default Source identity derives from:
 
@@ -99,17 +97,15 @@ Default Source identity derives from:
 tenant_id + source_type + canonicalized location
 ```
 
-Same-config pending/running Jobs may be reused as a convenience. If an active Job exists with a different connector config, the request returns `409` rather than mutating the Source and claiming the old Job represents the new request.
-
-`idempotency_key` derives a deterministic Job ID and is the strict replay mechanism across API replicas; it requires `reuse_source=true`.
+Same-config pending/running Jobs may be reused. A conflicting active connector config returns `409`. `idempotency_key` is the strict replay mechanism across API replicas and requires `reuse_source=true`.
 
 ### `POST /ingest/batch`
 
-Requires operator capability. Submits 1–100 Quick Import specifications for one tenant. Each item has an independent result; inspect `failed` and `items` even when the HTTP response is `202`.
+Requires operator-or-owner ingestion capability. Submits 1–100 Quick Import specifications for one tenant. Each item has an independent result; inspect `failed` and `items` even when HTTP status is `202`.
 
 ## Cloud/SaaS credential contract
 
-Google Drive, Notion, and Confluence Source configuration stores a reference, never the credential value:
+Google Drive, Notion, and Confluence Source configuration stores a reference, never the secret value:
 
 ```json
 {
@@ -117,204 +113,153 @@ Google Drive, Notion, and Confluence Source configuration stores a reference, ne
 }
 ```
 
-The API validates the `env:VARIABLE` reference but does not resolve the secret. The ingestion worker resolves it at execution time. Inline access/refresh tokens, API keys, passwords, private keys, and client secrets are rejected for SaaS source types.
-
-See `docs/CLOUD_CONNECTORS.md` for connector-specific configuration.
+The API validates the reference; the worker resolves it at execution time. Inline access/refresh tokens, API keys, passwords, private keys, and client secrets are rejected for SaaS source types.
 
 ## Low-level Sources API
 
-Source mutation routes require operator capability under scoped principals.
-
 ### `POST /sources`
 
-Valid source/config contracts:
+Requires `source.create` (operator/owner). Valid contracts:
 
-| source_type | required config | notes |
-| --- | --- | --- |
-| `local_fs` | `path` | mounted text/Markdown tree |
-| `pdf` | `path` | local or remote PDF |
-| `web` | `url` | web content |
-| `repo` | `path` | repository path/URL; optional `ref` |
-| `s3` | `bucket` | optional `prefix`, endpoint/region options |
-| `gdrive` | `folder_id`, `credential_ref` | optional `credential_type=access_token|google_json` |
-| `notion` | `page_id`, `credential_ref` | optional recursive traversal/API version |
-| `confluence` | `base_url`, `space_key`, `credential_ref` | basic auth also requires email; bearer supported |
+| source_type | required config |
+|---|---|
+| `local_fs` | `path` |
+| `pdf` | `path` |
+| `web` | `url` |
+| `repo` | `path` |
+| `s3` | `bucket` |
+| `gdrive` | `folder_id`, `credential_ref` |
+| `notion` | `page_id`, `credential_ref` |
+| `confluence` | `base_url`, `space_key`, `credential_ref` |
 
 ### `GET /sources`
 
-Lists non-deleted Sources within authorized tenant scope.
+Requires `catalog.read`. Lists non-deleted Sources in authorized tenant scope.
 
 ### `GET /sources/{source_id}`
 
-Returns one Source after tenant authorization. This low-level endpoint includes Source config; operator/control-plane UIs should prefer redacted catalog APIs.
+Requires `catalog.read` after tenant authorization. The low-level endpoint includes Source config; product UIs should prefer redacted catalog APIs.
 
 ### `PUT /sources/{source_id}`
 
-Updates name, connector config, status, ACL policy, or tags. A queued Job retains the immutable `source_type/source_config` snapshot captured when submitted.
+Requires `source.update`. Updates name/config/status/ACL/tags. Queued Jobs retain the immutable connector snapshot captured at submission.
 
 ### `PUT /sources/{source_id}/sync`
 
-Configures recurring synchronization:
-
-```json
-{
-  "enabled": true,
-  "interval_seconds": 3600,
-  "run_immediately": false
-}
-```
-
-Scheduled Jobs use deterministic IDs plus atomic insert-if-absent; missed intervals collapse into one current refresh. Active ingestion for the same Source delays the scheduled refresh.
+Requires `source.sync`. Configures recurring synchronization.
 
 ### `DELETE /sources/{source_id}`
 
-Purges indexed Qdrant vectors and PostgreSQL Documents/Chunks and tombstones the Source.
+Requires **`source.delete`**, therefore tenant `owner` or global admin. Operator is intentionally insufficient for destructive deletion.
+
+Deletion first tombstones/advances Source generation, then purges PostgreSQL/Qdrant knowledge. Running or queued stale Jobs are fenced and cannot republish into the deleted lifecycle.
 
 ## Durable ingestion Jobs
 
 ### `POST /ingest/jobs`
 
-Requires operator capability. Queues an active Source. PostgreSQL-backed production persists a pending Job and an independent worker claims it with lease/heartbeat/recovery semantics.
+Requires `ingestion.run`. PostgreSQL production persists a pending Job; an independent worker claims it with lease/heartbeat/recovery semantics.
 
-### `GET /ingest/jobs`
+### `GET /ingest/jobs` and `GET /ingest/jobs/{job_id}`
 
-Lists Jobs with optional tenant/source filters.
+Require `catalog.read` plus tenant authorization.
 
-### `GET /ingest/jobs/{job_id}`
+Important reliability fields include `status`, `attempts`, `available_at`, lease/heartbeat timestamps, `error`, `failure_class`, `dead_lettered_at`, immutable connector snapshot, and `stats.source_generation`.
 
-Gets a Job after tenant authorization. Low-level responses include the immutable connector snapshot; catalog responses redact it.
-
-Important reliability fields include:
-
-- `status`;
-- `attempts`;
-- `available_at`;
-- lease/heartbeat timestamps;
-- `error`;
-- `failure_class`;
-- `dead_lettered_at`;
-- attempt/reuse/write statistics.
-
-### Job state model
+State model:
 
 ```text
 pending
   ↓ claim
 running
   ├─ success → completed
-  ├─ retryable failure + attempts remaining
-  │      → pending (durable exponential backoff)
-  └─ permanent/exhausted failure
-         → dead_lettered
+  ├─ retryable failure + attempts remaining → pending(backoff)
+  └─ permanent/exhausted/source-generation failure → dead_lettered
 ```
-
-Provider HTTP clients perform a separate short retry layer for 408/425/429/5xx and transport errors before the whole ingestion attempt is returned to the durable queue. `Retry-After` is honored when present.
 
 ### `POST /ingest/jobs/{job_id}/retry`
 
-Requires operator capability. Creates a fresh Job from the **current Source config** and is valid only for legacy/intermediate `failed` Jobs.
+Requires `ingestion.retry`. Creates a fresh Job from current Source config and applies only to `failed` Jobs.
 
 ### `POST /ingest/jobs/{job_id}/requeue`
 
-Requires operator capability. Requeues a `dead_lettered` Job.
+Requires `ingestion.retry`. Requeues a `dead_lettered` Job. Default behavior replays the dead-letter snapshot; `use_current_source_config=true` intentionally adopts repaired current Source config.
 
-Default request:
-
-```json
-{
-  "use_current_source_config": false
-}
-```
-
-The default replays the immutable dead-letter Job snapshot. Set `use_current_source_config=true` only when an operator deliberately wants the repaired/current Source configuration.
+The production queue implementation is the repository/PostgreSQL lease contract. The old `services/worker/queue.py` abstraction has been removed.
 
 ## Product control plane
 
-### `GET /catalog/overview`
+The following tenant catalog endpoints require `catalog.read`:
 
-Tenant-scoped Source/knowledge/queue summary. Queue fields include `pending`, `running`, `failed`, `dead_lettered`, stale lease count, oldest pending age, and 24-hour completion/failure/DLQ counts.
+- `GET /catalog/overview`
+- `GET /catalog/sources`
+- `GET /catalog/jobs`
+- `GET /catalog/session`
 
-### `GET /catalog/sources`
+Global surfaces require `admin=true`:
 
-Redacted Source Catalog. Full connector config and credential references are not returned.
+- `GET /admin/overview`
+- `GET /admin/queue/metrics`
+- `POST /admin/queue/reconcile`
+- `GET /metrics`
+- `GET /admin/metrics`
+- `GET /admin/metrics/history`
+- `GET /admin/cost`
 
-### `GET /catalog/jobs`
-
-Redacted Job history/progress. `source_config` is removed; failure class and DLQ metadata remain visible for operations.
-
-### `GET /catalog/session`
-
-Returns current principal roles/capabilities for UI behavior. It contains no API key, secret values, or connector config.
-
-### `GET /admin/overview`
-
-Global summary; requires `admin=true` when scoped principals are enabled.
-
-### `GET /admin/queue/metrics`
-
-Global queue/backlog metrics, including DLQ counts; admin required.
-
-### `POST /admin/queue/reconcile`
-
-Admin-only queue repair surface. It reconciles expired running leases and stranded failure state according to the configured max-attempt contract.
-
-Example:
-
-```bash
-curl -X POST 'https://ragbot.example.com/admin/queue/reconcile?max_attempts=3' \
-  -H "X-API-Key: $RAGBOT_ADMIN_KEY"
-```
-
-### `GET /admin/ui`
-
-Built-in zero-build control plane. The API key is stored only in browser `sessionStorage`. The UI displays principal role/capability, disables write controls for readers, shows Dead Lettered counts/failure classes, supports failed Retry and DLQ Requeue, and never requests inline SaaS credential values.
-
-## Incremental cloud synchronization
-
-Drive/Notion/Confluence refreshes are metadata-first:
-
-1. enumerate remote metadata;
-2. compare `external_id + remote_version` with previous chunks;
-3. reuse unchanged documents without content download/embedding;
-4. fetch/chunk/embed changed or new documents;
-5. prune remote deletions only after the replacement snapshot succeeds.
-
-Current implementation still enumerates the configured remote tree/space. It is **not yet a provider delta/change-feed implementation**. Drive Changes API / equivalent persistent cursor work belongs to a separate optimization milestone.
+`POST /admin/feedback` is allowed by `feedback.write`, but its request-id lookup is intentionally process-local diagnostic history. If the request was handled by another replica the endpoint may return `404`; production feedback persistence remains a separate data-model concern.
 
 ## Search and Chat
 
-### `POST /search`
+The following require `knowledge.query`:
 
-Direct hybrid retrieval without the Agent loop. Production combines Qdrant vector search + PostgreSQL FTS/CJK lexical search + RRF and optional reranking. Tenant/ACL scope comes from the trusted principal.
+- `POST /search`
+- `POST /chat`
+- `POST /v1/chat/completions`
 
-### `POST /chat`
+Search uses tenant/ACL scope derived from the trusted principal. Production retrieval combines Qdrant vector search + PostgreSQL lexical/CJK + RRF and optional reranking.
 
-Agentic RAG route → tool → synthesize → verify flow. Streaming uses SSE; document retrieval supports all ingestible source types.
+The OpenAI adapter preserves system/history context; the last non-empty user turn remains the active retrieval query. `temperature` and `max_tokens` are propagated to synthesis. Current SSE is final-answer chunk streaming, not provider-native token streaming; token usage is estimated.
 
-### `POST /v1/chat/completions`
+## Metrics and diagnostics
 
-OpenAI-compatible adapter. Tenant/user context remains constrained by the API-key principal.
+### `GET /metrics`
 
-## Other admin endpoints
+Admin-protected Prometheus exposition endpoint. Production Agent metrics are emitted at event time as counters/histograms rather than reconstructed from one process's rolling history. Representative metrics:
 
-- `GET /admin/health`: process liveness;
-- `GET /admin/ready`: repository/vector readiness;
-- `GET /admin/metrics`: aggregate quality/runtime metrics;
-- `GET /admin/metrics/history`: recent metric history;
-- `POST /admin/feedback`: feedback for a known request;
-- `GET /admin/cost`: model-router cost summary;
-- `GET /admin/cache`: cache statistics.
+- `ragbot_agent_requests_total`
+- `ragbot_agent_request_duration_seconds`
+- `ragbot_agent_retrieval_duration_seconds`
+- `ragbot_agent_tool_calls_total`
+- `ragbot_agent_tool_duration_seconds`
+- `ragbot_agent_feedback_total`
+- `ragbot_http_requests_total`
+- `ragbot_ingestion_jobs`
+- `ragbot_ingestion_oldest_pending_age_seconds`
+- `ragbot_ingestion_stale_running_leases`
+
+Prometheus aggregates counters/histograms across replicas. Queue/Source gauges are refreshed from the shared repository during scrape.
+
+### OpenTelemetry metrics
+
+Set:
+
+```dotenv
+RAGBOT_OTEL_METRICS_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+```
+
+Agent request/tool/latency/feedback metrics are exported via OTLP using the OpenTelemetry SDK.
+
+### `/admin/metrics` and `/admin/metrics/history`
+
+These are explicitly **process-local diagnostics**, retained for recent request inspection and feedback correlation. They are not the production metrics backend.
+
+There is no supported `/admin/cache` endpoint. The local cache primitives in `services/api/app/cache/` are experimental/test utilities and are not connected to retrieval.
+
+## CLI ownership
+
+`cli/rag.py` is the single product CLI implementation behind both `rag` and `python -m cli.rag`. `scripts/ragbot.py` is a bootstrap/deployment controller and delegates product commands to `cli.rag`. The old `cli/rag_impl.py` and `scripts/ragbot_impl.py` indirection files have been removed.
 
 ## Source/network security boundary
 
-Production connector policy includes:
-
-- Web/remote PDF/remote Git block non-public destinations by default and revalidate redirects;
-- local Sources must stay below `RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS`;
-- S3-compatible custom endpoints require explicit allowlisting;
-- Confluence production base URLs require `RAGBOT_CONFLUENCE_ALLOWED_HOSTS`;
-- private/self-hosted endpoints require explicit private-network opt-in when applicable;
-- remote downloads use hard byte limits;
-- SaaS secret values live in worker environment/secret stores, not Source config.
-
-Application validation complements rather than replaces VPC/firewall/service-mesh egress policy.
+Production connector policy blocks non-public remote destinations by default, revalidates redirects, constrains local paths to configured roots, applies hard download byte limits, and keeps SaaS secrets in worker environment/secret stores rather than Source config. Application validation complements rather than replaces VPC/firewall/service-mesh egress policy.
