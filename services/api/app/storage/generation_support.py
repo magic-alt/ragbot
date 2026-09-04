@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .generation_activation import activate_inmemory_generation, activate_postgres_generation
 from .generation_repo import InMemoryGenerationMixin, PostgresGenerationMixin
 
 _GENERATION_METHODS = (
@@ -84,9 +85,11 @@ def ensure_generation_repository(repo: Any) -> Any:
     if is_postgres:
         backend = PostgresGenerationMixin
         helpers = _POSTGRES_HELPERS
+        fenced_activation = activate_postgres_generation
     elif hasattr(repo, "_lock") and hasattr(repo, "_documents") and hasattr(repo, "_chunks"):
         backend = InMemoryGenerationMixin
         helpers = _IN_MEMORY_HELPERS
+        fenced_activation = activate_inmemory_generation
     else:
         return repo
 
@@ -100,7 +103,9 @@ def ensure_generation_repository(repo: Any) -> Any:
         setattr(repo, "_row_to_publication_event", getattr(backend, "_row_to_publication_event"))
 
     for name in _GENERATION_METHODS:
-        if is_postgres and name == "retry_publication_outbox":
+        if name == "activate_knowledge_generation":
+            method = fenced_activation
+        elif is_postgres and name == "retry_publication_outbox":
             method = _retry_publication_outbox_postgres
         else:
             method = getattr(backend, name)
