@@ -38,7 +38,7 @@ class Retriever:
         """Return non-secret runtime metadata useful for retrieval debugging."""
         embedder = self._embedder or HashEmbedder(dim=self._qdrant.dim)
         semantic = not isinstance(embedder, HashEmbedder)
-        reranker_enabled = bool(
+        reranker_configured = bool(
             self._reranker
             and hasattr(self._reranker, "enabled")
             and self._reranker.enabled
@@ -66,7 +66,10 @@ class Retriever:
             "vector_store": type(self._qdrant).__name__,
             "repository": type(self._repo).__name__,
             "reranker": type(self._reranker).__name__ if self._reranker is not None else None,
-            "reranker_enabled": reranker_enabled,
+            "reranker_configured": reranker_configured,
+            # Backward-compatible runtime field. Retrieval context can override
+            # this with whether reranking was actually applied for one request.
+            "reranker_enabled": reranker_configured,
             "fusion_mode": fusion_mode,
             "warnings": warnings,
         }
@@ -82,13 +85,15 @@ class Retriever:
         *,
         mode: str = "hybrid",
         candidate_pool: Optional[int] = None,
+        rerank: bool = True,
     ) -> List[RetrievalChunk]:
         """Retrieve evidence using vector, lexical, or adaptive-hybrid ranking.
 
         ``mode`` is intentionally exposed for ablation and evaluation. Normal
         Agent traffic keeps the default ``hybrid`` path. ``candidate_pool`` is
         the recall budget before optional cross-encoder reranking; it is not the
-        final result count.
+        final result count. ``rerank=False`` isolates first-stage retrieval and
+        fusion so benchmark comparisons are not confounded by a cross-encoder.
         """
         retrieval_mode = validate_retrieval_mode(mode)
         pool_size = resolve_candidate_pool(top_k, candidate_pool)
@@ -173,11 +178,12 @@ class Retriever:
 
         pre_rerank_scores = {chunk_id: float(score) for chunk_id, score in ranked}
         rerank_scores: Dict[str, float] = {}
-        reranker_enabled = bool(
+        reranker_configured = bool(
             self._reranker
             and hasattr(self._reranker, "enabled")
             and self._reranker.enabled
         )
+        reranker_enabled = bool(rerank and reranker_configured)
 
         if reranker_enabled and ranked:
             candidates = ranked[:pool_size]
@@ -208,6 +214,8 @@ class Retriever:
             "lexical_candidates": len(fts_ranked),
             "fusion_method": fusion_method,
             "fusion_policy": fusion_policy,
+            "reranker_configured": reranker_configured,
+            "reranker_requested": bool(rerank),
             "reranker_enabled": reranker_enabled,
             "reranker_candidate_count": min(len(pre_rerank_scores), pool_size) if reranker_enabled else 0,
         }
