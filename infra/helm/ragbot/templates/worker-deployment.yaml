@@ -72,6 +72,10 @@ spec:
               value: {{ .Values.worker.reconcileSeconds | quote }}
             - name: RAGBOT_SCHEDULER_SCAN_SECONDS
               value: {{ .Values.worker.schedulerScanSeconds | quote }}
+            - name: RAGBOT_PUBLICATION_OUTBOX_SCAN_SECONDS
+              value: {{ .Values.worker.publicationOutboxScanSeconds | quote }}
+            - name: RAGBOT_PUBLICATION_OUTBOX_MAX_ATTEMPTS
+              value: {{ .Values.worker.publicationOutboxMaxAttempts | quote }}
             - name: RAGBOT_PROVIDER_MAX_ATTEMPTS
               value: {{ .Values.worker.providerMaxAttempts | quote }}
             - name: RAGBOT_PROVIDER_BACKOFF_BASE_SECONDS
