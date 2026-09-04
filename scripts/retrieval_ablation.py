@@ -3,7 +3,12 @@
 
 This intentionally reuses ``scripts/rag_eval.py`` dataset semantics so relevance
 labels, filters and top-k behavior have one contract. It calls the live /search
-endpoint in each retrieval mode and reports Hit@K / MRR@10 side by side.
+endpoint in each retrieval mode and reports macro Recall@K / MRR@10 side by side.
+
+For concept-labeled datasets each query has one relevance target (one or more
+chunks may satisfy it), so macro Recall@K is the fraction of labeled queries
+with at least one relevant result in the first K positions. Hit@K aliases are
+kept in JSON for compatibility with earlier experimental reports.
 
 By default reranking is disabled so vector/lexical/fusion quality is measured in
 isolation. Use ``--with-reranker`` for a second experiment that measures the
@@ -28,10 +33,10 @@ import rag_eval
 MODES = ("vector", "lexical", "hybrid")
 
 
-def _mode_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
+def _summary_core(cases: list[dict[str, Any]]) -> dict[str, Any]:
     labeled = [case for case in cases if case["labeled"] and not case.get("error")]
 
-    def hit_at(k: int) -> float:
+    def recall_at(k: int) -> float:
         if not labeled:
             return 0.0
         return sum(
@@ -46,14 +51,36 @@ def _mode_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         rank = case.get("first_relevant_rank")
         reciprocal.append(1.0 / rank if rank is not None and rank <= 10 else 0.0)
 
+    recall_1 = round(recall_at(1), 4)
+    recall_3 = round(recall_at(3), 4)
+    recall_5 = round(recall_at(5), 4)
+    recall_10 = round(recall_at(10), 4)
     return {
         "labeled_cases": len(labeled),
-        "hit_at_1": round(hit_at(1), 4),
-        "hit_at_3": round(hit_at(3), 4),
-        "hit_at_5": round(hit_at(5), 4),
-        "hit_at_10": round(hit_at(10), 4),
+        "recall_at_1": recall_1,
+        "recall_at_3": recall_3,
+        "recall_at_5": recall_5,
+        "recall_at_10": recall_10,
+        # Compatibility aliases: for one concept target per query these are
+        # mathematically identical to macro recall.
+        "hit_at_1": recall_1,
+        "hit_at_3": recall_3,
+        "hit_at_5": recall_5,
+        "hit_at_10": recall_10,
         "mrr_at_10": round(statistics.fmean(reciprocal), 4) if reciprocal else None,
     }
+
+
+def _mode_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = _summary_core(cases)
+    categories = sorted({str(case.get("category") or "default") for case in cases})
+    summary["by_category"] = {
+        category: _summary_core(
+            [case for case in cases if str(case.get("category") or "default") == category]
+        )
+        for category in categories
+    }
+    return summary
 
 
 def _run_mode(
@@ -137,18 +164,29 @@ def _run_mode(
 def _print_table(results: list[dict[str, Any]]) -> None:
     print()
     print("Retrieval ablation")
-    print("mode      Hit@1   Hit@3   Hit@5   Hit@10  MRR@10")
+    print("mode      R@1     R@3     R@5     R@10    MRR@10")
     print("--------  ------  ------  ------  ------  ------")
     for item in results:
         summary = item["summary"]
         print(
             f"{item['mode']:<8}  "
-            f"{summary['hit_at_1']:<6.3f}  "
-            f"{summary['hit_at_3']:<6.3f}  "
-            f"{summary['hit_at_5']:<6.3f}  "
-            f"{summary['hit_at_10']:<6.3f}  "
+            f"{summary['recall_at_1']:<6.3f}  "
+            f"{summary['recall_at_3']:<6.3f}  "
+            f"{summary['recall_at_5']:<6.3f}  "
+            f"{summary['recall_at_10']:<6.3f}  "
             f"{(summary['mrr_at_10'] or 0.0):<6.3f}"
         )
+
+    print()
+    for item in results:
+        by_category = item["summary"].get("by_category") or {}
+        if not by_category:
+            continue
+        detail = ", ".join(
+            f"{category}:R@10={values['recall_at_10']:.3f}/MRR={values['mrr_at_10'] or 0.0:.3f}"
+            for category, values in by_category.items()
+        )
+        print(f"{item['mode']}: {detail}")
 
     hybrid = next((item for item in results if item["mode"] == "hybrid"), None)
     if hybrid:
