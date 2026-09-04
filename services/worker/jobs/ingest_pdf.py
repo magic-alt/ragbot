@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from ..chunking import split_text
-from ..connectors.pdf import fetch_pdf_bytes
+from ..connectors.pdf import fetch_pdf_bytes, fetch_pdf_pages  # fetch_pdf_pages kept for compatibility
 from ..parsing import iter_document_segments, parse_document
 from services.api.app.storage.models import Chunk
 from services.worker.dedup.hashing import content_hash
