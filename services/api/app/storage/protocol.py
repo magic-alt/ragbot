@@ -7,7 +7,16 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Protocol, runtime_checkable
 
-from .models import ACLPolicy, Chunk, Document, IngestionJob, Source, TableData
+from .models import (
+    ACLPolicy,
+    Chunk,
+    Document,
+    IngestionJob,
+    KnowledgeGeneration,
+    PublicationOutboxEvent,
+    Source,
+    TableData,
+)
 
 
 @runtime_checkable
@@ -29,6 +38,52 @@ class Repo(Protocol):
     def delete_chunks(self, chunk_ids: Iterable[str]) -> int: ...
     def delete_chunks_by_doc(self, doc_id: str) -> int: ...
     def iter_chunks(self) -> Iterable[Chunk]: ...
+
+    # ── Staged generation publication ──────────────────────────────────
+    def begin_knowledge_generation(self, generation: KnowledgeGeneration) -> None: ...
+    def stage_knowledge_generation(
+        self,
+        generation_id: str,
+        documents: Iterable[Document],
+        chunks: Iterable[Chunk],
+    ) -> Dict[str, int]: ...
+    def mark_knowledge_generation_prepared(
+        self,
+        generation_id: str,
+        stats: Optional[Dict[str, Any]] = None,
+    ) -> None: ...
+    def activate_knowledge_generation(
+        self,
+        source_id: str,
+        generation_id: str,
+        cleanup_point_ids: Iterable[str] = (),
+    ) -> Optional[str]: ...
+    def fail_knowledge_generation(
+        self,
+        generation_id: str,
+        error: str,
+        cleanup_point_ids: Iterable[str] = (),
+    ) -> None: ...
+    def get_active_generation_id(self, source_id: str) -> Optional[str]: ...
+    def active_vector_points(self, chunk_ids: Iterable[str]) -> Dict[str, str]: ...
+
+    # ── Publication outbox ─────────────────────────────────────────────
+    def claim_publication_outbox(
+        self,
+        worker_id: str,
+        lease_seconds: int = 120,
+        limit: int = 10,
+    ) -> List[PublicationOutboxEvent]: ...
+    def complete_publication_outbox(self, outbox_id: int, worker_id: str) -> bool: ...
+    def retry_publication_outbox(
+        self,
+        outbox_id: int,
+        worker_id: str,
+        error: str,
+        delay_seconds: float,
+        max_attempts: int = 10,
+    ) -> bool: ...
+    def reconcile_publication_outbox(self, max_attempts: int = 10) -> Dict[str, int]: ...
 
     # ── Policies ───────────────────────────────────────────────────────
     def add_policy(self, policy: ACLPolicy) -> None: ...
