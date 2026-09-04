@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Optional
 
 
@@ -7,27 +8,45 @@ class SourceFenceError(RuntimeError):
     """Raised when a job no longer belongs to the current Source lifecycle."""
 
 
+def _canonical_timestamp(value) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return raw
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 def source_generation(source) -> str:
     """Return the durable lifecycle token for a Source.
 
     ``updated_at`` changes whenever the Source definition/lifecycle is mutated;
-    ``created_at`` is the fallback for older rows. Jobs snapshot this token when
-    submitted. A delete, restore or Source update therefore fences older queued
-    and running work from publishing into the new Source generation.
+    ``created_at`` is the fallback for older rows. Timestamps are normalized so
+    an API-side ISO string and the same PostgreSQL ``datetime`` compare equal.
     """
-    updated_at = getattr(source, "updated_at", None)
-    created_at = getattr(source, "created_at", None)
+    updated_at = _canonical_timestamp(getattr(source, "updated_at", None))
+    created_at = _canonical_timestamp(getattr(source, "created_at", None))
     if updated_at:
-        return str(updated_at)
+        return updated_at
     if created_at:
-        return str(created_at)
+        return created_at
     return f"legacy:{source.source_id}"
 
 
 def job_source_generation(job) -> Optional[str]:
     stats = dict(getattr(job, "stats", {}) or {})
     value = stats.get("source_generation")
-    return str(value) if value not in (None, "") else None
+    if value in (None, ""):
+        return None
+    normalized = _canonical_timestamp(value)
+    return normalized or str(value)
 
 
 def job_stats_for_source(source, stats: Optional[dict] = None) -> dict:
@@ -46,7 +65,8 @@ def assert_source_fence(source, repo, expected_generation: Optional[str] = None)
     if current.status == "deleted":
         raise SourceFenceError(f"Source is deleted during ingestion: {source.source_id}")
 
-    expected = expected_generation or source_generation(source)
+    expected = _canonical_timestamp(expected_generation) if expected_generation else source_generation(source)
+    expected = expected or str(expected_generation)
     actual = source_generation(current)
     if actual != expected:
         raise SourceFenceError(
