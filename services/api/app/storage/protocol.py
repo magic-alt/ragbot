@@ -1,7 +1,9 @@
-"""Repository Protocol — abstract interface for data persistence.
+"""Repository protocols for Ragbot persistence capabilities.
 
-Both InMemoryRepo (dev/test) and production managed PostgreSQL repositories
-implement this protocol.
+``Repo`` is the stable baseline used by retrieval, ingestion and custom storage
+implementations. Staged knowledge publication is intentionally additive and is
+modelled by ``GenerationRepo`` so third-party repositories are not forced to
+pretend they provide PostgreSQL/Qdrant cutover semantics.
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ from .models import (
 
 @runtime_checkable
 class Repo(Protocol):
-    """Abstract repository interface used by retrieval and ingestion."""
+    """Baseline repository interface used by retrieval and ingestion."""
 
     # ── Documents ──────────────────────────────────────────────────────
     def add_document(self, doc: Document) -> None: ...
@@ -38,54 +40,6 @@ class Repo(Protocol):
     def delete_chunks(self, chunk_ids: Iterable[str]) -> int: ...
     def delete_chunks_by_doc(self, doc_id: str) -> int: ...
     def iter_chunks(self) -> Iterable[Chunk]: ...
-
-    # ── Staged generation publication ──────────────────────────────────
-    def begin_knowledge_generation(self, generation: KnowledgeGeneration) -> None: ...
-    def stage_knowledge_generation(
-        self,
-        generation_id: str,
-        documents: Iterable[Document],
-        chunks: Iterable[Chunk],
-    ) -> Dict[str, int]: ...
-    def mark_knowledge_generation_prepared(
-        self,
-        generation_id: str,
-        stats: Optional[Dict[str, Any]] = None,
-    ) -> None: ...
-    def activate_knowledge_generation(
-        self,
-        source_id: str,
-        generation_id: str,
-        cleanup_point_ids: Iterable[str] = (),
-        previous_doc_ids: Iterable[str] = (),
-        expected_source_generation: Optional[str] = None,
-    ) -> Optional[str]: ...
-    def fail_knowledge_generation(
-        self,
-        generation_id: str,
-        error: str,
-        cleanup_point_ids: Iterable[str] = (),
-    ) -> None: ...
-    def get_active_generation_id(self, source_id: str) -> Optional[str]: ...
-    def active_vector_points(self, chunk_ids: Iterable[str]) -> Dict[str, str]: ...
-
-    # ── Publication outbox ─────────────────────────────────────────────
-    def claim_publication_outbox(
-        self,
-        worker_id: str,
-        lease_seconds: int = 120,
-        limit: int = 10,
-    ) -> List[PublicationOutboxEvent]: ...
-    def complete_publication_outbox(self, outbox_id: int, worker_id: str) -> bool: ...
-    def retry_publication_outbox(
-        self,
-        outbox_id: int,
-        worker_id: str,
-        error: str,
-        delay_seconds: float,
-        max_attempts: int = 10,
-    ) -> bool: ...
-    def reconcile_publication_outbox(self, max_attempts: int = 10) -> Dict[str, int]: ...
 
     # ── Policies ───────────────────────────────────────────────────────
     def add_policy(self, policy: ACLPolicy) -> None: ...
@@ -117,3 +71,53 @@ class Repo(Protocol):
     # ── Runtime / debug ────────────────────────────────────────────────
     def healthcheck(self) -> bool: ...
     def export_state(self) -> Dict[str, List[dict]]: ...
+
+
+@runtime_checkable
+class GenerationRepo(Protocol):
+    """Optional staged-generation publication and cleanup capability."""
+
+    def begin_knowledge_generation(self, generation: KnowledgeGeneration) -> None: ...
+    def stage_knowledge_generation(
+        self,
+        generation_id: str,
+        documents: Iterable[Document],
+        chunks: Iterable[Chunk],
+    ) -> Dict[str, int]: ...
+    def mark_knowledge_generation_prepared(
+        self,
+        generation_id: str,
+        stats: Optional[Dict[str, Any]] = None,
+    ) -> None: ...
+    def activate_knowledge_generation(
+        self,
+        source_id: str,
+        generation_id: str,
+        cleanup_point_ids: Iterable[str] = (),
+        previous_doc_ids: Iterable[str] = (),
+        expected_source_generation: Optional[str] = None,
+    ) -> Optional[str]: ...
+    def fail_knowledge_generation(
+        self,
+        generation_id: str,
+        error: str,
+        cleanup_point_ids: Iterable[str] = (),
+    ) -> None: ...
+    def get_active_generation_id(self, source_id: str) -> Optional[str]: ...
+    def active_vector_points(self, chunk_ids: Iterable[str]) -> Dict[str, str]: ...
+    def claim_publication_outbox(
+        self,
+        worker_id: str,
+        lease_seconds: int = 120,
+        limit: int = 10,
+    ) -> List[PublicationOutboxEvent]: ...
+    def complete_publication_outbox(self, outbox_id: int, worker_id: str) -> bool: ...
+    def retry_publication_outbox(
+        self,
+        outbox_id: int,
+        worker_id: str,
+        error: str,
+        delay_seconds: float,
+        max_attempts: int = 10,
+    ) -> bool: ...
+    def reconcile_publication_outbox(self, max_attempts: int = 10) -> Dict[str, int]: ...
