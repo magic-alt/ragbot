@@ -18,6 +18,13 @@ from services.api.app.storage.models import Chunk, Document, IngestionJob, Sourc
 from services.api.app.storage.protocol import Repo
 from services.worker.dedup.versioning import next_version
 from services.worker.jobs.embed_and_upsert import embed_and_upsert
+from services.worker.source_fence import (
+    SourceFenceError,
+    assert_source_fence,
+    job_source_generation,
+    job_stats_for_source,
+    source_generation,
+)
 
 logger = logging.getLogger(__name__)
 LEXICAL_VERSION = 2
@@ -32,16 +39,37 @@ def run_ingest_pipeline(
     job_id: Optional[str] = None,
     embedder: Optional[Embedder] = None,
     existing_job: bool = False,
+    expected_source_generation: Optional[str] = None,
 ) -> IngestionJob:
-    """Execute one replacement-oriented ingestion run for ``source``."""
+    """Execute one replacement-oriented ingestion run for ``source``.
+
+    The Source lifecycle token is checked before and after publish-sensitive
+    phases. Existing durable Jobs use the generation captured at submission;
+    direct pipeline calls use the repository's persisted Source generation so
+    database-generated timestamps cannot create a false fence mismatch.
+    """
     now = datetime.now(timezone.utc).isoformat()
     job_id = job_id or uuid.uuid4().hex
+
+    persisted_source = repo.get_source(source.source_id)
+    current_job = repo.get_job(job_id) if existing_job else None
+    expected_generation = expected_source_generation
+    if expected_generation is None and current_job is not None:
+        expected_generation = job_source_generation(current_job)
+    if expected_generation is None:
+        expected_generation = source_generation(persisted_source or source)
+
     if existing_job:
-        current = repo.get_job(job_id)
-        if current is None:
+        if current_job is None:
             raise ValueError(f"Existing ingestion job not found: {job_id}")
-        repo.update_job(job_id, status="running", started_at=current.started_at or now, error=None)
+        repo.update_job(
+            job_id,
+            status="running",
+            started_at=current_job.started_at or now,
+            error=None,
+        )
     else:
+        generation_source = persisted_source or source
         job = IngestionJob(
             job_id=job_id,
             tenant_id=source.tenant_id,
@@ -51,10 +79,12 @@ def run_ingest_pipeline(
             status="running",
             started_at=now,
             created_at=now,
+            stats=job_stats_for_source(generation_source),
         )
         repo.add_job(job)
 
     try:
+        assert_source_fence(source, repo, expected_generation)
         previous_documents = source_documents(source, repo)
         previous_doc_ids = {doc.doc_id for doc in previous_documents}
         previous_chunks = {
@@ -73,6 +103,8 @@ def run_ingest_pipeline(
             candidate_chunks, previous_chunks.values()
         )
 
+        # A connector can be slow; re-check immediately before the first write.
+        assert_source_fence(source, repo, expected_generation)
         documents = _ensure_documents(source, repo, current_chunks)
         if chunks_to_write:
             embed_and_upsert(repo, qdrant, chunks_to_write, embedder=embedder)
@@ -91,16 +123,24 @@ def run_ingest_pipeline(
         _delete_qdrant_documents(qdrant, removed_doc_ids)
         documents_removed = repo.delete_documents(removed_doc_ids)
 
+        # If a delete/update raced with the write phase, do not publish a false
+        # completed state. A delete handler tombstones before its final purge,
+        # so the normal race resolves to a fenced failure plus clean knowledge.
+        assert_source_fence(source, repo, expected_generation)
+
         doc_ids = [doc.doc_id for doc in documents]
-        stats = {
+        latest_job = repo.get_job(job_id)
+        stats = dict((latest_job.stats if latest_job else {}) or {})
+        stats.update({
             "doc_ids": doc_ids,
+            "source_generation": expected_generation,
             "chunks_total": len(current_chunks),
             "chunks_ingested": len(chunks_to_write),
             "chunks_reused": chunks_reused,
             "chunks_removed": chunks_removed,
             "vector_chunks_removed": vector_chunks_removed,
             "documents_removed": documents_removed,
-        }
+        })
         if len(doc_ids) == 1:
             stats["doc_id"] = doc_ids[0]
 
@@ -123,6 +163,22 @@ def run_ingest_pipeline(
             len(chunks_to_write),
             chunks_reused,
             chunks_removed,
+        )
+    except SourceFenceError as exc:
+        logger.warning("Pipeline fenced: job=%s source=%s error=%s", job_id, source.source_id, exc)
+        current_source = repo.get_source(source.source_id)
+        if current_source is not None and current_source.status == "deleted":
+            try:
+                purge_source_knowledge(current_source, repo, qdrant)
+            except Exception:
+                logger.exception("Failed to purge knowledge after Source fence: %s", source.source_id)
+        repo.update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            lease_owner=None,
+            lease_expires_at=None,
         )
     except Exception as exc:
         logger.exception("Pipeline failed: job=%s source=%s", job_id, source.source_id)

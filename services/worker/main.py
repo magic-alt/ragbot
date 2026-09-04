@@ -29,6 +29,7 @@ from services.worker.reliability import (
     durable_retry_delay,
 )
 from services.worker.scheduler import schedule_due_sources
+from services.worker.source_fence import job_source_generation, source_generation
 
 logger = logging.getLogger(__name__)
 _STOP = threading.Event()
@@ -127,6 +128,21 @@ def _execute_claimed_job(
         logger.error("Dead-lettering claimed job %s: %s", job.job_id, reason)
         return
 
+    expected_generation = job_source_generation(job)
+    if expected_generation and source_generation(current_source) != expected_generation:
+        reason = (
+            "Source lifecycle generation changed before worker execution: "
+            f"expected={expected_generation} actual={source_generation(current_source)}"
+        )
+        _dead_letter_job(
+            services.repo,
+            job,
+            error=reason,
+            failure_class="source_generation_mismatch",
+        )
+        logger.error("Dead-lettering claimed job %s: %s", job.job_id, reason)
+        return
+
     # Connector configuration is part of the durable job contract. A Source may
     # be edited while a job waits in the queue; execute the immutable snapshot
     # captured when the Job was submitted while retaining current metadata/ACL.
@@ -145,6 +161,10 @@ def _execute_claimed_job(
     )
     heartbeat_thread.start()
     try:
+        # Preserve the established six-argument pipeline call contract. The
+        # pipeline reads the durable Job generation snapshot itself; avoiding a
+        # new positional argument keeps tests/extensions that monkeypatch the
+        # pipeline callable source-compatible.
         result = run_ingest_pipeline(
             source,
             services.repo,

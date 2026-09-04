@@ -17,6 +17,8 @@ from typing import Any, Callable, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from services.worker.source_fence import job_stats_for_source
+
 from ..auth.principal import allowed_tenants, authorize_tenant, require_operator
 from ..storage.models import IngestionJob
 
@@ -61,8 +63,9 @@ def enqueue_ingestion_job(source, services, job_id: Optional[str] = None) -> Ing
     """Persist an ingestion job and schedule inline execution when configured.
 
     Connector type/config are deeply snapshotted into the Job so queued/retried
-    work is not silently redirected by a later mutable Source config edit. This
-    helper is shared by the low-level Job API and higher-level Quick Import.
+    work is not silently redirected by a later mutable Source config edit. The
+    Source lifecycle generation is also persisted in Job.stats so a Job cannot
+    publish into a deleted-and-restored deterministic Source.
     """
     assert_source_ingestible(source)
     job_id = job_id or uuid.uuid4().hex
@@ -77,6 +80,7 @@ def enqueue_ingestion_job(source, services, job_id: Optional[str] = None) -> Ing
         status="pending",
         created_at=now,
         available_at=now,
+        stats=job_stats_for_source(source),
     )
     services.repo.add_job(job)
 

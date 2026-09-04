@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from services.api.app.storage.models import IngestionJob, Source
+from services.worker.source_fence import job_stats_for_source
 
 MIN_SYNC_INTERVAL_SECONDS = 60
 
@@ -45,7 +46,10 @@ def schedule_due_sources(repo, *, now: Optional[datetime] = None, limit: int = 1
                 status="pending",
                 created_at=current.isoformat(),
                 available_at=current.isoformat(),
-                stats={"trigger": "scheduled", "scheduled_for": due_at.isoformat()},
+                stats=job_stats_for_source(
+                    source,
+                    {"trigger": "scheduled", "scheduled_for": due_at.isoformat()},
+                ),
             )
             inserted = bool(repo.add_job_if_absent(job))
             if inserted:

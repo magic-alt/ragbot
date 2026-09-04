@@ -7,7 +7,7 @@ import logging
 import time
 import uuid
 from dataclasses import asdict
-from typing import Any, AsyncIterator, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -32,14 +32,48 @@ class OpenAIChatRequest(BaseModel):
     model: str = "ragbot"
     messages: List[Message] = Field(min_length=1)
     stream: bool = False
-    temperature: float = 0.2
-    max_tokens: Optional[int] = None
+    temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    max_tokens: Optional[int] = Field(default=None, ge=1)
 
 
 def _estimate_tokens(text: str) -> int:
     if not text:
         return 0
     return max(1, (len(text) + 3) // 4)
+
+
+def _prepare_messages(messages: List[Message]) -> Tuple[str, List[Dict[str, str]], Optional[str]]:
+    """Keep the last user turn as retrieval query and preserve prior context."""
+    query_index: Optional[int] = None
+    for index in range(len(messages) - 1, -1, -1):
+        msg = messages[index]
+        if msg.role.strip().lower() == "user" and msg.content.strip():
+            query_index = index
+            break
+    if query_index is None:
+        query_index = len(messages) - 1
+
+    query = messages[query_index].content.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="At least one non-empty message is required")
+
+    system_parts: List[str] = []
+    conversation: List[Dict[str, str]] = []
+    for index, message in enumerate(messages):
+        role = message.role.strip().lower()
+        content = message.content.strip()
+        if not content:
+            continue
+        if role == "system":
+            system_parts.append(content)
+            continue
+        if index == query_index:
+            continue
+        if role in {"user", "assistant"}:
+            conversation.append({"role": role, "content": content})
+
+    system_prompt = "\n\n".join(system_parts) if system_parts else None
+    return query, conversation, system_prompt
 
 
 def create_openai_compat_endpoint(get_services, verify_api_key):
@@ -66,16 +100,7 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
             }
         )
 
-        query = ""
-        for msg in reversed(payload.messages):
-            if msg.role == "user" and msg.content.strip():
-                query = msg.content
-                break
-        if not query:
-            query = payload.messages[-1].content
-        if not query.strip():
-            raise HTTPException(status_code=400, detail="At least one non-empty message is required")
-
+        query, conversation, system_prompt = _prepare_messages(payload.messages)
         request_id = uuid.uuid4().hex
         if payload.stream:
             return StreamingResponse(
@@ -87,6 +112,10 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
                     request_id,
                     payload.model,
                     constraints,
+                    conversation,
+                    system_prompt,
+                    payload.temperature,
+                    payload.max_tokens,
                 ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -99,10 +128,15 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
             services=services,
             request_id=request_id,
             constraints=constraints,
+            conversation_messages=conversation,
+            system_prompt=system_prompt,
+            generation_temperature=payload.temperature,
+            generation_max_tokens=payload.max_tokens,
         )
         answer = state.final.answer if state.final else ""
         citations = [asdict(c) for c in state.final.citations] if state.final else []
-        prompt_tokens = _estimate_tokens(query)
+        prompt_text = "\n".join(message.content for message in payload.messages)
+        prompt_tokens = _estimate_tokens(prompt_text)
         completion_tokens = _estimate_tokens(answer)
         return {
             "id": f"chatcmpl-{request_id}",
@@ -133,6 +167,10 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
         request_id: str,
         model: str,
         constraints: Constraints,
+        conversation: List[Dict[str, str]],
+        system_prompt: Optional[str],
+        temperature: float,
+        max_tokens: Optional[int],
     ) -> AsyncIterator[str]:
         cb = AsyncQueueCallback()
 
@@ -145,6 +183,10 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
                 request_id=request_id,
                 callback=cb,
                 constraints=constraints,
+                conversation_messages=conversation,
+                system_prompt=system_prompt,
+                generation_temperature=temperature,
+                generation_max_tokens=max_tokens,
             )
 
         task = asyncio.create_task(_run())

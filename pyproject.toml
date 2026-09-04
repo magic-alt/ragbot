@@ -25,6 +25,7 @@ observability = [
     "opentelemetry-sdk>=1.20",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20",
     "python-json-logger>=2.0",
+    "prometheus-client>=0.20",
 ]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
 

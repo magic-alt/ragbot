@@ -37,13 +37,7 @@ def provider_request(
     random_fn: Callable[[], float] = random.random,
     **kwargs: Any,
 ):
-    """Execute one HTTP request with bounded retry for transient provider failures.
-
-    The helper deliberately retries only transport failures and retryable HTTP
-    statuses. Authentication/authorization/not-found errors remain immediate so
-    bad credentials or bad Source configuration do not create retry storms.
-    ``Retry-After`` is honored when present and capped by the configured maximum.
-    """
+    """Execute one HTTP request with bounded retry for transient provider failures."""
     attempts = max_attempts or _positive_int("RAGBOT_PROVIDER_MAX_ATTEMPTS", 4)
     base = backoff_base_seconds or _positive_float("RAGBOT_PROVIDER_BACKOFF_BASE_SECONDS", 0.5)
     maximum = backoff_max_seconds or _positive_float("RAGBOT_PROVIDER_BACKOFF_MAX_SECONDS", 30.0)
@@ -101,17 +95,13 @@ def classify_ingestion_error(exc: BaseException) -> FailureClassification:
         return FailureClassification(type(exc).__name__.lower(), False)
     if isinstance(exc, ValueError):
         return FailureClassification("validation_error", False)
+    if exc.__class__.__name__ == "SourceFenceError":
+        return FailureClassification("source_generation_mismatch", False)
     return FailureClassification(type(exc).__name__.lower() or "ingestion_error", True)
 
 
 def classify_persisted_failure(message: Optional[str]) -> FailureClassification:
-    """Classify a pipeline failure after it has already been persisted as text.
-
-    The pipeline intentionally sanitizes/serializes errors into the Job record.
-    This conservative classifier prevents obvious permanent auth/config failures
-    from being replayed repeatedly while leaving unknown runtime failures
-    retryable under the bounded durable-attempt budget.
-    """
+    """Classify a pipeline failure after it has already been persisted as text."""
     text = str(message or "").strip()
     lower = text.lower()
     for match in _HTTP_STATUS_RE.finditer(text):
@@ -120,6 +110,14 @@ def classify_persisted_failure(message: Optional[str]) -> FailureClassification:
             return FailureClassification(f"http_{status}", True)
         if 400 <= status < 500:
             return FailureClassification(f"http_{status}", False)
+    fence_markers = (
+        "source lifecycle generation changed",
+        "source is deleted during ingestion",
+        "source disappeared during ingestion",
+        "source tenant changed during ingestion",
+    )
+    if any(marker in lower for marker in fence_markers):
+        return FailureClassification("source_generation_mismatch", False)
     permanent_markers = (
         "permission denied",
         "no such file",
@@ -158,7 +156,6 @@ def _backoff_delay(
     random_fn: Callable[[], float],
 ) -> float:
     raw = min(maximum, base * (2 ** max(0, attempt - 1)))
-    # Equal jitter: avoids synchronized workers hammering a recovering provider.
     return min(maximum, raw * (0.5 + 0.5 * max(0.0, min(1.0, random_fn()))))
 
 
