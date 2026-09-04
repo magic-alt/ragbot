@@ -105,7 +105,7 @@ def ingest_repo(
             segments = _locate_framework_segments(content, parts)
 
         for symbol_name, start_line, end_line, segment in segments:
-            yield Chunk(
+            chunk = Chunk(
                 chunk_id=uuid.uuid4().hex,
                 doc_id=doc_id,
                 tenant_id=tenant_id,
@@ -126,7 +126,7 @@ def ingest_repo(
                     **chunker_metadata,
                 },
             )
-            yield chunk if False else None
+            yield chunk
             idx += 1
     logger.info("Repo ingestion complete: %s -> %d chunks", url_or_path, idx)
 
@@ -150,9 +150,6 @@ def _locate_framework_segments(
         result.append((None, start_line, end_line, part))
         cursor = max(cursor, end)
     return result
-
-
-# ── Python AST-based symbol chunking ──────────────────────────────────
 
 
 def _split_python_symbols(content: str, chunk_size: int) -> List[Tuple[Optional[str], int, int, str]]:
