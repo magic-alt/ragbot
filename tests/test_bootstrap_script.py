@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -47,7 +48,51 @@ def test_local_env_forces_inline_and_removes_durable_endpoints(
     assert env["RAGBOT_INGESTION_MODE"] == "inline"
     assert "POSTGRES_DSN" not in env
     assert "QDRANT_URL" not in env
+    assert env["RAGBOT_DATA_DIR"] == str(data.resolve())
     assert env["RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS"] == str(data.resolve())
+
+
+def test_docker_start_forces_controller_repo_data_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    env_file = tmp_path / ".env"
+    env_file.write_text("RAGBOT_DATA_DIR=/tmp/stale-corpus\n", encoding="utf-8")
+    captured: list[dict[str, str]] = []
+
+    monkeypatch.setattr(bootstrap, "DATA_DIR", data)
+    monkeypatch.setattr(bootstrap, "ENV_FILE", env_file)
+    monkeypatch.setattr(bootstrap, "_docker_available", lambda: True)
+    monkeypatch.setattr(bootstrap, "_copy_default_env", lambda: None)
+    monkeypatch.setattr(bootstrap, "_ensure_dirs", lambda: None)
+    monkeypatch.setattr(bootstrap, "_ensure_venv", lambda **_kwargs: tmp_path / "python")
+    monkeypatch.setattr(bootstrap, "_wait_ready", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bootstrap, "_write_state", lambda *_args, **_kwargs: None)
+
+    def fake_run(command, *, env=None, **_kwargs):
+        assert command[:3] == ["docker", "compose", "up"]
+        captured.append(dict(env or {}))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(bootstrap, "_run", fake_run)
+    bootstrap._start_docker(
+        SimpleNamespace(force_install=False, port=8000, host="127.0.0.1", timeout=1.0)
+    )
+
+    assert captured
+    assert captured[0]["RAGBOT_DATA_DIR"] == str(data.resolve())
+
+
+def test_runtime_mode_recovers_from_stale_docker_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bootstrap, "_read_state", lambda: {"mode": "docker"})
+    monkeypatch.setattr(bootstrap, "_read_pid", lambda: 1234)
+    monkeypatch.setattr(bootstrap, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(bootstrap, "_docker_stack_running", lambda: False)
+
+    assert bootstrap._runtime_mode() == "local"
 
 
 def test_docker_location_maps_repo_data_to_container(
@@ -60,6 +105,7 @@ def test_docker_location_maps_repo_data_to_container(
     monkeypatch.setattr(bootstrap, "DATA_DIR", data)
 
     assert bootstrap._docker_location("data/manuals") == "/data/manuals"
+    assert bootstrap._docker_location("data") == "/data"
 
 
 def test_docker_location_rejects_paths_outside_data(
