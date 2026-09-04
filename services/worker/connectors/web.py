@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urljoin
 
@@ -17,13 +18,20 @@ _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _ALLOWED_CONTENT_TYPES = ("text/", "application/json", "application/xml", "application/xhtml+xml")
 
 
-def fetch_web(url: str, timeout: int = _DEFAULT_TIMEOUT, max_length: int = _MAX_CONTENT_LENGTH) -> str:
-    """Fetch a bounded public/allowlisted web resource and return text content.
+@dataclass(frozen=True)
+class WebResource:
+    body: bytes
+    content_type: str
+    encoding: str
+    url: str
 
-    Redirects are followed manually so every destination is revalidated. The
-    body is streamed with a hard byte cap; slicing ``response.text`` is not a
-    download limit because the complete response has already been buffered.
-    """
+
+def fetch_web_resource(
+    url: str,
+    timeout: int = _DEFAULT_TIMEOUT,
+    max_length: int = _MAX_CONTENT_LENGTH,
+) -> WebResource:
+    """Fetch bounded bytes while revalidating every redirect destination."""
     allowed_hosts = csv_values("RAGBOT_WEB_ALLOWED_HOSTS")
     max_redirects = int(os.getenv("RAGBOT_WEB_MAX_REDIRECTS", "5"))
     current_url = url
@@ -70,17 +78,27 @@ def fetch_web(url: str, timeout: int = _DEFAULT_TIMEOUT, max_length: int = _MAX_
                     raise ValueError(f"Web source exceeds {max_length} byte limit")
                 raw_bytes.extend(chunk)
 
-            encoding = response.encoding or "utf-8"
-            raw = bytes(raw_bytes).decode(encoding, errors="replace")
-            if "html" in content_type:
-                return _extract_html_text(raw) or raw
-            return raw
+            return WebResource(
+                body=bytes(raw_bytes),
+                content_type=content_type or "text/plain",
+                encoding=response.encoding or "utf-8",
+                url=current_url,
+            )
         finally:
             close = getattr(response, "close", None)
             if callable(close):
                 close()
 
     raise ValueError("Web source exceeded redirect limit")
+
+
+def fetch_web(url: str, timeout: int = _DEFAULT_TIMEOUT, max_length: int = _MAX_CONTENT_LENGTH) -> str:
+    """Backward-compatible text helper; production ingestion uses raw resources."""
+    resource = fetch_web_resource(url, timeout=timeout, max_length=max_length)
+    raw = resource.body.decode(resource.encoding, errors="replace")
+    if "html" in resource.content_type:
+        return _extract_html_text(raw) or raw
+    return raw
 
 
 def _extract_html_text(html: str) -> Optional[str]:
