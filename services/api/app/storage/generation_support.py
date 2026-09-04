@@ -118,6 +118,24 @@ def _retry_publication_outbox_postgres(
             return (result.rowcount or 0) > 0
 
 
+def _reconcile_publication_postgres(repo: Any, max_attempts: int = 10) -> Dict[str, int]:
+    generation_stats = reconcile_postgres_generations(repo)
+    outbox_stats = PostgresGenerationMixin.reconcile_publication_outbox(
+        repo,
+        max_attempts=max_attempts,
+    )
+    return {**outbox_stats, **generation_stats}
+
+
+def _reconcile_publication_inmemory(repo: Any, max_attempts: int = 10) -> Dict[str, int]:
+    generation_stats = reconcile_inmemory_generations(repo)
+    outbox_stats = InMemoryGenerationMixin.reconcile_publication_outbox(
+        repo,
+        max_attempts=max_attempts,
+    )
+    return {**outbox_stats, **generation_stats}
+
+
 def ensure_generation_repository(repo: Any) -> Any:
     """Attach staged-publication adapters to Ragbot's built-in repositories.
 
@@ -136,6 +154,7 @@ def ensure_generation_repository(repo: Any) -> Any:
         prepared = _mark_prepared_postgres
         failed = fail_postgres_generation
         recover = reconcile_postgres_generations
+        publication_reconcile = _reconcile_publication_postgres
     elif hasattr(repo, "_lock") and hasattr(repo, "_documents") and hasattr(repo, "_chunks"):
         backend = InMemoryGenerationMixin
         helpers = _IN_MEMORY_HELPERS
@@ -143,6 +162,7 @@ def ensure_generation_repository(repo: Any) -> Any:
         prepared = _mark_prepared_inmemory
         failed = fail_inmemory_generation
         recover = reconcile_inmemory_generations
+        publication_reconcile = _reconcile_publication_inmemory
     else:
         return repo
 
@@ -162,6 +182,8 @@ def ensure_generation_repository(repo: Any) -> Any:
             method = fenced_activation
         elif name == "fail_knowledge_generation":
             method = failed
+        elif name == "reconcile_publication_outbox":
+            method = publication_reconcile
         elif is_postgres and name == "retry_publication_outbox":
             method = _retry_publication_outbox_postgres
         else:
