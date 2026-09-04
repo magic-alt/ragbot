@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from ..auth.acl import compute_security_scope
-from ..auth.principal import authorize_identity
+from ..auth.principal import CAP_KNOWLEDGE_QUERY, authorize_identity, require_capability
 
 router = APIRouter(tags=["search"])
 
@@ -88,6 +88,7 @@ def create_search_endpoint(get_services, verify_api_key):
         payload: SearchRequest,
         _key: Optional[str] = Depends(verify_api_key),
     ) -> SearchResponse:
+        require_capability(_key, CAP_KNOWLEDGE_QUERY)
         services = get_services()
         trusted_user_id, groups, roles = authorize_identity(
             _key, payload.tenant_id, payload.user_id

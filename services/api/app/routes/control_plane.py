@@ -8,7 +8,16 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ..auth.principal import allowed_tenants, authorize_tenant, get_api_principal, require_admin
+from ..auth.principal import (
+    CAP_CATALOG_READ,
+    ROLE_CAPABILITIES,
+    allowed_tenants,
+    authorize_tenant,
+    capabilities_for_principal,
+    get_api_principal,
+    require_admin,
+    require_capability,
+)
 
 
 def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRouter:
@@ -19,6 +28,7 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
         tenant_id: Optional[str] = None,
         _key: Optional[str] = Depends(auth_dep),
     ):
+        require_capability(_key, CAP_CATALOG_READ)
         services = get_services()
         tenant_scope = _resolve_tenant_scope(_key, tenant_id)
         return build_overview(services.repo, tenant_scope)
@@ -32,6 +42,7 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
         limit: int = Query(default=100, ge=1, le=500),
         _key: Optional[str] = Depends(auth_dep),
     ):
+        require_capability(_key, CAP_CATALOG_READ)
         services = get_services()
         tenant_scope = _resolve_tenant_scope(_key, tenant_id)
         sources = _scoped_sources(services.repo, tenant_scope)
@@ -70,6 +81,7 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
         limit: int = Query(default=100, ge=1, le=500),
         _key: Optional[str] = Depends(auth_dep),
     ):
+        require_capability(_key, CAP_CATALOG_READ)
         services = get_services()
         tenant_scope = _resolve_tenant_scope(_key, tenant_id)
         jobs = _scoped_jobs(services.repo, tenant_scope)
@@ -82,8 +94,10 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
 
     @router.get("/catalog/session")
     async def catalog_session(_key: Optional[str] = Depends(auth_dep)):
-        """Return non-secret capability metadata for the current API principal."""
+        """Return non-secret RBAC capability metadata for the current principal."""
         principal = get_api_principal(_key)
+        effective = capabilities_for_principal(principal)
+        role_matrix = {role: sorted(values) for role, values in ROLE_CAPABILITIES.items()}
         if principal is None:
             return {
                 "principal_mode": "development",
@@ -91,15 +105,28 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
                 "roles": ["owner"],
                 "tenant_ids": [],
                 "capabilities": {"read": True, "operate": True, "admin": True},
+                "effective_capabilities": sorted(effective),
+                "role_capability_matrix": role_matrix,
             }
+
         roles = sorted({role.strip().lower() for role in principal.roles if role.strip()})
-        operate = principal.admin or "owner" in roles or "operator" in roles
+        operate = any(
+            capability in effective
+            for capability in ("source.create", "source.update", "ingestion.run", "ingestion.retry")
+        )
         return {
             "principal_mode": "scoped",
             "admin": principal.admin,
             "roles": roles,
             "tenant_ids": sorted(principal.tenant_ids),
-            "capabilities": {"read": True, "operate": operate, "admin": principal.admin},
+            # Backward-compatible summary used by the current admin UI.
+            "capabilities": {
+                "read": CAP_CATALOG_READ in effective,
+                "operate": operate,
+                "admin": principal.admin,
+            },
+            "effective_capabilities": sorted(effective),
+            "role_capability_matrix": role_matrix,
         }
 
     @router.get("/admin/overview")
@@ -116,6 +143,26 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
             "queue": overview["queue"],
             "scheduled_sources": overview["sources"]["scheduled"],
             "next_sync_at": overview["sources"]["next_sync_at"],
+        }
+
+    @router.get("/admin/cache", deprecated=True)
+    async def retired_cache_status(_key: Optional[str] = Depends(auth_dep)):
+        """Compatibility tombstone for the retired process-local runtime cache.
+
+        This endpoint intentionally exposes no cache state and cannot enable or
+        clear caching. It exists only so pre-P2 clients get an explicit retired
+        signal instead of mistaking a transient 404 for a deployment problem.
+        """
+        require_admin(_key)
+        return {
+            "enabled": False,
+            "retired": True,
+            "reason": (
+                "Process-local retrieval/embedding caches are not part of the runtime; "
+                "a future cache requires shared generation-aware invalidation."
+            ),
+            "retrieval": {"supported": False, "runtime_wired": False},
+            "embedding": {"supported": False, "runtime_wired": False},
         }
 
     @router.post("/admin/queue/reconcile")

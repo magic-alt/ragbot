@@ -12,7 +12,16 @@ from services.worker.connectors.credentials import validate_secret_ref
 from services.worker.pipeline import purge_source_knowledge
 from services.worker.scheduler import configure_source_sync
 
-from ..auth.principal import allowed_tenants, authorize_tenant, require_operator
+from ..auth.principal import (
+    CAP_CATALOG_READ,
+    CAP_SOURCE_CREATE,
+    CAP_SOURCE_DELETE,
+    CAP_SOURCE_SYNC,
+    CAP_SOURCE_UPDATE,
+    allowed_tenants,
+    authorize_tenant,
+    require_capability,
+)
 from ..storage.models import Source
 
 
@@ -137,7 +146,7 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         _validate_source_type(payload.source_type)
         _validate_source_config(payload.source_type, payload.config)
         authorize_tenant(_key, payload.tenant_id)
-        require_operator(_key)
+        require_capability(_key, CAP_SOURCE_CREATE)
         services = get_services()
         now = datetime.now(timezone.utc).isoformat()
         source = Source(
@@ -159,6 +168,7 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         tenant_id: Optional[str] = None,
         _key: Optional[str] = Depends(auth_dep),
     ):
+        require_capability(_key, CAP_CATALOG_READ)
         services = get_services()
         if tenant_id:
             authorize_tenant(_key, tenant_id)
@@ -177,6 +187,7 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if not source or source.status == "deleted":
             raise HTTPException(404, "Source not found")
         authorize_tenant(_key, source.tenant_id)
+        require_capability(_key, CAP_CATALOG_READ)
         return asdict(source)
 
     @router.put("/{source_id}")
@@ -190,7 +201,7 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if not source or source.status == "deleted":
             raise HTTPException(404, "Source not found")
         authorize_tenant(_key, source.tenant_id)
-        require_operator(_key)
+        require_capability(_key, CAP_SOURCE_UPDATE)
         if payload.config is not None:
             _validate_source_config(source.source_type, payload.config)
         updates = {
@@ -213,7 +224,7 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if not source or source.status == "deleted":
             raise HTTPException(404, "Source not found")
         authorize_tenant(_key, source.tenant_id)
-        require_operator(_key)
+        require_capability(_key, CAP_SOURCE_SYNC)
         if payload.enabled and payload.interval_seconds is None:
             raise HTTPException(status_code=422, detail="enabled sync requires interval_seconds")
         try:
@@ -235,7 +246,7 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if not source or source.status == "deleted":
             raise HTTPException(404, "Source not found")
         authorize_tenant(_key, source.tenant_id)
-        require_operator(_key)
+        require_capability(_key, CAP_SOURCE_DELETE)
 
         # Fence first, purge second. Running workers observe the tombstone/new
         # updated_at generation and cannot republish knowledge after the purge.
