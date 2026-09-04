@@ -23,6 +23,7 @@ from typing import Dict, Iterable, List, Optional, Sequence
 ROOT = Path(__file__).resolve().parents[1]
 VENV = ROOT / ".venv"
 DATA_DIR = ROOT / "data"
+DOCKER_DATA_DIR = "/data"
 LOG_DIR = ROOT / "logs"
 TMP_DIR = ROOT / "tmp"
 LOCAL_LOG = LOG_DIR / "ragbot-local.log"
@@ -112,7 +113,7 @@ def _local_env() -> Dict[str, str]:
     env["RAGBOT_INGESTION_MODE"] = "inline"
     env.pop("POSTGRES_DSN", None)
     env.pop("QDRANT_URL", None)
-    env["RAGBOT_DATA_DIR"] = str(DATA_DIR)
+    env["RAGBOT_DATA_DIR"] = str(DATA_DIR.resolve())
     env["RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS"] = str(DATA_DIR.resolve())
     return env
 
@@ -167,6 +168,21 @@ def _docker_available() -> bool:
     return daemon.returncode == 0
 
 
+def _docker_stack_running() -> bool:
+    if not _docker_available():
+        return False
+    result = subprocess.run(
+        ["docker", "compose", "ps", "--status", "running", "--services"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return False
+    services = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    return "api" in services and "worker" in services
+
+
 def _read_state() -> Dict[str, object]:
     if not STATE_FILE.exists():
         return {}
@@ -195,6 +211,25 @@ def _resolve_mode(requested: str) -> str:
     if requested in {"current", "auto"}:
         return "docker" if _docker_available() else "local"
     raise UserError(f"Unsupported mode: {requested}")
+
+
+def _runtime_mode() -> str:
+    """Resolve the active runtime without blindly trusting a stale state file."""
+    state_mode = _read_state().get("mode")
+    local_pid = _read_pid()
+    local_running = bool(local_pid and _pid_alive(local_pid))
+
+    if state_mode == "local" and local_running:
+        return "local"
+    if state_mode == "docker" and _docker_stack_running():
+        return "docker"
+    if local_running:
+        return "local"
+    if _docker_stack_running():
+        return "docker"
+    if state_mode in {"local", "docker"}:
+        return str(state_mode)
+    return _resolve_mode("auto")
 
 
 def _server_url(args: argparse.Namespace) -> str:
@@ -275,6 +310,7 @@ def _start_local(args: argparse.Namespace) -> None:
     _write_state("local", server, pid=process.pid)
     _wait_ready(server, timeout=args.timeout)
     print(f"Admin UI: {server}/admin/ui")
+    print(f"Data directory: {DATA_DIR.resolve()}")
     print(f"Log file: {LOCAL_LOG}")
 
 
@@ -286,11 +322,17 @@ def _start_docker(args: argparse.Namespace) -> None:
     _ensure_venv(force_install=args.force_install, extras="postgres,qdrant,worker,s3,saas")
     env = _base_env()
     env["RAGBOT_API_PORT"] = str(args.port)
+    # The controller owns a stable host/container path contract. Direct Compose
+    # users may still override RAGBOT_DATA_DIR themselves, but bootstrap-managed
+    # runtimes always mount <repo>/data at /data so CLI path rewriting and the
+    # worker allowlist cannot drift apart because of an old .env value.
+    env["RAGBOT_DATA_DIR"] = str(DATA_DIR.resolve())
     _run(["docker", "compose", "up", "-d", "--build"], env=env)
     server = f"http://{args.host}:{args.port}"
     _write_state("docker", server)
     _wait_ready(server, timeout=max(args.timeout, 120.0))
     print(f"Admin UI: {server}/admin/ui")
+    print(f"Data directory: {DATA_DIR.resolve()} -> {DOCKER_DATA_DIR}")
 
 
 def _stop_local() -> None:
@@ -325,7 +367,7 @@ def _docker_location(location: str) -> str:
     except ValueError as exc:
         raise UserError(f"Docker local sources must be below {DATA_DIR}") from exc
     posix = relative.as_posix()
-    return "/data" if posix == "." else f"/data/{posix}"
+    return DOCKER_DATA_DIR if posix == "." else f"{DOCKER_DATA_DIR}/{posix}"
 
 
 def _local_location(location: str) -> str:
@@ -360,6 +402,7 @@ def cmd_setup(args: argparse.Namespace) -> None:
     extras = "postgres,qdrant,worker,s3,saas" if mode == "docker" else "worker"
     _ensure_venv(force_install=args.force_install, extras=extras)
     print(f"Setup complete ({mode}).")
+    print(f"Default data directory: {DATA_DIR.resolve()}")
 
 
 def cmd_up(args: argparse.Namespace) -> None:
@@ -389,8 +432,12 @@ def cmd_restart(args: argparse.Namespace) -> None:
 def cmd_status(args: argparse.Namespace) -> None:
     server = _server_url(args)
     state = _read_state()
-    print(f"mode: {state.get('mode') or 'unknown'}")
+    detected = _runtime_mode()
+    print(f"mode: {detected}")
+    if state.get("mode") and state.get("mode") != detected:
+        print(f"saved mode: {state.get('mode')} (stale; detected runtime is {detected})")
     print(f"server: {server}")
+    print(f"data: {DATA_DIR.resolve()}")
     print(f"liveness: {'OK' if _health(server, '/admin/health') else 'DOWN'}")
     print(f"readiness: {'READY' if _health(server, '/admin/ready') else 'NOT READY'}")
 
@@ -400,7 +447,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
 
 def cmd_ingest(args: argparse.Namespace) -> None:
-    mode = str(_read_state().get("mode") or _resolve_mode("auto"))
+    mode = _runtime_mode()
     location = _docker_location(args.location) if mode == "docker" else _local_location(args.location)
     tail = ["ingest", location]
     if args.type:
@@ -444,7 +491,7 @@ def _print_log_tail(lines: int) -> None:
 
 
 def cmd_logs(args: argparse.Namespace) -> None:
-    mode = str(_read_state().get("mode") or _resolve_mode("auto"))
+    mode = _runtime_mode()
     if mode == "docker":
         command = ["docker", "compose", "logs", "--tail", str(args.lines)]
         if args.follow:
@@ -502,7 +549,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = sub.add_parser("ingest")
     _add_common_server_args(ingest)
-    ingest.add_argument("location")
+    ingest.add_argument(
+        "location",
+        nargs="?",
+        default="data",
+        help="Source location; defaults to the repository data directory",
+    )
     ingest.add_argument("--type", choices=["local_fs", "repo", "pdf", "web", "s3", "gdrive", "notion", "confluence"])
     ingest.add_argument("--name")
     ingest.add_argument("--tag", action="append", default=[])
@@ -543,7 +595,7 @@ def _normalize_ingest_argv(argv: Sequence[str]) -> List[str]:
     except ValueError:
         return tokens
     start = index + 1
-    if start >= len(tokens):
+    if start >= len(tokens) or tokens[start].startswith("--"):
         return tokens
     end = start
     while end < len(tokens) and not tokens[end].startswith("--"):
@@ -574,6 +626,15 @@ def _option_values(tokens: Sequence[str], name: str) -> List[str]:
         elif token.startswith(name + "="):
             values.append(token[len(name) + 1 :])
     return values
+
+
+def _ingest_location(tokens: Sequence[str]) -> Optional[str]:
+    if "ingest" not in tokens:
+        return None
+    index = list(tokens).index("ingest")
+    if index + 1 >= len(tokens) or tokens[index + 1].startswith("--"):
+        return "data"
+    return str(tokens[index + 1])
 
 
 def _resolved_directory(location: str) -> Optional[Path]:
@@ -625,18 +686,25 @@ _impl = _BootstrapCore()
 
 
 def _smart_directory_ingest(tokens: Sequence[str]) -> Optional[int]:
-    if "ingest" not in tokens or _has_option(tokens, "--type"):
+    if "ingest" not in tokens:
         return None
-    index = list(tokens).index("ingest")
-    if index + 1 >= len(tokens):
+    explicit_type = _option_value(tokens, "--type")
+    if explicit_type not in {None, "pdf"}:
         return None
-    directory = _resolved_directory(tokens[index + 1])
+    location = _ingest_location(tokens)
+    if location is None:
+        return None
+    directory = _resolved_directory(location)
     if directory is None:
         return None
     pdf_count, text_count = _directory_inventory(directory)
     if pdf_count == 0:
         return None
-    if text_count:
+
+    # Explicit --type pdf on a directory means "ingest the PDFs in this
+    # directory", not "open the directory itself as one PDF". For implicit
+    # mixed-directory ingestion, keep the existing text/local_fs pass first.
+    if explicit_type is None and text_count:
         result = _impl.main(list(tokens))
         if int(result or 0) != 0:
             return int(result)
