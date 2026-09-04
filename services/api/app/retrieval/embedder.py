@@ -6,6 +6,7 @@ import math
 import os
 import re
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from urllib.parse import urlparse
 
 import requests
 
@@ -37,6 +38,22 @@ _QWEN3_QUERY_TASK = (
     "Given a user question, retrieve relevant passages from the knowledge base "
     "that answer the question"
 )
+_LOCAL_EMBEDDING_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "host.docker.internal"})
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_local_embedding_endpoint(base_url: str) -> bool:
+    try:
+        hostname = (urlparse(base_url).hostname or "").lower()
+    except ValueError:
+        return False
+    return hostname in _LOCAL_EMBEDDING_HOSTS
 
 
 def model_dimension(model: str) -> Optional[int]:
@@ -222,9 +239,9 @@ def build_embedder(dimension: Optional[int] = None) -> Embedder:
     """Build an Embedder from environment variables.
 
     Local OpenAI-compatible endpoints such as Ollama do not require a fake API
-    key: setting ``EMBEDDING_MODEL`` + ``EMBEDDING_BASE_URL`` is sufficient.
-    Development can still fall back to ``HashEmbedder``; production validation
-    rejects that fallback.
+    key. Remote anonymous endpoints require the explicit
+    ``EMBEDDING_ALLOW_ANONYMOUS=true`` opt-in. Development can still fall back
+    to ``HashEmbedder``; production validation rejects that fallback.
     """
     model = os.getenv("EMBEDDING_MODEL", "").strip()
     api_key = os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY", "")
@@ -233,8 +250,11 @@ def build_embedder(dimension: Optional[int] = None) -> Embedder:
     dim_override = os.getenv("QDRANT_DIM")
     effective_dimension = int(dim_override) if dim_override else (dimension or model_dimension(model))
     query_instruction = os.getenv("EMBEDDING_QUERY_INSTRUCTION")
+    anonymous_allowed = _is_local_embedding_endpoint(base_url) or _env_flag(
+        "EMBEDDING_ALLOW_ANONYMOUS", False
+    )
 
-    if model and (api_key or explicit_embedding_base):
+    if model and (api_key or anonymous_allowed):
         logger.info("Using API embedder: model=%s, base_url=%s", model, base_url)
         return APIEmbedder(
             api_key=api_key,
@@ -246,9 +266,9 @@ def build_embedder(dimension: Optional[int] = None) -> Embedder:
 
     fallback_dimension = effective_dimension or 64
     logger.info(
-        "Using hash-based embedder (dimension=%d); set EMBEDDING_MODEL + "
-        "EMBEDDING_BASE_URL for a local endpoint or EMBEDDING_API_KEY/OPENAI_API_KEY "
-        "for a hosted semantic embedding service",
+        "Using hash-based embedder (dimension=%d); configure credentials for a hosted endpoint, "
+        "use a localhost/host.docker.internal EMBEDDING_BASE_URL for local semantic embeddings, "
+        "or explicitly opt into a trusted remote anonymous endpoint",
         fallback_dimension,
     )
     return HashEmbedder(dim=fallback_dimension)
