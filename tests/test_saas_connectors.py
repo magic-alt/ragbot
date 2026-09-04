@@ -9,6 +9,7 @@ from services.worker.connectors.incremental import stable_document_id
 from services.worker.jobs.ingest_confluence import ingest_confluence
 from services.worker.jobs.ingest_google_drive import ingest_google_drive
 from services.worker.jobs.ingest_notion import ingest_notion
+from services.worker.parsing import parser_metadata
 
 
 class _Response:
@@ -46,6 +47,7 @@ def _previous(base: str, external_id: str, remote_version: str, text: str = "unc
             "version": "1.0",
             "tags": [],
             "acl_hash": "public",
+            **parser_metadata(None, name="document.txt", media_type="text/plain"),
             **chunking_metadata(None, chunk_size=800, chunk_overlap=100),
         },
     )
@@ -142,6 +144,8 @@ class _DriveSession:
                     ]
                 }
             )
+        if url.endswith("/files/same"):
+            return _Response(body=b"Unchanged Drive engineering runbook content.")
         if url.endswith("/files/changed"):
             return _Response(body=b"Changed Drive engineering runbook content.")
         raise AssertionError(f"unexpected Drive request: {url}")
@@ -167,6 +171,33 @@ def test_google_drive_reuses_unchanged_file_without_downloading(monkeypatch):
     assert any(chunk.metadata.get("external_id") == "changed" for chunk in chunks)
     assert not any(url.endswith("/files/same") for url, _ in session.calls)
     assert any(url.endswith("/files/changed") for url, _ in session.calls)
+
+
+def test_google_drive_legacy_chunk_without_parser_contract_rebuilds(monkeypatch):
+    monkeypatch.setenv("DRIVE_TOKEN", "token")
+    base = "doc-drive"
+    legacy = _previous(base, "same", "2026-09-01T00:00:00Z:1:aaa")
+    for key in ("parser_provider", "parser_strategy", "parser_version", "parser_config_hash"):
+        legacy.metadata.pop(key, None)
+    session = _DriveSession()
+
+    chunks = list(
+        ingest_google_drive(
+            folder_id="folder",
+            credential_ref="env:DRIVE_TOKEN",
+            doc_id=base,
+            tenant_id="tenant-a",
+            recursive=False,
+            previous_chunks=[legacy],
+            session=session,
+        )
+    )
+
+    assert any(url.endswith("/files/same") for url, _ in session.calls)
+    rebuilt = [chunk for chunk in chunks if chunk.metadata.get("external_id") == "same"]
+    assert rebuilt
+    assert all(chunk.chunk_id != "old-same" for chunk in rebuilt)
+    assert all(chunk.metadata.get("parser_config_hash") for chunk in rebuilt)
 
 
 class _NotionSession:
