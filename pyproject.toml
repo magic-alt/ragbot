@@ -27,10 +27,14 @@ observability = [
     "python-json-logger>=2.0",
     "prometheus-client>=0.20",
 ]
+benchmark-frameworks = [
+    "langchain-text-splitters>=0.3",
+    "llama-index-core>=0.12",
+]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
 
 [tool.setuptools.packages.find]
-include = ["contracts*", "services*", "cli*", "eval*"]
+include = ["contracts*", "services*", "cli*", "eval*", "benchmarks*"]
 
 [project.scripts]
 rag = "cli.rag:main"

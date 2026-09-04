@@ -1,0 +1,59 @@
+name: RAG Framework Benchmark
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "benchmarks/rag_framework_compare.py"
+      - "tests/test_rag_framework_compare_benchmark.py"
+      - "docs/RAG_FRAMEWORK_BENCHMARK.md"
+      - "pyproject.toml"
+      - ".github/workflows/rag-framework-benchmark.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rag-framework-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  controlled-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install benchmark dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,worker,benchmark-frameworks]"
+
+      - name: Run benchmark regression tests
+        run: python -m pytest -q tests/test_rag_framework_compare_benchmark.py
+
+      - name: Run controlled three-backend smoke benchmark
+        run: |
+          python -m benchmarks.rag_framework_compare \
+            --backends ragbot,langchain,llamaindex \
+            --synthetic-documents 24 \
+            --synthetic-queries 12 \
+            --chunk-size 400 \
+            --chunk-overlap 60 \
+            --output rag-framework-benchmark.json
+
+      - name: Upload benchmark result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rag-framework-benchmark
+          path: rag-framework-benchmark.json
+          if-no-files-found: warn
