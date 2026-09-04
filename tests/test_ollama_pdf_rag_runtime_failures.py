@@ -205,7 +205,7 @@ def test_pdf_ingestion_wraps_local_path_failure_with_runtime_context(
 
     with patch.object(
         ingest_pdf_module,
-        "fetch_pdf",
+        "fetch_pdf_pages",
         side_effect=ValueError("Local source is outside RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS"),
     ):
         with pytest.raises(ValueError, match="PDF local path rejected") as exc_info:
