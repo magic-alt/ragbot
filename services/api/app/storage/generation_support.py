@@ -19,6 +19,47 @@ _GENERATION_METHODS = (
 )
 
 
+def _retry_publication_outbox_postgres(
+    repo: Any,
+    outbox_id: int,
+    worker_id: str,
+    error: str,
+    delay_seconds: float,
+    max_attempts: int = 10,
+) -> bool:
+    with repo._pool.connection() as conn:
+        with conn.transaction():
+            row = conn.execute(
+                "SELECT attempts FROM publication_outbox WHERE outbox_id = %s AND lease_owner = %s FOR UPDATE",
+                (int(outbox_id), worker_id),
+            ).fetchone()
+            if not row:
+                return False
+            attempts = int(row["attempts"] if isinstance(row, dict) else row[0])
+            if attempts >= max_attempts:
+                result = conn.execute(
+                    """
+                    UPDATE publication_outbox
+                    SET status = 'failed', last_error = %s,
+                        lease_owner = NULL, lease_expires_at = NULL
+                    WHERE outbox_id = %s AND lease_owner = %s
+                    """,
+                    (str(error)[:4000], int(outbox_id), worker_id),
+                )
+            else:
+                result = conn.execute(
+                    """
+                    UPDATE publication_outbox
+                    SET status = 'pending', last_error = %s,
+                        available_at = NOW() + (%s * INTERVAL '1 second'),
+                        lease_owner = NULL, lease_expires_at = NULL
+                    WHERE outbox_id = %s AND lease_owner = %s
+                    """,
+                    (str(error)[:4000], max(0.0, float(delay_seconds)), int(outbox_id), worker_id),
+                )
+            return (result.rowcount or 0) > 0
+
+
 def ensure_generation_repository(repo: Any) -> Any:
     """Attach the staged-publication adapter to built-in repositories.
 
@@ -32,7 +73,8 @@ def ensure_generation_repository(repo: Any) -> Any:
         return repo
 
     backend = None
-    if hasattr(repo, "_pool"):
+    is_postgres = hasattr(repo, "_pool")
+    if is_postgres:
         backend = PostgresGenerationMixin
     elif hasattr(repo, "_lock") and hasattr(repo, "_documents") and hasattr(repo, "_chunks"):
         backend = InMemoryGenerationMixin
@@ -40,7 +82,10 @@ def ensure_generation_repository(repo: Any) -> Any:
         return repo
 
     for name in _GENERATION_METHODS:
-        method = getattr(backend, name)
+        if is_postgres and name == "retry_publication_outbox":
+            method = _retry_publication_outbox_postgres
+        else:
+            method = getattr(backend, name)
         setattr(repo, name, method.__get__(repo, type(repo)))
     return repo
 
