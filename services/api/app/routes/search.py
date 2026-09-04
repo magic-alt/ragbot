@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
@@ -28,6 +28,10 @@ class SearchRequest(BaseModel):
     tenant_id: str = Field(min_length=1)
     user_id: str = Field(min_length=1)
     top_k: int = Field(default=20, ge=1, le=100)
+    mode: Literal["vector", "lexical", "hybrid"] = "hybrid"
+    candidate_pool: Optional[int] = Field(default=None, ge=1, le=200)
+    rerank: bool = True
+    explain: bool = False
     filters: Optional[SearchFilters] = None
 
 
@@ -82,6 +86,15 @@ def _build_retrieval_filters(
     return result
 
 
+def _retrieval_context(chunks: List[Any]) -> Dict[str, Any]:
+    if not chunks:
+        return {}
+    metadata = chunks[0].metadata if getattr(chunks[0], "metadata", None) else {}
+    trace = metadata.get("_retrieval") if isinstance(metadata, dict) else None
+    context = trace.get("context") if isinstance(trace, dict) else None
+    return dict(context) if isinstance(context, dict) else {}
+
+
 def create_search_endpoint(get_services, verify_api_key):
     @router.post("/search", response_model=SearchResponse)
     async def search_endpoint(
@@ -101,7 +114,14 @@ def create_search_endpoint(get_services, verify_api_key):
             payload.filters,
             services,
         )
-        chunks = services.retriever.retrieve(payload.query, retrieval_filters, top_k=payload.top_k)
+        chunks = services.retriever.retrieve(
+            payload.query,
+            retrieval_filters,
+            top_k=payload.top_k,
+            mode=payload.mode,
+            candidate_pool=payload.candidate_pool,
+            rerank=payload.rerank,
+        )
         chunk_results = [
             ChunkResult(
                 chunk_id=c.chunk_id,
@@ -113,10 +133,16 @@ def create_search_endpoint(get_services, verify_api_key):
             )
             for c in chunks
         ]
-        diagnostics = {}
+        diagnostics: Dict[str, Any] = {
+            "retrieval_mode": payload.mode,
+            "requested_candidate_pool": payload.candidate_pool,
+            "reranker_requested": payload.rerank,
+            "explain": payload.explain,
+        }
+        diagnostics.update(_retrieval_context(chunks))
         describe = getattr(services.retriever, "diagnostics", None)
         if callable(describe):
-            diagnostics = describe(payload.query)
+            diagnostics = describe(payload.query, diagnostics)
         return SearchResponse(
             request_id=uuid.uuid4().hex,
             chunks=chunk_results,

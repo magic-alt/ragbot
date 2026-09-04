@@ -101,7 +101,7 @@ Bootstrap controller 会创建本地环境、安装依赖、启动服务、等�
 
 ## Semantic Embedding / LLM
 
-真实 semantic retrieval 至少配置：
+真实 semantic retrieval 必须使用真实 embedding model；`HashEmbedder` 只用于 pipeline/test scaffolding。Hosted OpenAI-compatible 示例：
 
 ```dotenv
 EMBEDDING_MODEL=text-embedding-3-small
@@ -109,6 +109,36 @@ EMBEDDING_API_KEY=<your-key>
 EMBEDDING_BASE_URL=https://api.openai.com
 QDRANT_DIM=1536
 ```
+
+也可以**完全本地**运行 semantic embedding。对于“英文技术文档 + 中英文 query”的场景，推荐先把 Qwen3-Embedding 0.6B 作为本地 multilingual baseline：
+
+```powershell
+ollama pull qwen3-embedding:0.6b
+```
+
+```dotenv
+EMBEDDING_MODEL=qwen3-embedding:0.6b
+EMBEDDING_BASE_URL=http://127.0.0.1:11434
+QDRANT_DIM=1024
+```
+
+localhost / loopback / `host.docker.internal` 不需要伪造 embedding API key；远端匿名 endpoint 需要显式 `EMBEDDING_ALLOW_ANONYMOUS=true`。Qwen3 query 会自动使用 retrieval task instruction，document embedding 不加 query instruction。
+
+切换 embedding model 或 dimension 会改变索引契约。Ragbot 将 embedding identity 纳入 chunk reuse key，因此文本即使没变，也会在模型变化后重新向量化；persistent Qdrant 仍应使用匹配 dimension 的 collection。
+
+检索质量不要靠肉眼调权。可直接做 vector / lexical / hybrid ablation：
+
+```powershell
+python .\scripts\ragbot.py search `
+  "What techniques lower VRAM consumption when running large language models?" `
+  --tenant engineering --mode hybrid --candidate-pool 50 --no-rerank --explain
+
+python .\scripts\retrieval_ablation.py `
+  .\eval\datasets\deepseek_in_action_retrieval.json `
+  --tenant engineering --candidate-pool 50
+```
+
+报告包含整体及 exact / paraphrase / cross-lingual 分类的 Recall@1/3/5/10 与 MRR@10。完整方法见 [`docs/RETRIEVAL_QUALITY.md`](docs/RETRIEVAL_QUALITY.md)。
 
 使用 `ask` 再配置 LLM：
 
@@ -119,7 +149,7 @@ OPENAI_BASE_URL=https://api.openai.com
 OPENAI_MODEL=gpt-4o-mini
 ```
 
-development 环境在 embedding key 缺失时允许 HashEmbedder fallback。它只适合 pipeline smoke，不应用于真实语义检索质量评估。
+development 环境在没有可用 semantic endpoint 时允许 HashEmbedder fallback。它只适合 pipeline smoke，不应用于真实语义检索质量评估。
 
 ## 核心能力
 
@@ -129,7 +159,7 @@ development 环境在 embedding key 缺失时允许 HashEmbedder fallback。它�
 - **Source generation fencing**：Job 快照 Source 生命周期代次；Source 更新/删除会 fence 旧 Job，删除采用 tombstone-first → purge。
 - **周期同步**：Source-level scheduled sync，多 worker deterministic Job ID + atomic insert-if-absent。
 - **SaaS 增量复用**：Drive / Notion / Confluence metadata-first refresh，未变化内容跳过正文下载和 embedding。
-- **混合检索**：Qdrant vector + PostgreSQL FTS/CJK bigram + RRF，可选 reranker。
+- **可测量混合检索**：Qdrant vector + PostgreSQL FTS/CJK bigram + adaptive RRF + optional reranker；支持 vector/lexical/hybrid ablation、raw-score explain 与独立 candidate pool。
 - **Agentic RAG**：route → retrieve/sql/code/web → synthesize → verify → finalize，输出 citation。
 - **多租户与 ACL**：API-key principal 绑定 tenant/user/groups/roles；证据进入 synthesis 前执行 tenant/ACL pre-filter。
 - **正式 RBAC**：reader → operator → owner capability hierarchy；owner 独占 destructive `source.delete`；`admin=true` 只用于全局运维。
@@ -153,8 +183,8 @@ CLI / Admin UI / SDK / Agent / IDE / Application
 │ Catalog / schedule / Retry / Requeue / reconcile              │
 │                                                               │
 │ Query → Qdrant vector ─┐                                     │
-│         PostgreSQL FTS ├─ RRF / rerank → Agent → citations   │
-│         CJK bigrams ───┘                                     │
+│         PostgreSQL FTS ├─ adaptive RRF → optional rerank      │
+│         CJK bigrams ───┘              → Agent → citations    │
 │                                                               │
 │ Agent SQL: disabled by default → isolated read-only SQL DSN   │
 │ Metrics: Prometheus + optional OTLP                           │
@@ -208,9 +238,9 @@ RAGBOT_SQL_TIMEOUT_MS=3000
 
 ## Retrieval cache 边界
 
-Ragbot 当前**没有 production RetrievalCache**。原先的 process-local cache 从未真正接入 retrieval，而且 API replicas 与 workers 之间没有一致 invalidation，因此相关 `RAGBOT_CACHE_*` 配置和 `/admin/cache` claim 已删除。
+Ragbot 当前**没有 production RetrievalCache**。原先的 process-local cache 从未真正接入 retrieval，而且 API replicas 与 workers 之间没有一致 invalidation，因此相关 `RAGBOT_CACHE_*` runtime 配置已删除。
 
-`services/api/app/cache/` 仅保留 local primitives 供单测/实验使用。未来只有在存在 shared / generation-aware invalidation contract，并且 benchmark 证明收益后，才应重新把缓存放到 retrieval path。
+`GET /admin/cache` 仅保留为 admin-protected deprecated compatibility tombstone，返回 `enabled=false` / `retired=true`；它不能启用、清理或暴露 runtime cache state。`services/api/app/cache/` 仅保留 local primitives 供单测/实验使用。未来只有在存在 shared / generation-aware invalidation contract，并且 benchmark 证明收益后，才应重新把缓存放到 retrieval path。
 
 ## OpenAI-compatible API 边界
 
@@ -287,6 +317,7 @@ PDF 使用独立 `pdf` connector。扫描型 PDF 需要先 OCR。Docker 模式�
 
 - [`docs/CLI_DEPLOYMENT.md`](docs/CLI_DEPLOYMENT.md) — 部署与 CLI 运维
 - [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — Source → queryable knowledge base
+- [`docs/RETRIEVAL_QUALITY.md`](docs/RETRIEVAL_QUALITY.md) — embedding / ablation / adaptive RRF / reranker benchmark
 - [`docs/API.md`](docs/API.md) — HTTP / RBAC / Job contracts
 - [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — 环境变量与 provider 配置
 - [`docs/SYSTEM_DESIGN.md`](docs/SYSTEM_DESIGN.md) — authoritative architecture

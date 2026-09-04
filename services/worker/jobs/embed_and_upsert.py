@@ -26,6 +26,11 @@ def embed_and_upsert(
     derived from it. The logical ID is also stored in the vector payload so
     retrieval can fuse vector and lexical rankings without coupling SQL primary
     keys to Qdrant's restricted point-ID type.
+
+    The embedding model + dimension are persisted on chunk metadata as part of
+    the reusable knowledge snapshot. Re-ingestion can therefore distinguish
+    unchanged text encoded by a different embedding model and force a safe
+    re-vectorization instead of silently reusing incompatible/stale vectors.
     """
     emb = embedder or HashEmbedder(dim=qdrant.dim)
     vector_batch: List[Tuple[str, List[float], Dict[str, Any]]] = []
@@ -47,6 +52,10 @@ def embed_and_upsert(
                     "Embedding dimension does not match vector store: "
                     f"chunk={chunk.chunk_id}, vector={len(vector)}, qdrant={qdrant.dim}"
                 )
+            metadata = dict(chunk.metadata or {})
+            metadata["embedding_model"] = emb.model_name
+            metadata["embedding_dimension"] = emb.dimension
+            chunk.metadata = metadata
             point_id = point_id_for_chunk(chunk.chunk_id)
             chunk.qdrant_point_id = point_id
             vector_batch.append((point_id, vector, _build_payload(chunk, emb.model_name)))
@@ -93,5 +102,6 @@ def _build_payload(chunk: Chunk, embedding_model: str = "hash-64") -> Dict[str, 
         "acl_hash": acl_hash,
         "tags": chunk.metadata.get("tags") or [],
         "embedding_model": embedding_model,
+        "embedding_dimension": chunk.metadata.get("embedding_dimension"),
         "text": chunk.text,
     }

@@ -216,7 +216,37 @@ The following require `knowledge.query`:
 - `POST /chat`
 - `POST /v1/chat/completions`
 
-Search uses tenant/ACL scope derived from the trusted principal. Production retrieval combines Qdrant vector search + PostgreSQL lexical/CJK + RRF and optional reranking.
+Search uses tenant/ACL scope derived from the trusted principal. The normal default is adaptive hybrid retrieval over Qdrant vector search + PostgreSQL lexical/CJK candidates, followed by optional reranking.
+
+### `POST /search` retrieval-quality controls
+
+```json
+{
+  "query": "What techniques lower VRAM consumption?",
+  "tenant_id": "engineering",
+  "user_id": "researcher",
+  "top_k": 10,
+  "mode": "hybrid",
+  "candidate_pool": 50,
+  "rerank": false,
+  "explain": true
+}
+```
+
+Fields added for controlled retrieval experiments:
+
+| Field | Default | Semantics |
+|---|---|---|
+| `mode` | `hybrid` | `vector`, `lexical`, or `hybrid`; enables true first-stage ablation |
+| `candidate_pool` | configured/default | pre-rerank recall budget, 1–200; does not change final `top_k` |
+| `rerank` | `true` | apply the configured reranker; set `false` to isolate vector/lexical/fusion behavior |
+| `explain` | `false` | diagnostic intent flag; structured retrieval traces remain backward compatible |
+
+Hybrid fusion uses an observable adaptive RRF policy. Weak lexical evidence shifts weight toward semantic vectors. When a CJK query retrieves an English corpus and lexical evidence effectively comes from residual ASCII terms such as `GPU`, the lexical branch is capped at 10% authority instead of receiving unconditional 50/50 fusion weight.
+
+Per-result `metadata._retrieval` includes vector and lexical ranks/raw scores, pre-rerank/RRF score, optional reranker score, embedding model, fusion method and request context. Existing `vector.score`, `lexical.score`, and `rrf_score` keys remain available for compatible evaluators.
+
+Top-level `diagnostics` includes embedding backend/model/dimension, whether semantic embeddings are active, candidate counts, resolved candidate pool, fusion weights/reason, and whether the reranker is configured/requested/applied.
 
 The OpenAI adapter preserves system/history context; the last non-empty user turn remains the active retrieval query. `temperature` and `max_tokens` are propagated to synthesis. Current SSE is final-answer chunk streaming, not provider-native token streaming; token usage is estimated.
 
@@ -254,7 +284,7 @@ Agent request/tool/latency/feedback metrics are exported via OTLP using the Open
 
 These are explicitly **process-local diagnostics**, retained for recent request inspection and feedback correlation. They are not the production metrics backend.
 
-There is no supported `/admin/cache` endpoint. The local cache primitives in `services/api/app/cache/` are experimental/test utilities and are not connected to retrieval.
+`GET /admin/cache` is retained only as an admin-protected deprecated compatibility tombstone. It returns `enabled=false` / `retired=true`, exposes no runtime cache state, and cannot enable or clear caching. The local cache primitives in `services/api/app/cache/` are experimental/test utilities and are not connected to retrieval.
 
 ## CLI ownership
 

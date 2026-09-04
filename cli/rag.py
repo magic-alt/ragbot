@@ -211,12 +211,22 @@ def cmd_ask(args: argparse.Namespace) -> None:
 
 def cmd_search(args: argparse.Namespace) -> None:
     query = " ".join(args.query)
+    rerank = not args.no_rerank
     if args.server:
         result = _api_request(
             args.server,
             "POST",
             "/search",
-            {"query": query, "tenant_id": args.tenant, "user_id": args.user, "top_k": args.top_k},
+            {
+                "query": query,
+                "tenant_id": args.tenant,
+                "user_id": args.user,
+                "top_k": args.top_k,
+                "mode": args.mode,
+                "candidate_pool": args.candidate_pool,
+                "rerank": rerank,
+                "explain": args.explain,
+            },
             _auth_headers(args.api_key),
         )
     else:
@@ -225,19 +235,40 @@ def cmd_search(args: argparse.Namespace) -> None:
 
         services = build_default_services()
         scope = compute_security_scope(args.user, services.repo.list_policies())
+        retrieval_filters: Dict[str, Any] = {"tenant_id": args.tenant}
+        if scope:
+            retrieval_filters["security_scope"] = scope
         chunks = services.retriever.retrieve(
             query,
-            {"tenant_id": args.tenant, "acl_hashes": scope},
+            retrieval_filters,
             top_k=args.top_k,
+            mode=args.mode,
+            candidate_pool=args.candidate_pool,
+            rerank=rerank,
         )
+        context = {}
+        if chunks:
+            trace = (chunks[0].metadata or {}).get("_retrieval") or {}
+            context = dict(trace.get("context") or {})
         result = {
             "chunks": [
-                {"chunk_id": chunk.chunk_id, "text": chunk.text, "score": chunk.score}
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "doc_id": chunk.doc_id,
+                    "text": chunk.text,
+                    "score": chunk.score,
+                    "citations": chunk.citations,
+                    "metadata": chunk.metadata,
+                }
                 for chunk in chunks
             ],
             "total": len(chunks),
+            "diagnostics": services.retriever.diagnostics(query, context),
         }
-    _print_result(result, args.json)
+    if args.explain and not args.json:
+        _print_search_explain(result)
+    else:
+        _print_result(result, args.json)
 
 
 def cmd_patch(args: argparse.Namespace) -> None:
@@ -412,6 +443,57 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         raise RuntimeError("ragbot is not ready")
 
 
+def _print_search_explain(result: Dict[str, Any]) -> None:
+    diagnostics = result.get("diagnostics") or {}
+    policy = diagnostics.get("fusion_policy") or {}
+    print("Retrieval diagnostics")
+    print(
+        "  mode={mode} embedding={model} semantic={semantic} candidate_pool={pool}".format(
+            mode=diagnostics.get("retrieval_mode", "?"),
+            model=diagnostics.get("embedding_model", "?"),
+            semantic=diagnostics.get("semantic_embedding", "?"),
+            pool=diagnostics.get("candidate_pool", diagnostics.get("requested_candidate_pool", "?")),
+        )
+    )
+    print(
+        "  fusion={fusion} vector_weight={vw} lexical_weight={lw} lexical_confidence={lc}".format(
+            fusion=diagnostics.get("fusion_method", diagnostics.get("fusion_mode", "?")),
+            vw=policy.get("vector_weight", "?"),
+            lw=policy.get("lexical_weight", "?"),
+            lc=policy.get("lexical_confidence", "?"),
+        )
+    )
+    print(
+        "  candidates: vector={vector} lexical={lexical} reranker={reranker} rerank_pool={rerank_pool}".format(
+            vector=diagnostics.get("vector_candidates", "?"),
+            lexical=diagnostics.get("lexical_candidates", "?"),
+            reranker=diagnostics.get("reranker_enabled", False),
+            rerank_pool=diagnostics.get("reranker_candidate_count", 0),
+        )
+    )
+    for warning in diagnostics.get("warnings") or []:
+        print(f"  warning: {warning}")
+
+    chunks = result.get("chunks") or []
+    print(f"\nFound {result.get('total', len(chunks))} results:\n")
+    for index, chunk in enumerate(chunks, 1):
+        metadata = chunk.get("metadata") or {}
+        trace = metadata.get("_retrieval") or {}
+        vector = trace.get("vector") or {}
+        lexical = trace.get("lexical") or {}
+        preview = " ".join(str(chunk.get("text") or "").split())[:180]
+        vector_score = vector.get("raw_score", vector.get("score"))
+        lexical_score = lexical.get("raw_score", lexical.get("score"))
+        print(
+            f"  {index}. final={chunk.get('score', '?')} "
+            f"vector={vector.get('rank', '-')}/{vector_score if vector_score is not None else '-'} "
+            f"lexical={lexical.get('rank', '-')}/{lexical_score if lexical_score is not None else '-'} "
+            f"pre_rerank={trace.get('pre_rerank_score', '-')} "
+            f"rerank={trace.get('rerank_score', '-')}"
+        )
+        print(f"     {preview}")
+
+
 def _print_result(result: Dict[str, Any], as_json: bool) -> None:
     if as_json:
         print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -468,6 +550,27 @@ def build_parser() -> argparse.ArgumentParser:
     search = subparsers.add_parser("search")
     search.add_argument("query", nargs="+")
     search.add_argument("--top-k", type=int, default=10)
+    search.add_argument(
+        "--mode",
+        choices=["vector", "lexical", "hybrid"],
+        default="hybrid",
+        help="Retrieval ablation mode (default: hybrid)",
+    )
+    search.add_argument(
+        "--candidate-pool",
+        type=int,
+        help="Pre-rerank candidate budget; final results still use --top-k",
+    )
+    search.add_argument(
+        "--no-rerank",
+        action="store_true",
+        help="Disable configured reranker to isolate first-stage retrieval/fusion",
+    )
+    search.add_argument(
+        "--explain",
+        action="store_true",
+        help="Show vector/lexical raw scores, fusion weights and reranker trace",
+    )
     search.set_defaults(func=cmd_search)
 
     patch = subparsers.add_parser("patch")

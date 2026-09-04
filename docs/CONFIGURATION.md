@@ -12,6 +12,7 @@
 6. Production API key 必须绑定 scoped principal；请求不能自行扩大 tenant/user scope。
 7. **`POSTGRES_DSN` 只属于 Ragbot control plane。** Agent SQL 默认关闭；启用时使用独立 `RAGBOT_SQL_DSN`。
 8. Ragbot 当前**没有受支持的 runtime RetrievalCache**。仓库中的 local cache primitives 仅用于实验/测试，不进入 retrieval path，也没有 `RAGBOT_CACHE_*` 生产配置。
+9. Retrieval 调参必须通过 vector/lexical/hybrid ablation 与 Recall@K/MRR 验证，避免只凭少量 Top-K 结果修改权重。
 
 ## 2. Runtime / durable ingestion
 
@@ -57,15 +58,39 @@ Durable queue 唯一实现位于 repository/PostgreSQL lease contract；旧 `ser
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `EMBEDDING_MODEL` | empty | OpenAI-compatible embedding model；development 为空时 HashEmbedder |
+| `EMBEDDING_MODEL` | empty | OpenAI-compatible embedding model；未形成 semantic endpoint 时 development 使用 HashEmbedder |
 | `EMBEDDING_API_KEY` | `OPENAI_API_KEY` | embedding API key |
 | `EMBEDDING_BASE_URL` | `OPENAI_BASE_URL` | embedding endpoint |
+| `EMBEDDING_ALLOW_ANONYMOUS` | `false` | 显式允许无认证的远端 embedding endpoint；localhost/loopback/`host.docker.internal` 自动允许 |
+| `EMBEDDING_QUERY_INSTRUCTION` | model default | query-side retrieval instruction；Qwen3 Embedding 自动提供默认 instruction |
 | `QDRANT_URL` | empty | development 为空时 InMemoryQdrant |
 | `QDRANT_API_KEY` | empty | Qdrant API key |
 | `QDRANT_COLLECTION` | `rag_chunks` | collection name |
-| `QDRANT_DIM` | 64(in-memory) / 1536(Qdrant) | vector dimension |
+| `QDRANT_DIM` | model-known dimension / 64 fallback | vector dimension；显式值优先 |
 
-Embedding 返回维度必须严格等于 `QDRANT_DIM`。模型升级应使用新 collection → re-ingest → retrieval/ACL/citation gate → traffic cutover → rollback window。
+Embedding 返回维度必须严格等于 `QDRANT_DIM`。已知 Qwen3 Embedding 维度可从模型名推断，包括常见 Ollama quantization suffix：
+
+| Model family | Native dimension |
+|---|---:|
+| `qwen3-embedding:0.6b*` | 1024 |
+| `qwen3-embedding:4b*` | 2560 |
+| `qwen3-embedding:8b*` | 4096 |
+
+本地 Ollama 示例：
+
+```dotenv
+EMBEDDING_MODEL=qwen3-embedding:0.6b
+EMBEDDING_BASE_URL=http://127.0.0.1:11434
+QDRANT_DIM=1024
+```
+
+无需伪造 API key。远端无认证 endpoint 必须显式设置 `EMBEDDING_ALLOW_ANONYMOUS=true`；否则 development 回退到 HashEmbedder，production 则因非 semantic fallback fail-fast。
+
+Qwen3 query 使用 `Instruct: ...\nQuery:...` 形态，document embedding 保持原始正文。这样不会把 query instruction 污染进 corpus vector。
+
+模型升级应使用 compatible collection → re-ingest → retrieval/ACL/citation gate → traffic cutover → rollback window。Chunk reuse identity 现在包含 `embedding_model` 与 `embedding_dimension`；切换模型/维度后，即使正文 checksum 没变化，也会强制重新 embedding，避免 benchmark 静默复用旧向量。
+
+更完整的模型比较、ablation 与本地 Qwen 指南见 [`RETRIEVAL_QUALITY.md`](RETRIEVAL_QUALITY.md)。
 
 ## 5. PostgreSQL control plane / lexical retrieval
 
@@ -83,7 +108,36 @@ POSTGRES_TEST_DSN='postgresql://...' python -m eval.cjk_retrieval
 
 Release floor：Recall@5 ≥ 0.90、MRR ≥ 0.80。
 
-## 6. Optional Agent SQL
+## 6. Retrieval fusion / quality controls
+
+| Variable / request field | Default | Meaning |
+|---|---|---|
+| `RAGBOT_RETRIEVAL_CANDIDATE_POOL` | `max(40, top_k*4)` when unset | vector/lexical pre-rerank recall budget；最大 200 |
+| `/search.mode` | `hybrid` | `vector` / `lexical` / `hybrid` ablation mode |
+| `/search.candidate_pool` | env/default | request-level candidate budget override |
+| `/search.rerank` | `true` | 是否应用已配置 reranker；ablation 可显式关闭 |
+| `/search.explain` | `false` | 标记 diagnostic request；retrieval trace 仍保持结构化兼容字段 |
+
+Hybrid 使用 adaptive RRF：强 lexical evidence 保持 50/50；弱 lexical evidence 提升 vector 权重；CJK query 对英文 corpus 仅靠少量 ASCII token 命中时，lexical 权重降至 0.1，避免例如单个 `GPU` token 获得与完整 lexical match 相同的融合权威。
+
+CLI：
+
+```bash
+python -m cli.rag search "query" --mode vector --no-rerank --explain
+python -m cli.rag search "query" --mode lexical --no-rerank --explain
+python -m cli.rag search "query" --mode hybrid --candidate-pool 50 --no-rerank --explain
+```
+
+DeepSeek in Action benchmark：
+
+```bash
+python scripts/retrieval_ablation.py eval/datasets/deepseek_in_action_retrieval.json \
+  --tenant engineering --candidate-pool 50
+```
+
+默认关闭 reranker，以隔离 first-stage retrieval/fusion；再加 `--with-reranker` 测 cross-encoder 的增量收益。报告包含整体及 exact/paraphrase/cross-lingual 分类的 Recall@1/3/5/10 与 MRR@10。
+
+## 7. Optional Agent SQL
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -95,7 +149,7 @@ Release floor：Recall@5 ≥ 0.90、MRR ≥ 0.80。
 
 Production 会拒绝 `RAGBOT_SQL_DSN == POSTGRES_DSN`，也会拒绝空 allowlist。数据库仍应使用 dedicated read-only role、最小 grants，以及多租户场景下的 RLS 或 tenant-safe views。
 
-## 7. Reranker
+## 8. Reranker
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -104,11 +158,11 @@ Production 会拒绝 `RAGBOT_SQL_DSN == POSTGRES_DSN`，也会拒绝空 allowlis
 | `RAGBOT_RERANK_MODEL` | provider default | model |
 | `RAGBOT_RERANK_API_KEY` | empty | provider key |
 | `RAGBOT_RERANK_BASE_URL` | empty | local rerank endpoint |
-| `RAGBOT_RERANK_TOP_K` | `10` | rerank top-k |
+| `RAGBOT_RERANK_TOP_K` | `10` | provider factory default top-k；请求最终 Top-K 仍由 search `top_k` 控制 |
 
-Provider failure 时 Retriever 回退到 RRF。
+Provider failure 时 Retriever 回退到 pre-rerank ranking。`candidate_pool` 控制 cross-encoder 最多看到多少候选，`top_k` 控制最终输出；两者不再绑定为固定 `top_k * 2`。
 
-## 8. API identity / RBAC / ACL
+## 9. API identity / RBAC / ACL
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -145,7 +199,7 @@ RAGBOT_API_KEY_PRINCIPALS='{"tenant-a-key":{"tenant_ids":["tenant-a"],"user_id":
 
 `GET /catalog/session` 返回 legacy UI summary 以及完整 `effective_capabilities` / `role_capability_matrix`。
 
-## 9. Source boundaries
+## 10. Source boundaries
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -162,7 +216,7 @@ RAGBOT_API_KEY_PRINCIPALS='{"tenant-a-key":{"tenant_ids":["tenant-a"],"user_id":
 
 应用层 URL 验证不是 egress firewall 的替代品。
 
-## 10. Observability / metrics
+## 11. Observability / metrics
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -199,7 +253,7 @@ RAGBOT_OTEL_METRICS_ENABLED=true
 OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
 ```
 
-## 11. CLI ownership
+## 12. CLI ownership
 
 唯一产品 CLI implementation 是 `cli/rag.py`，同时服务：
 
@@ -210,7 +264,7 @@ python -m cli.rag ...
 
 `scripts/ragbot.py` 只负责 setup/up/down/restart/status/logs 和部署路径映射；ask/search/ingest/import/doctor 最终委托给 `cli.rag`。旧 `cli/rag_impl.py` 与 `scripts/ragbot_impl.py` 已删除。
 
-## 12. Staging / install / production gate
+## 13. Staging / install / production gate
 
 Full development：
 
