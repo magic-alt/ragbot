@@ -56,6 +56,7 @@ def fail_postgres_generation(
                 generation_id=generation_id,
                 point_ids=point_ids,
             )
+            conn.execute("DELETE FROM staged_chunks WHERE generation_id = %s", (generation_id,))
             conn.execute("DELETE FROM staged_documents WHERE generation_id = %s", (generation_id,))
 
 
@@ -129,14 +130,15 @@ def reconcile_postgres_generations(repo: Any) -> Dict[str, int]:
                     """,
                     (generation_id,),
                 )
-                before = len(point_ids)
                 repo._enqueue_cleanup_events(
                     conn,
                     source_id=source_id,
                     generation_id=generation_id,
                     point_ids=point_ids,
                 )
-                cleanup_events += 1 if before else 0
+                if point_ids:
+                    cleanup_events += 1
+                conn.execute("DELETE FROM staged_chunks WHERE generation_id = %s", (generation_id,))
                 conn.execute("DELETE FROM staged_documents WHERE generation_id = %s", (generation_id,))
                 recovered += 1
     return {"recovered_generations": recovered, "cleanup_generations": cleanup_events}
