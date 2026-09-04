@@ -275,3 +275,6 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         if tombstoned is None:
             raise HTTPException(404, "Source not found")
         purge_source_knowledge(tombstoned, services.repo, services.qdrant)
+        return None
+
+    return router
