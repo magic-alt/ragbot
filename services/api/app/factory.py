@@ -10,7 +10,7 @@ from .agent.nodes.sql import PostgresSqlEngine, SqlEngine
 from .agent.sql_disabled import DisabledSqlEngine
 from .llm.provider import build_model_provider
 from .retrieval.cross_encoder import build_reranker
-from .retrieval.embedder import HashEmbedder, build_embedder
+from .retrieval.embedder import HashEmbedder, build_embedder, model_dimension
 from .retrieval.qdrant import InMemoryQdrant, QdrantClientAdapter
 from .retrieval.service import Retriever
 from .runtime import is_production, validate_production_environment
@@ -43,7 +43,14 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
     qdrant_api_key = os.getenv("QDRANT_API_KEY")
     qdrant_collection = os.getenv("QDRANT_COLLECTION", "rag_chunks")
     qdrant_dim_raw = os.getenv("QDRANT_DIM")
-    qdrant_dim = int(qdrant_dim_raw) if qdrant_dim_raw else (1536 if qdrant_url else 64)
+    embedding_model = os.getenv("EMBEDDING_MODEL", "").strip()
+    inferred_dim = model_dimension(embedding_model)
+    if qdrant_dim_raw:
+        qdrant_dim = int(qdrant_dim_raw)
+    elif inferred_dim:
+        qdrant_dim = inferred_dim
+    else:
+        qdrant_dim = 1536 if qdrant_url else 64
 
     if qdrant_url:
         qdrant = QdrantClientAdapter(
