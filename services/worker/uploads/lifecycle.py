@@ -26,6 +26,8 @@ def retire_uploaded_object_for_source(repo: Any, source: Any) -> bool:
     obj = repo.get_uploaded_object(object_id)
     if obj is None or obj.state == "deleted":
         return False
+    if obj.tenant_id != getattr(source, "tenant_id", None):
+        raise ValueError("Uploaded object tenant does not match Source tenant")
     now = datetime.now(timezone.utc).isoformat()
     repo.update_uploaded_object(
         object_id,
@@ -36,13 +38,18 @@ def retire_uploaded_object_for_source(repo: Any, source: Any) -> bool:
     return True
 
 
-def gc_uploaded_objects(repo: Any, *, retention_seconds: int | None = None) -> dict[str, int]:
+def gc_uploaded_objects(
+    repo: Any,
+    *,
+    tenant_id: str | None = None,
+    retention_seconds: int | None = None,
+) -> dict[str, int]:
     """Delete unreferenced uploaded objects after a retention window.
 
-    GC is deliberately registry-driven. Source deletion only retires an object;
-    the worker later deletes storage after the configured retention window so
-    transient operator mistakes can be diagnosed without racing immediate blob
-    deletion.
+    ``tenant_id`` scopes operator-triggered GC. Passing ``None`` is reserved for
+    trusted internal maintenance paths. Source deletion only retires an object;
+    storage deletion occurs after retention so failed submissions and accidental
+    deletes remain diagnosable.
     """
     list_objects = getattr(repo, "list_uploaded_objects", None)
     update = getattr(repo, "update_uploaded_object", None)
@@ -51,8 +58,9 @@ def gc_uploaded_objects(repo: Any, *, retention_seconds: int | None = None) -> d
     if retention_seconds is None:
         retention_seconds = _nonnegative_int_env("RAGBOT_UPLOAD_RETENTION_SECONDS", 86400)
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=retention_seconds)
+    objects = list_objects(tenant_id=tenant_id) if tenant_id is not None else list_objects()
     candidates = [
-        obj for obj in list_objects()
+        obj for obj in objects
         if obj.state in {"orphaned", "retired"}
         and int(obj.ref_count or 0) == 0
         and _timestamp(obj.retired_at or obj.created_at) <= cutoff
@@ -68,7 +76,11 @@ def gc_uploaded_objects(repo: Any, *, retention_seconds: int | None = None) -> d
     for obj in candidates:
         try:
             store.delete_object(obj.object_id, sha256=obj.sha256)
-            update(obj.object_id, state="deleted", retired_at=obj.retired_at or datetime.now(timezone.utc).isoformat())
+            update(
+                obj.object_id,
+                state="deleted",
+                retired_at=obj.retired_at or datetime.now(timezone.utc).isoformat(),
+            )
             stats["deleted"] += 1
         except Exception:
             stats["errors"] += 1
