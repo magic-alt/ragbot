@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Optional
+from typing import Dict, List, Optional
 
 from contracts.types import (  # noqa: F401 - re-exported
     AgentState,
@@ -37,6 +37,10 @@ def build_initial_state(
     session_id: Optional[str] = None,
     constraints: Optional[Constraints] = None,
     request_id: Optional[str] = None,
+    conversation_messages: Optional[List[Dict[str, str]]] = None,
+    system_prompt: Optional[str] = None,
+    generation_temperature: float = 0.2,
+    generation_max_tokens: Optional[int] = None,
 ) -> AgentState:
     return AgentState(
         request_id=request_id or uuid.uuid4().hex,
@@ -45,4 +49,8 @@ def build_initial_state(
         session_id=session_id,
         query=query,
         constraints=constraints or Constraints(),
+        conversation_messages=list(conversation_messages or []),
+        system_prompt=system_prompt,
+        generation_temperature=generation_temperature,
+        generation_max_tokens=generation_max_tokens,
     )
