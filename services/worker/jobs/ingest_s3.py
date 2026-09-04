@@ -2,19 +2,19 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import logging
+import mimetypes
 import os
 import uuid
 from pathlib import PurePosixPath
 from typing import Iterable, Optional
 
 from services.api.app.storage.models import Chunk
-from services.worker.chunking import split_text
 from services.worker.chunking.languages import language_for_path
 from services.worker.connectors.security import csv_values, validate_remote_url
 from services.worker.dedup.hashing import content_hash
 from services.worker.jobs.ingest_text import _extract_section
+from services.worker.parsing import iter_document_segments, parse_document
 
 logger = logging.getLogger(__name__)
 DEFAULT_EXTENSIONS = {".txt", ".md", ".markdown", ".rst", ".py", ".js", ".ts", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".go", ".rs", ".yaml", ".yml", ".json", ".toml", ".ini", ".pdf"}
@@ -37,6 +37,7 @@ def ingest_s3(
     tags: Optional[list] = None,
     acl_hash: Optional[str] = None,
     chunking: Optional[dict] = None,
+    parsing: Optional[dict] = None,
 ) -> Iterable[Chunk]:
     try:
         import boto3
@@ -85,44 +86,58 @@ def ingest_s3(
             if len(body) > max_object_bytes:
                 logger.warning("Skipping S3 object exceeding hard read limit: s3://%s/%s", bucket, key)
                 continue
-            text = _extract_object_text(body, suffix)
-            if not text.strip():
+            if not body:
                 continue
 
             object_doc_id = f"{doc_id}:{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}"
             uri = f"s3://{bucket}/{key}"
-            sections, chunker_metadata = split_text(
-                text,
+            media_type = mimetypes.guess_type(key)[0] or "application/octet-stream"
+            document, parser_metadata = parse_document(
+                body,
+                parsing,
+                name=PurePosixPath(key).name,
+                media_type=media_type,
+                uri=uri,
+            )
+            if not document.blocks:
+                continue
+            chunk_index = 0
+            for segment in iter_document_segments(
+                document,
                 chunking,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
                 language=language_for_path(key),
-            )
-            for index, section in enumerate(sections):
+            ):
+                section = segment.section
+                if section is None and suffix in {".md", ".markdown"}:
+                    section = _extract_section(segment.text)
                 metadata = {
                     "source_type": "s3",
                     "bucket": bucket,
                     "object_key": key,
                     "filename": PurePosixPath(key).name,
+                    "media_type": media_type,
                     "etag": str(item.get("ETag") or "").strip('"'),
                     "version": version,
                     "tags": tags or [],
                     "acl_hash": acl_hash or "public",
-                    **chunker_metadata,
+                    **parser_metadata,
+                    **segment.metadata,
                 }
-                if suffix == ".pdf":
-                    metadata.update({"parser_provider": "pypdf2", "parser_version": 1})
                 yield Chunk(
                     chunk_id=uuid.uuid4().hex,
                     doc_id=object_doc_id,
                     tenant_id=tenant_id,
-                    chunk_index=index,
-                    text=section,
+                    chunk_index=chunk_index,
+                    text=segment.text,
                     path=uri,
-                    section=_extract_section(section) if suffix in {".md", ".markdown"} else None,
-                    checksum=content_hash(section),
+                    page=segment.page,
+                    section=section,
+                    checksum=content_hash(segment.text),
                     metadata=metadata,
                 )
+                chunk_index += 1
                 total_chunks += 1
             total_objects += 1
 
@@ -144,14 +159,15 @@ def _validate_custom_endpoint(endpoint_url: str) -> str:
 
 
 def _extract_object_text(body: bytes, suffix: str) -> str:
-    if suffix == ".pdf":
-        try:
-            from PyPDF2 import PdfReader
-        except ImportError as exc:
-            raise RuntimeError("PDF objects require PyPDF2; install ragbot[worker]") from exc
-        reader = PdfReader(io.BytesIO(body))
-        return "\n\n".join((page.extract_text() or "") for page in reader.pages)
-    return body.decode("utf-8", errors="replace")
+    """Backward-compatible helper implemented through the Parser Port."""
+    media_type = mimetypes.guess_type(f"file{suffix}")[0] or "application/octet-stream"
+    document, _metadata = parse_document(
+        body,
+        None,
+        name=f"file{suffix}",
+        media_type=media_type,
+    )
+    return document.text
 
 
 def _normalize_extensions(values: Optional[list[str]]) -> set[str]:
