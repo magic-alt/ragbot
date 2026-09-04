@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from services.worker.chunking import resolve_chunking_spec
 from services.worker.connectors.credentials import validate_secret_ref
+from services.worker.parsing import resolve_parser_spec
 from services.worker.pipeline import purge_source_knowledge
 from services.worker.scheduler import configure_source_sync
 
@@ -31,6 +32,7 @@ SOURCE_TYPE_VALUES = (
 )
 VALID_SOURCE_TYPES = set(SOURCE_TYPE_VALUES)
 _CLOUD_SECRET_SOURCE_TYPES = {"gdrive", "notion", "confluence"}
+_PARSER_SOURCE_TYPES = {"local_fs", "pdf", "web", "s3", "gdrive"}
 _INLINE_SECRET_MARKERS = (
     "access_token", "refresh_token", "api_key", "apikey", "password",
     "private_key", "client_secret", "secret_access_key",
@@ -110,8 +112,38 @@ def _validate_chunking_config(source_type: str, config: Dict[str, Any]) -> None:
         raise HTTPException(status_code=422, detail=f"Invalid chunking configuration: {exc}") from exc
 
 
+def _validate_parsing_config(source_type: str, config: Dict[str, Any]) -> None:
+    raw_parsing = config.get("parsing")
+    if raw_parsing is None:
+        return
+    if source_type not in _PARSER_SOURCE_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"source_type={source_type} does not accept config.parsing",
+        )
+    if not isinstance(raw_parsing, dict):
+        raise HTTPException(status_code=422, detail="config.parsing must be an object")
+    validation_name = {
+        "pdf": "document.pdf",
+        "web": "index.html",
+        "local_fs": "document.txt",
+        "s3": "document.txt",
+        "gdrive": "document.txt",
+    }[source_type]
+    validation_media_type = "application/pdf" if source_type == "pdf" else "application/octet-stream"
+    try:
+        resolve_parser_spec(
+            raw_parsing,
+            name=validation_name,
+            media_type=validation_media_type,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid parsing configuration: {exc}") from exc
+
+
 def _validate_source_config(source_type: str, config: Dict[str, Any]) -> None:
     _validate_chunking_config(source_type, config)
+    _validate_parsing_config(source_type, config)
     if source_type == "web":
         _require_string(config, "url", source_type)
         return
