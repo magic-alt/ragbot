@@ -16,6 +16,7 @@ from .retrieval.service import Retriever
 from .runtime import is_production, validate_production_environment
 from .storage.generation_support import ensure_generation_repository
 from .storage.repo import InMemoryRepo
+from .storage.upload_support import ensure_upload_repository
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +41,8 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
             repo = InMemoryRepo()
             logger.info("Using InMemoryRepo")
 
-    # Staged knowledge generations are an additive capability layered over the
-    # existing Repo API. Installing it in every API/worker process guarantees
-    # retrieval can validate Qdrant candidates against the authoritative active
-    # PostgreSQL manifest even when that process did not perform ingestion.
     ensure_generation_repository(repo)
+    ensure_upload_repository(repo)
 
     qdrant_url = os.getenv("QDRANT_URL")
     qdrant_api_key = os.getenv("QDRANT_API_KEY")
@@ -97,9 +95,6 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
     if sql_enabled:
         sql_dsn = (os.getenv("RAGBOT_SQL_DSN") or "").strip()
         if postgres_dsn and not sql_dsn and not is_production():
-            # Development-only compatibility: production validation forbids this
-            # implicit reuse because the control-plane database is not a tenant-
-            # safe Agent query surface.
             sql_dsn = postgres_dsn
         if sql_dsn:
             allowed_schemas_raw = os.getenv("RAGBOT_SQL_ALLOWED_SCHEMAS", "")
