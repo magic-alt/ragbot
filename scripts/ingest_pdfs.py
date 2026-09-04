@@ -87,6 +87,68 @@ def _docker_stack_running() -> bool:
     return "api" in services and "worker" in services
 
 
+def _docker_postgres_host_port() -> int | None:
+    """Return the published host PostgreSQL port for the active Compose stack."""
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "port", "postgres", "5432"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    endpoints = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not endpoints:
+        return None
+    try:
+        return int(endpoints[-1].rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _host_postgres_python_clients(port: int) -> list[str]:
+    """Return host Python processes connected to the Docker PostgreSQL port."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:ESTABLISHED"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode not in {0, 1}:
+        return []
+    matches: list[str] = []
+    for line in result.stdout.splitlines()[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        command = stripped.split(None, 1)[0].lower()
+        if command.startswith(("python", "pypy")):
+            matches.append(stripped)
+    return matches
+
+
+def _assert_no_competing_host_worker() -> None:
+    """Fail before submission if a host Python process can claim Docker jobs."""
+    port = _docker_postgres_host_port()
+    if port is None:
+        return
+    clients = _host_postgres_python_clients(port)
+    if clients:
+        preview = " | ".join(clients[:8])
+        raise UserError(
+            "Competing host Python process is connected to the Docker PostgreSQL ingestion queue "
+            f"on host port {port}. It can claim a /data job outside the Docker filesystem namespace. "
+            f"Stop the stale host worker before retrying: {preview}"
+        )
+
+
 def _resolve_runtime_mode(state: dict) -> str:
     """Resolve the live runtime instead of trusting a potentially stale state file."""
     saved = str(state.get("mode") or "")
@@ -145,17 +207,16 @@ def _runtime_location(path: Path, mode: str) -> str:
     return str(resolved)
 
 
-def _docker_source_contract(path: Path) -> None:
-    """Verify that the running worker sees the same PDF under the /data contract."""
-    runtime_path = _runtime_location(path, "docker")
+def _docker_source_contract(paths: Path | Sequence[Path]) -> None:
+    """Verify every submitted PDF is readable by the running Docker worker."""
+    selected = [paths] if isinstance(paths, Path) else list(paths)
+    runtime_paths = [_runtime_location(path, "docker") for path in selected]
     probe = r'''
 import json
 import os
 import sys
 from pathlib import Path
 
-requested = sys.argv[1]
-resolved = Path(requested).expanduser().resolve()
 roots = [
     Path(value).expanduser().resolve()
     for value in os.getenv("RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS", "").split(os.pathsep)
@@ -169,20 +230,23 @@ def within(candidate: Path, root: Path) -> bool:
     except ValueError:
         return False
 
-allowed = not roots or any(within(resolved, root) for root in roots)
-result = {
-    "requested": requested,
-    "resolved": str(resolved),
-    "allowed_roots": [str(root) for root in roots],
-    "allowed": allowed,
-    "is_file": resolved.is_file(),
-}
-print(json.dumps(result, sort_keys=True))
-raise SystemExit(0 if allowed and result["is_file"] else 3)
+checks = []
+for requested in sys.argv[1:]:
+    resolved = Path(requested).expanduser().resolve()
+    allowed = not roots or any(within(resolved, root) for root in roots)
+    checks.append({
+        "requested": requested,
+        "resolved": str(resolved),
+        "allowed_roots": [str(root) for root in roots],
+        "allowed": allowed,
+        "is_file": resolved.is_file(),
+    })
+print(json.dumps({"checks": checks}, sort_keys=True))
+raise SystemExit(0 if checks and all(item["allowed"] and item["is_file"] for item in checks) else 3)
 '''
     try:
         result = subprocess.run(
-            ["docker", "compose", "exec", "-T", "worker", "python", "-c", probe, runtime_path],
+            ["docker", "compose", "exec", "-T", "worker", "python", "-c", probe, *runtime_paths],
             cwd=ROOT,
             text=True,
             capture_output=True,
@@ -193,8 +257,8 @@ raise SystemExit(0 if allowed and result["is_file"] else 3)
         return
     detail = (result.stdout or result.stderr or "worker probe failed").strip()
     raise UserError(
-        "Docker local-source contract mismatch. The host discovered the PDF, but the running "
-        f"worker cannot read the mapped container path {runtime_path!r} inside its configured "
+        "Docker local-source contract mismatch. The host discovered the PDF batch, but the running "
+        "worker cannot read one or more mapped /data paths inside its configured "
         f"RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS. Worker probe: {detail}. "
         "Recreate the controller-managed stack with "
         "`python scripts/ragbot.py restart --mode docker`, then retry ingestion."
@@ -344,12 +408,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(path.relative_to(DATA_DIR.resolve()).as_posix())
             return 0
 
-        if mode == "docker":
-            _docker_source_contract(pdfs[0])
-
         batches = list(_batches(pdfs, args.batch_size))
+        if mode == "docker":
+            _assert_no_competing_host_worker()
+
         failed_batches = 0
         for index, batch in enumerate(batches, 1):
+            if mode == "docker":
+                _docker_source_contract(batch)
             manifest = _write_manifest(
                 batch,
                 batch_index=index,
