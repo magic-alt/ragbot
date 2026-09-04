@@ -130,6 +130,7 @@ def run_ingest_pipeline(
             "source_generation": expected_generation,
             "embedding_model": embedding_model,
             "embedding_dimension": embedding_dimension,
+            "parser_contracts": _parser_contracts(current_chunks),
             "chunking_contracts": _chunking_contracts(current_chunks),
             "chunks_total": len(current_chunks),
             "chunks_ingested": len(chunks_to_write),
@@ -262,6 +263,7 @@ def _run_connector(source: Source, repo: Repo, previous_chunks: Iterable[Chunk] 
             path=config["path"],
             chunk_size=int(config.get("chunk_size", 800)),
             chunk_overlap=int(config.get("chunk_overlap", 100)),
+            parsing=config.get("parsing"),
             **common,
         )
     if source_type == "web":
@@ -270,6 +272,7 @@ def _run_connector(source: Source, repo: Repo, previous_chunks: Iterable[Chunk] 
             url=config["url"],
             chunk_size=int(config.get("chunk_size", 800)),
             chunk_overlap=int(config.get("chunk_overlap", 100)),
+            parsing=config.get("parsing"),
             **common,
         )
     if source_type == "repo":
@@ -288,6 +291,7 @@ def _run_connector(source: Source, repo: Repo, previous_chunks: Iterable[Chunk] 
             extensions=config.get("extensions"),
             chunk_size=int(config.get("chunk_size", 800)),
             chunk_overlap=int(config.get("chunk_overlap", 100)),
+            parsing=config.get("parsing"),
             **common,
         )
     if source_type == "s3":
@@ -302,6 +306,7 @@ def _run_connector(source: Source, repo: Repo, previous_chunks: Iterable[Chunk] 
             max_object_bytes=int(config.get("max_object_bytes", 20 * 1024 * 1024)),
             chunk_size=int(config.get("chunk_size", 800)),
             chunk_overlap=int(config.get("chunk_overlap", 100)),
+            parsing=config.get("parsing"),
             **common,
         )
     if source_type == "gdrive":
@@ -315,6 +320,7 @@ def _run_connector(source: Source, repo: Repo, previous_chunks: Iterable[Chunk] 
             chunk_size=int(config.get("chunk_size", 800)),
             chunk_overlap=int(config.get("chunk_overlap", 100)),
             previous_chunks=previous_chunks,
+            parsing=config.get("parsing"),
             **common,
         )
     if source_type == "notion":
@@ -438,7 +444,9 @@ def _reuse_key(chunk: Chunk) -> tuple:
         metadata.get("remote_version"),
         metadata.get("lexical_version"),
         metadata.get("parser_provider"),
+        metadata.get("parser_strategy"),
         metadata.get("parser_version"),
+        metadata.get("parser_config_hash"),
         metadata.get("chunker_provider"),
         metadata.get("chunker_strategy"),
         metadata.get("chunker_version"),
@@ -446,6 +454,22 @@ def _reuse_key(chunk: Chunk) -> tuple:
         metadata.get("embedding_model"),
         metadata.get("embedding_dimension"),
     )
+
+
+def _parser_contracts(chunks: Iterable[Chunk]) -> list[dict[str, object]]:
+    contracts: dict[str, dict[str, object]] = {}
+    for chunk in chunks:
+        metadata = chunk.metadata or {}
+        config_hash = str(metadata.get("parser_config_hash") or "")
+        if not config_hash or config_hash in contracts:
+            continue
+        contracts[config_hash] = {
+            "provider": metadata.get("parser_provider"),
+            "strategy": metadata.get("parser_strategy"),
+            "version": metadata.get("parser_version"),
+            "config_hash": config_hash,
+        }
+    return list(contracts.values())
 
 
 def _chunking_contracts(chunks: Iterable[Chunk]) -> list[dict[str, object]]:
