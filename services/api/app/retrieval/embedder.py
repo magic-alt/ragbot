@@ -40,13 +40,28 @@ _QWEN3_QUERY_TASK = (
 
 
 def model_dimension(model: str) -> Optional[int]:
-    """Return a known native embedding dimension without case sensitivity."""
+    """Return a known native embedding dimension without case sensitivity.
+
+    Ollama model tags can append quantization suffixes (for example
+    ``qwen3-embedding:0.6b-q8_0``), so Qwen3 variants are matched by stable
+    size prefixes rather than only by one exact tag.
+    """
     normalized = str(model or "").strip().lower()
     if not normalized:
         return None
-    if normalized == "qwen3-embedding":
-        # Ollama's unqualified library tag currently resolves to the 8B variant.
+    if normalized == "qwen3-embedding" or normalized.startswith("qwen3-embedding:8b"):
+        # Ollama's unqualified/latest tag currently resolves to the 8B variant.
         return 4096
+    if normalized.startswith("qwen3-embedding:4b"):
+        return 2560
+    if normalized.startswith("qwen3-embedding:0.6b"):
+        return 1024
+    if normalized.startswith("qwen/qwen3-embedding-8b"):
+        return 4096
+    if normalized.startswith("qwen/qwen3-embedding-4b"):
+        return 2560
+    if normalized.startswith("qwen/qwen3-embedding-0.6b"):
+        return 1024
     return MODEL_DIMENSIONS.get(normalized)
 
 
