@@ -90,7 +90,7 @@ class ProductionIngestionModeTests(unittest.TestCase):
             "RAGBOT_API_KEYS": "service-key",
             "RAGBOT_API_KEY_PRINCIPALS": (
                 '{"service-key":{"tenant_ids":["tenant-1"],'
-                '"user_id":"svc","groups":[],"roles":[],"admin":false}}'
+                '"user_id":"svc","groups":[],"roles":["reader"],"admin":false}}'
             ),
         }
 
