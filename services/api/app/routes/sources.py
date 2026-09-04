@@ -13,7 +13,11 @@ from services.worker.connectors.credentials import validate_secret_ref
 from services.worker.parsing import resolve_parser_spec
 from services.worker.pipeline import purge_source_knowledge
 from services.worker.scheduler import configure_source_sync
-from services.worker.uploads.lifecycle import retire_uploaded_object_for_source
+from services.worker.uploads import is_upload_uri
+from services.worker.uploads.lifecycle import (
+    retire_uploaded_object_for_source,
+    source_upload_object_id,
+)
 
 from ..auth.principal import (
     CAP_CATALOG_READ,
@@ -92,6 +96,18 @@ def _reject_inline_secrets(config: Dict[str, Any]) -> None:
             detail=(
                 "Cloud connector credentials must not be stored in Source.config; "
                 f"use credential_ref=env:VARIABLE instead (inline fields: {', '.join(sorted(offending))})"
+            ),
+        )
+
+
+def _reject_direct_managed_upload_config(config: Dict[str, Any]) -> None:
+    path = config.get("path")
+    if isinstance(path, str) and is_upload_uri(path):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "ragbot-upload URIs are server-managed; create uploaded PDF Sources through "
+                "/ingest/upload/pdf instead of /sources"
             ),
         )
 
@@ -196,6 +212,7 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
     @router.post("", status_code=201)
     async def create_source(payload: CreateSourceRequest, _key: Optional[str] = Depends(auth_dep)):
         _validate_source_type(payload.source_type)
+        _reject_direct_managed_upload_config(payload.config)
         _validate_source_config(payload.source_type, payload.config)
         authorize_tenant(_key, payload.tenant_id)
         require_capability(_key, CAP_SOURCE_CREATE)
@@ -255,6 +272,17 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         authorize_tenant(_key, source.tenant_id)
         require_capability(_key, CAP_SOURCE_UPDATE)
         if payload.config is not None:
+            managed_object_id = source_upload_object_id(source)
+            if managed_object_id is not None and dict(payload.config) != dict(source.config or {}):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Server-managed uploaded Source content is immutable; upload a new document "
+                        "instead of replacing config/path on the existing Source"
+                    ),
+                )
+            if managed_object_id is None:
+                _reject_direct_managed_upload_config(payload.config)
             _validate_source_config(source.source_type, payload.config)
         updates = {
             key: value
