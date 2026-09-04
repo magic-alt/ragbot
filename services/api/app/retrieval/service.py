@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from .embedder import Embedder, HashEmbedder
 from .lexical import contains_cjk
 from .pg_fts import fts_search
+from .policy import adaptive_fusion_policy, resolve_candidate_pool, validate_retrieval_mode
 from .rerank import rrf_fuse
 from ..storage.models import Chunk
 from ..storage.protocol import Repo
@@ -29,7 +30,11 @@ class Retriever:
         self._embedder = embedder
         self._reranker = reranker
 
-    def diagnostics(self, query: Optional[str] = None) -> Dict[str, Any]:
+    def diagnostics(
+        self,
+        query: Optional[str] = None,
+        retrieval_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Return non-secret runtime metadata useful for retrieval debugging."""
         embedder = self._embedder or HashEmbedder(dim=self._qdrant.dim)
         semantic = not isinstance(embedder, HashEmbedder)
@@ -39,13 +44,13 @@ class Retriever:
             and self._reranker.enabled
         )
         warnings: List[str] = []
-        fusion_mode = "balanced-hybrid"
+        fusion_mode = "adaptive-hybrid"
         if not semantic:
             fusion_mode = "lexical-first-development"
             warnings.append(
                 "HashEmbedder is a development fallback, not a semantic embedding model. "
-                "Local English search is therefore lexical-first. Configure EMBEDDING_MODEL + "
-                "EMBEDDING_API_KEY and re-ingest before judging semantic quality."
+                "Configure EMBEDDING_MODEL and a real embedding endpoint, then re-ingest before "
+                "judging semantic retrieval quality."
             )
             if query and contains_cjk(query):
                 warnings.append(
@@ -53,7 +58,7 @@ class Retriever:
                     "the invalid hash-vector branch is disabled for this query. Cross-lingual "
                     "Chinese-to-English retrieval requires a multilingual semantic embedding model."
                 )
-        return {
+        result = {
             "embedding_backend": type(embedder).__name__,
             "embedding_model": embedder.model_name,
             "embedding_dimension": embedder.dimension,
@@ -65,89 +70,151 @@ class Retriever:
             "fusion_mode": fusion_mode,
             "warnings": warnings,
         }
+        if retrieval_context:
+            result.update(retrieval_context)
+        return result
 
-    def retrieve(self, query: str, filters: Dict[str, Any], top_k: int = 20) -> List[RetrievalChunk]:
+    def retrieve(
+        self,
+        query: str,
+        filters: Dict[str, Any],
+        top_k: int = 20,
+        *,
+        mode: str = "hybrid",
+        candidate_pool: Optional[int] = None,
+    ) -> List[RetrievalChunk]:
+        """Retrieve evidence using vector, lexical, or adaptive-hybrid ranking.
+
+        ``mode`` is intentionally exposed for ablation and evaluation. Normal
+        Agent traffic keeps the default ``hybrid`` path. ``candidate_pool`` is
+        the recall budget before optional cross-encoder reranking; it is not the
+        final result count.
+        """
+        retrieval_mode = validate_retrieval_mode(mode)
+        pool_size = resolve_candidate_pool(top_k, candidate_pool)
         embedder = self._embedder or HashEmbedder(dim=self._qdrant.dim)
         is_hash_fallback = isinstance(embedder, HashEmbedder)
         cjk_query = contains_cjk(query)
 
-        # HashEmbedder tokenizes only ASCII identifiers. A pure/mostly CJK query
-        # therefore becomes a zero vector and Qdrant returns arbitrary ties. Do
-        # not surface those misleading candidates; CJK lexical retrieval can
-        # still work when the indexed corpus itself contains CJK text.
-        if is_hash_fallback and cjk_query:
-            qdrant_hits = []
-        else:
-            query_vector = embedder.embed(query)
-            qdrant_hits = self._qdrant.search(query_vector, filters, top_k * 2)
-        fts_hits = fts_search(self._repo, query, filters, top_k * 2)
+        qdrant_hits = []
+        if retrieval_mode in {"vector", "hybrid"}:
+            # HashEmbedder tokenizes only ASCII identifiers. A CJK query becomes
+            # an invalid semantic representation, so do not surface arbitrary
+            # Qdrant ties in development mode.
+            if not (is_hash_fallback and cjk_query):
+                embed_query = getattr(embedder, "embed_query", None)
+                query_vector = embed_query(query) if callable(embed_query) else embedder.embed(query)
+                qdrant_hits = self._qdrant.search(query_vector, filters, pool_size)
+
+        fts_hits = []
+        if retrieval_mode in {"lexical", "hybrid"}:
+            fts_hits = fts_search(self._repo, query, filters, pool_size)
 
         # Qdrant point IDs are storage UUIDs; ranking/fusion operates on Ragbot's
-        # logical chunk IDs so the same hit from vector and lexical retrieval is
-        # fused instead of appearing as two unrelated candidates.
-        qdrant_ranked = []
+        # logical chunk IDs so vector and lexical hits for the same chunk fuse.
+        qdrant_ranked: List[tuple[str, float]] = []
         payload_map: Dict[str, Dict[str, Any]] = {}
         vector_trace: Dict[str, Dict[str, Any]] = {}
         for rank, (point_id, score, payload) in enumerate(qdrant_hits, 1):
             logical_id = str(payload.get("chunk_id") or point_id)
-            qdrant_ranked.append((logical_id, score))
+            raw_score = float(score)
+            qdrant_ranked.append((logical_id, raw_score))
             payload_map[logical_id] = payload
-            vector_trace[logical_id] = {"rank": rank, "score": float(score)}
+            vector_trace[logical_id] = {"rank": rank, "raw_score": raw_score}
 
-        fts_ranked = []
+        fts_ranked: List[tuple[str, float]] = []
         lexical_trace: Dict[str, Dict[str, Any]] = {}
         for rank, (chunk, score) in enumerate(fts_hits, 1):
-            fts_ranked.append((chunk.chunk_id, score))
-            lexical_trace[chunk.chunk_id] = {"rank": rank, "score": float(score)}
+            raw_score = float(score)
+            fts_ranked.append((chunk.chunk_id, raw_score))
+            lexical_trace[chunk.chunk_id] = {"rank": rank, "raw_score": raw_score}
 
-        # A deterministic hash vector is useful for tests but should not receive
-        # equal authority with real lexical matches in development. With a real
-        # embedding backend, preserve the calibrated 50/50 hybrid default.
-        if is_hash_fallback:
-            fused = rrf_fuse(
+        fusion_policy: Dict[str, Any]
+        fusion_method: str
+        if retrieval_mode == "vector":
+            ranked = list(qdrant_ranked)
+            fusion_method = "vector-only"
+            fusion_policy = {
+                "vector_weight": 1.0,
+                "lexical_weight": 0.0,
+                "reason": "ablation-vector-only",
+            }
+        elif retrieval_mode == "lexical":
+            ranked = list(fts_ranked)
+            fusion_method = "lexical-only"
+            fusion_policy = {
+                "vector_weight": 0.0,
+                "lexical_weight": 1.0,
+                "reason": "ablation-lexical-only",
+            }
+        else:
+            policy = adaptive_fusion_policy(
+                query,
+                qdrant_hits,
+                fts_hits,
+                hash_fallback=is_hash_fallback,
+            )
+            fusion_policy = policy.as_dict()
+            fusion_method = "adaptive-rrf"
+            ranked = rrf_fuse(
                 qdrant_ranked,
                 fts_ranked,
-                weight_primary=0.2,
-                weight_secondary=0.8,
+                weight_primary=policy.vector_weight,
+                weight_secondary=policy.lexical_weight,
             )
-        else:
-            fused = rrf_fuse(qdrant_ranked, fts_ranked)
-        rrf_scores = {chunk_id: float(score) for chunk_id, score in fused}
-        rerank_scores: Dict[str, float] = {}
 
-        if self._reranker and hasattr(self._reranker, "enabled") and self._reranker.enabled:
-            candidates = fused[:top_k * 2]
-            candidate_texts = []
+        pre_rerank_scores = {chunk_id: float(score) for chunk_id, score in ranked}
+        rerank_scores: Dict[str, float] = {}
+        reranker_enabled = bool(
+            self._reranker
+            and hasattr(self._reranker, "enabled")
+            and self._reranker.enabled
+        )
+
+        if reranker_enabled and ranked:
+            candidates = ranked[:pool_size]
+            candidate_texts: List[str] = []
             for cid, _ in candidates:
                 chunk = self._repo.get_chunk(cid)
                 if chunk:
                     candidate_texts.append(chunk.text)
                 else:
-                    candidate_texts.append(payload_map.get(cid, {}).get("text", ""))
+                    candidate_texts.append(str(payload_map.get(cid, {}).get("text", "")))
             try:
                 reranked = self._reranker.rerank(query, candidate_texts, top_k=top_k)
-                valid = []
+                valid: List[tuple[str, float]] = []
                 for idx, score in reranked:
                     if isinstance(idx, int) and 0 <= idx < len(candidates):
                         chunk_id = candidates[idx][0]
                         rerank_scores[chunk_id] = float(score)
-                        valid.append((chunk_id, score))
+                        valid.append((chunk_id, float(score)))
                 if valid:
-                    fused = valid
+                    ranked = valid
             except Exception:
-                logger.exception("Optional reranker failed; falling back to RRF ordering")
+                logger.exception("Optional reranker failed; falling back to pre-rerank ordering")
+
+        retrieval_context = {
+            "retrieval_mode": retrieval_mode,
+            "candidate_pool": pool_size,
+            "vector_candidates": len(qdrant_ranked),
+            "lexical_candidates": len(fts_ranked),
+            "fusion_method": fusion_method,
+            "fusion_policy": fusion_policy,
+            "reranker_enabled": reranker_enabled,
+            "reranker_candidate_count": min(len(pre_rerank_scores), pool_size) if reranker_enabled else 0,
+        }
 
         results: List[RetrievalChunk] = []
-        for final_rank, (chunk_id, fused_score) in enumerate(fused[:top_k], 1):
+        for final_rank, (chunk_id, final_score) in enumerate(ranked[:top_k], 1):
             trace = {
                 "final_rank": final_rank,
-                "final_score": float(fused_score),
-                "rrf_score": rrf_scores.get(chunk_id),
+                "final_score": float(final_score),
+                "pre_rerank_score": pre_rerank_scores.get(chunk_id),
                 "vector": vector_trace.get(chunk_id),
                 "lexical": lexical_trace.get(chunk_id),
                 "rerank_score": rerank_scores.get(chunk_id),
                 "embedding_model": embedder.model_name,
-                "fusion_mode": "lexical-first-development" if is_hash_fallback else "balanced-hybrid",
+                "context": retrieval_context,
             }
             chunk = self._repo.get_chunk(chunk_id)
             if not chunk:
@@ -162,12 +229,13 @@ class Retriever:
                         chunk_id=logical_id,
                         doc_id=payload.get("doc_id", "unknown"),
                         text=payload.get("text", ""),
-                        score=fused_score,
+                        score=float(final_score),
                         citations=[payload.get("citation", logical_id)],
                         metadata=metadata,
                     )
                 )
                 continue
+
             citations = [build_citation(chunk)]
             metadata = dict(chunk.metadata)
             metadata.update(
@@ -188,7 +256,7 @@ class Retriever:
                     chunk_id=chunk.chunk_id,
                     doc_id=chunk.doc_id,
                     text=chunk.text,
-                    score=fused_score,
+                    score=float(final_score),
                     citations=citations,
                     metadata=metadata,
                 )
