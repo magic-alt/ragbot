@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from cli.job_wait import format_job_knowledge, job_chunk_stats, wait_for_job
 
 
@@ -52,3 +54,37 @@ def test_wait_for_job_prints_total_written_and_reused(capsys) -> None:
     assert result is completed
     output = capsys.readouterr().out
     assert "completed (docs=1, chunks=42, written=0, reused=42)" in output
+
+
+def test_wait_for_job_failure_includes_durable_source_snapshot() -> None:
+    failed = {
+        "job_id": "job-path",
+        "status": "failed",
+        "doc_count": 0,
+        "chunk_count": 0,
+        "attempts": 1,
+        "source_type": "pdf",
+        "source_config": {"path": "ragbot-data:///manual.pdf"},
+        "error": "Local source is outside RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS",
+        "failure_class": "configuration_error",
+        "stats": {},
+    }
+
+    def request_fn(*args, **kwargs):
+        return failed
+
+    with pytest.raises(RuntimeError) as exc_info:
+        wait_for_job(
+            request_fn,
+            "http://127.0.0.1:8000",
+            "job-path",
+            headers={},
+            timeout=1,
+            poll_interval=0.1,
+            quiet=True,
+        )
+
+    message = str(exc_info.value)
+    assert "job_id=job-path" in message
+    assert "attempts=1" in message
+    assert '"path": "ragbot-data:///manual.pdf"' in message
