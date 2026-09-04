@@ -120,14 +120,22 @@ class Retriever:
             raw_score = float(score)
             qdrant_ranked.append((logical_id, raw_score))
             payload_map[logical_id] = payload
-            vector_trace[logical_id] = {"rank": rank, "raw_score": raw_score}
+            vector_trace[logical_id] = {
+                "rank": rank,
+                "score": raw_score,
+                "raw_score": raw_score,
+            }
 
         fts_ranked: List[tuple[str, float]] = []
         lexical_trace: Dict[str, Dict[str, Any]] = {}
         for rank, (chunk, score) in enumerate(fts_hits, 1):
             raw_score = float(score)
             fts_ranked.append((chunk.chunk_id, raw_score))
-            lexical_trace[chunk.chunk_id] = {"rank": rank, "raw_score": raw_score}
+            lexical_trace[chunk.chunk_id] = {
+                "rank": rank,
+                "score": raw_score,
+                "raw_score": raw_score,
+            }
 
         fusion_policy: Dict[str, Any]
         fusion_method: str
@@ -206,14 +214,17 @@ class Retriever:
 
         results: List[RetrievalChunk] = []
         for final_rank, (chunk_id, final_score) in enumerate(ranked[:top_k], 1):
+            pre_score = pre_rerank_scores.get(chunk_id)
             trace = {
                 "final_rank": final_rank,
                 "final_score": float(final_score),
-                "pre_rerank_score": pre_rerank_scores.get(chunk_id),
+                "pre_rerank_score": pre_score,
+                "rrf_score": pre_score if retrieval_mode == "hybrid" else None,
                 "vector": vector_trace.get(chunk_id),
                 "lexical": lexical_trace.get(chunk_id),
                 "rerank_score": rerank_scores.get(chunk_id),
                 "embedding_model": embedder.model_name,
+                "fusion_mode": fusion_method,
                 "context": retrieval_context,
             }
             chunk = self._repo.get_chunk(chunk_id)
