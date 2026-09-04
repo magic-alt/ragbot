@@ -30,6 +30,7 @@ class SearchRequest(BaseModel):
     top_k: int = Field(default=20, ge=1, le=100)
     mode: Literal["vector", "lexical", "hybrid"] = "hybrid"
     candidate_pool: Optional[int] = Field(default=None, ge=1, le=200)
+    rerank: bool = True
     explain: bool = False
     filters: Optional[SearchFilters] = None
 
@@ -119,6 +120,7 @@ def create_search_endpoint(get_services, verify_api_key):
             top_k=payload.top_k,
             mode=payload.mode,
             candidate_pool=payload.candidate_pool,
+            rerank=payload.rerank,
         )
         chunk_results = [
             ChunkResult(
@@ -134,6 +136,7 @@ def create_search_endpoint(get_services, verify_api_key):
         diagnostics: Dict[str, Any] = {
             "retrieval_mode": payload.mode,
             "requested_candidate_pool": payload.candidate_pool,
+            "reranker_requested": payload.rerank,
             "explain": payload.explain,
         }
         diagnostics.update(_retrieval_context(chunks))
