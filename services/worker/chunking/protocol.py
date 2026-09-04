@@ -22,7 +22,7 @@ class ChunkingSpec:
             raise ValueError("chunk_size must be >= 1")
         if self.chunk_overlap < 0:
             raise ValueError("chunk_overlap must be >= 0")
-        if self.chunk_overlap >= self.chunk_size:
+        if self.strategy != "structural" and self.chunk_overlap >= self.chunk_size:
             raise ValueError("chunk_overlap must be smaller than chunk_size")
         if self.version < 1:
             raise ValueError("chunker version must be >= 1")
