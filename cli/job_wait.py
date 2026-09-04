@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Callable, Dict, Optional
 
@@ -32,6 +33,24 @@ def format_job_knowledge(job: Dict[str, Any]) -> str:
     )
 
 
+def _failure_context(job: Dict[str, Any]) -> str:
+    source_config = job.get("source_config") if isinstance(job.get("source_config"), dict) else {}
+    stats = job.get("stats") if isinstance(job.get("stats"), dict) else {}
+    execution = stats.get("execution") if isinstance(stats.get("execution"), dict) else None
+    parts = [
+        f"job_id={job.get('job_id')}",
+        f"status={job.get('status')}",
+        f"attempts={int(job.get('attempts', 0) or 0)}",
+        f"source_type={job.get('source_type')!r}",
+        f"source_config={json.dumps(source_config, ensure_ascii=False, sort_keys=True)}",
+    ]
+    if execution:
+        parts.append(
+            "execution=" + json.dumps(execution, ensure_ascii=False, sort_keys=True)
+        )
+    return "; ".join(parts)
+
+
 def wait_for_job(
     request_fn: Callable[..., Dict[str, Any]],
     server: str,
@@ -57,9 +76,8 @@ def wait_for_job(
         if status in TERMINAL_FAILURE:
             failure_class = str(job.get("failure_class") or "").strip()
             prefix = f"[{failure_class}] " if failure_class else ""
-            raise RuntimeError(
-                prefix + str(job.get("error") or f"Ingestion job {status}: {job_id}")
-            )
+            error = str(job.get("error") or f"Ingestion job {status}: {job_id}")
+            raise RuntimeError(f"{prefix}{error} | {_failure_context(job)}")
         if time.monotonic() >= deadline:
             raise TimeoutError(f"Timed out waiting for ingestion job {job_id} after {timeout:.0f}s")
         time.sleep(max(0.1, poll_interval))

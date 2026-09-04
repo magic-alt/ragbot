@@ -69,9 +69,6 @@ services:
       dockerfile: infra/docker/Dockerfile
     image: ragbot:local
     command: ["python", "-m", "services.worker.main"]
-    # Arbitrary cloud/SaaS credentials are loaded only into the worker. Keep
-    # real values in an ignored local file and point RAGBOT_WORKER_ENV_FILE at
-    # it. The default points back to the repository's checked-in example file.
     env_file:
       - ${RAGBOT_WORKER_ENV_FILE:-../../.env.worker.example}
     environment:
@@ -143,8 +140,6 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-ragbot}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ragbot}
       POSTGRES_DB: ${POSTGRES_DB:-ragbot}
-    ports:
-      - "127.0.0.1:${RAGBOT_POSTGRES_PORT:-0}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
