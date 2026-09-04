@@ -8,6 +8,44 @@ from typing import Dict, Iterable, Optional, Tuple
 from fastapi import HTTPException
 
 
+# Tenant-scoped product capabilities. Global operational endpoints remain behind
+# admin=true and are intentionally not granted by any tenant role.
+CAP_KNOWLEDGE_QUERY = "knowledge.query"
+CAP_CATALOG_READ = "catalog.read"
+CAP_FEEDBACK_WRITE = "feedback.write"
+CAP_SOURCE_CREATE = "source.create"
+CAP_SOURCE_UPDATE = "source.update"
+CAP_SOURCE_SYNC = "source.sync"
+CAP_SOURCE_DELETE = "source.delete"
+CAP_INGEST_RUN = "ingestion.run"
+CAP_INGEST_RETRY = "ingestion.retry"
+
+READER_CAPABILITIES = frozenset(
+    {
+        CAP_KNOWLEDGE_QUERY,
+        CAP_CATALOG_READ,
+        CAP_FEEDBACK_WRITE,
+    }
+)
+OPERATOR_CAPABILITIES = READER_CAPABILITIES | frozenset(
+    {
+        CAP_SOURCE_CREATE,
+        CAP_SOURCE_UPDATE,
+        CAP_SOURCE_SYNC,
+        CAP_INGEST_RUN,
+        CAP_INGEST_RETRY,
+    }
+)
+OWNER_CAPABILITIES = OPERATOR_CAPABILITIES | frozenset({CAP_SOURCE_DELETE})
+
+ROLE_CAPABILITIES = {
+    "reader": READER_CAPABILITIES,
+    "operator": OPERATOR_CAPABILITIES,
+    "owner": OWNER_CAPABILITIES,
+}
+ALL_TENANT_CAPABILITIES = frozenset().union(*ROLE_CAPABILITIES.values())
+
+
 @dataclass(frozen=True)
 class ApiPrincipal:
     """Trusted identity and tenant scope associated with one API key."""
@@ -15,6 +53,8 @@ class ApiPrincipal:
     tenant_ids: frozenset[str]
     user_id: Optional[str] = None
     groups: Tuple[str, ...] = ()
+    # roles may contain application/ACL roles in addition to the platform RBAC
+    # roles reader/operator/owner. Only recognized RBAC roles grant capabilities.
     roles: Tuple[str, ...] = ()
     admin: bool = False
 
@@ -97,26 +137,56 @@ def allowed_tenants(api_key: Optional[str]) -> Optional[frozenset[str]]:
     return principal.tenant_ids
 
 
-def require_role(api_key: Optional[str], *allowed_roles: str) -> Optional[ApiPrincipal]:
-    """Require one tenant-scoped capability role when principals are enabled.
+def capabilities_for_principal(principal: Optional[ApiPrincipal]) -> frozenset[str]:
+    """Return the effective tenant capability set for one principal.
 
-    ``admin=true`` bypasses tenant role checks. Development mode without
-    principal mappings remains backward compatible. ``owner`` is treated as a
-    tenant-level superset of operator capabilities.
+    Development mode (no principal mapping) preserves historical unrestricted
+    behavior. admin=true is global and therefore also receives every tenant
+    capability. Custom ACL roles never implicitly grant platform capabilities.
+    """
+    if principal is None or principal.admin:
+        return ALL_TENANT_CAPABILITIES
+    capabilities: set[str] = set()
+    for role in principal.roles:
+        capabilities.update(ROLE_CAPABILITIES.get(role.strip().lower(), ()))
+    return frozenset(capabilities)
+
+
+def require_capability(api_key: Optional[str], capability: str) -> Optional[ApiPrincipal]:
+    """Require a named tenant capability when scoped principals are enabled."""
+    if capability not in ALL_TENANT_CAPABILITIES:
+        raise ValueError(f"Unknown Ragbot capability: {capability}")
+    principal = get_api_principal(api_key)
+    if capability in capabilities_for_principal(principal):
+        return principal
+    raise HTTPException(status_code=403, detail=f"API principal requires capability: {capability}")
+
+
+def require_role(api_key: Optional[str], *allowed_roles: str) -> Optional[ApiPrincipal]:
+    """Compatibility helper for callers that still reason in role names.
+
+    New API authorization should use require_capability(). Role inheritance is
+    resolved through ROLE_CAPABILITIES rather than special-casing owner.
     """
     principal = get_api_principal(api_key)
     if principal is None or principal.admin:
         return principal
     wanted = {role.strip().lower() for role in allowed_roles if role.strip()}
     actual = {role.strip().lower() for role in principal.roles}
-    if "owner" in actual or actual.intersection(wanted):
+    if actual.intersection(wanted):
+        return principal
+    # Preserve historical hierarchy for downstream imports of this helper.
+    if "owner" in actual and wanted.intersection({"reader", "operator", "owner"}):
+        return principal
+    if "operator" in actual and "reader" in wanted:
         return principal
     expected = ", ".join(sorted(wanted)) or "required role"
     raise HTTPException(status_code=403, detail=f"API principal requires one of roles: {expected}")
 
 
 def require_operator(api_key: Optional[str]) -> Optional[ApiPrincipal]:
-    return require_role(api_key, "operator")
+    """Backward-compatible alias for the operator ingestion capability."""
+    return require_capability(api_key, CAP_INGEST_RUN)
 
 
 def require_admin(api_key: Optional[str]) -> None:
@@ -135,8 +205,14 @@ def validate_principal_coverage(api_keys: Iterable[str]) -> None:
             f"missing {len(missing)} key(s)"
         )
     for api_key in api_keys:
-        if not principals[api_key].user_id:
+        principal = principals[api_key]
+        if not principal.user_id:
             raise ValueError("Production API principals require a stable user_id for ACL evaluation")
+        if not principal.admin and not capabilities_for_principal(principal):
+            raise ValueError(
+                "Production tenant principals require at least one platform RBAC role: "
+                "reader, operator, or owner"
+            )
 
 
 def _string_set(value: object, *, field: str, api_key: str) -> set[str]:
