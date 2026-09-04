@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from .embedder import Embedder, HashEmbedder
@@ -16,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 
 def build_citation(chunk: Chunk) -> str:
+    location = chunk.path or chunk.url
+    if location and chunk.page is not None:
+        return f"{chunk.doc_id}:{location}:page={chunk.page}:chunk={chunk.chunk_index}"
     if chunk.path:
         return f"{chunk.doc_id}:{chunk.path}:{chunk.chunk_index}"
     if chunk.url:
@@ -35,7 +39,6 @@ class Retriever:
         query: Optional[str] = None,
         retrieval_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Return non-secret runtime metadata useful for retrieval debugging."""
         embedder = self._embedder or HashEmbedder(dim=self._qdrant.dim)
         semantic = not isinstance(embedder, HashEmbedder)
         reranker_configured = bool(
@@ -67,8 +70,6 @@ class Retriever:
             "repository": type(self._repo).__name__,
             "reranker": type(self._reranker).__name__ if self._reranker is not None else None,
             "reranker_configured": reranker_configured,
-            # Backward-compatible runtime field. Retrieval context can override
-            # this with whether reranking was actually applied for one request.
             "reranker_enabled": reranker_configured,
             "fusion_mode": fusion_mode,
             "warnings": warnings,
@@ -87,36 +88,38 @@ class Retriever:
         candidate_pool: Optional[int] = None,
         rerank: bool = True,
     ) -> List[RetrievalChunk]:
-        """Retrieve evidence using vector, lexical, or adaptive-hybrid ranking.
-
-        ``mode`` is intentionally exposed for ablation and evaluation. Normal
-        Agent traffic keeps the default ``hybrid`` path. ``candidate_pool`` is
-        the recall budget before optional cross-encoder reranking; it is not the
-        final result count. ``rerank=False`` isolates first-stage retrieval and
-        fusion so benchmark comparisons are not confounded by a cross-encoder.
-        """
+        """Retrieve evidence using vector, lexical, or adaptive-hybrid ranking."""
         retrieval_mode = validate_retrieval_mode(mode)
         pool_size = resolve_candidate_pool(top_k, candidate_pool)
         embedder = self._embedder or HashEmbedder(dim=self._qdrant.dim)
         is_hash_fallback = isinstance(embedder, HashEmbedder)
         cjk_query = contains_cjk(query)
 
-        qdrant_hits = []
-        if retrieval_mode in {"vector", "hybrid"}:
-            # HashEmbedder tokenizes only ASCII identifiers. A CJK query becomes
-            # an invalid semantic representation, so do not surface arbitrary
-            # Qdrant ties in development mode.
-            if not (is_hash_fallback and cjk_query):
-                embed_query = getattr(embedder, "embed_query", None)
-                query_vector = embed_query(query) if callable(embed_query) else embedder.embed(query)
-                qdrant_hits = self._qdrant.search(query_vector, filters, pool_size)
+        def vector_search():
+            if is_hash_fallback and cjk_query:
+                return []
+            embed_query = getattr(embedder, "embed_query", None)
+            query_vector = embed_query(query) if callable(embed_query) else embedder.embed(query)
+            return self._qdrant.search(query_vector, filters, pool_size)
 
-        fts_hits = []
-        if retrieval_mode in {"lexical", "hybrid"}:
-            fts_hits = fts_search(self._repo, query, filters, pool_size)
+        def lexical_search():
+            return fts_search(self._repo, query, filters, pool_size)
 
-        # Qdrant point IDs are storage UUIDs; ranking/fusion operates on Ragbot's
-        # logical chunk IDs so vector and lexical hits for the same chunk fuse.
+        if retrieval_mode == "hybrid":
+            # Embedding+Qdrant and PostgreSQL lexical retrieval are independent
+            # I/O branches. Fan them out concurrently, then fuse after both join.
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ragbot-retrieval") as executor:
+                vector_future = executor.submit(vector_search)
+                lexical_future = executor.submit(lexical_search)
+                qdrant_hits = vector_future.result()
+                fts_hits = lexical_future.result()
+        elif retrieval_mode == "vector":
+            qdrant_hits = vector_search()
+            fts_hits = []
+        else:
+            qdrant_hits = []
+            fts_hits = lexical_search()
+
         qdrant_ranked: List[tuple[str, float]] = []
         payload_map: Dict[str, Dict[str, Any]] = {}
         vector_trace: Dict[str, Dict[str, Any]] = {}
@@ -133,9 +136,11 @@ class Retriever:
 
         fts_ranked: List[tuple[str, float]] = []
         lexical_trace: Dict[str, Dict[str, Any]] = {}
+        lexical_chunk_map: Dict[str, Chunk] = {}
         for rank, (chunk, score) in enumerate(fts_hits, 1):
             raw_score = float(score)
             fts_ranked.append((chunk.chunk_id, raw_score))
+            lexical_chunk_map[chunk.chunk_id] = chunk
             lexical_trace[chunk.chunk_id] = {
                 "rank": rank,
                 "score": raw_score,
@@ -187,13 +192,14 @@ class Retriever:
 
         if reranker_enabled and ranked:
             candidates = ranked[:pool_size]
-            candidate_texts: List[str] = []
-            for cid, _ in candidates:
-                chunk = self._repo.get_chunk(cid)
-                if chunk:
-                    candidate_texts.append(chunk.text)
-                else:
-                    candidate_texts.append(str(payload_map.get(cid, {}).get("text", "")))
+            # Candidate text already arrived from PostgreSQL FTS or Qdrant
+            # payloads. Reuse it instead of issuing one get_chunk query per hit.
+            candidate_texts = [
+                lexical_chunk_map[cid].text
+                if cid in lexical_chunk_map
+                else str(payload_map.get(cid, {}).get("text", ""))
+                for cid, _score in candidates
+            ]
             try:
                 reranked = self._reranker.rerank(query, candidate_texts, top_k=top_k)
                 valid: List[tuple[str, float]] = []
@@ -210,6 +216,7 @@ class Retriever:
         retrieval_context = {
             "retrieval_mode": retrieval_mode,
             "candidate_pool": pool_size,
+            "parallel_fanout": retrieval_mode == "hybrid",
             "vector_candidates": len(qdrant_ranked),
             "lexical_candidates": len(fts_ranked),
             "fusion_method": fusion_method,
@@ -235,8 +242,8 @@ class Retriever:
                 "fusion_mode": fusion_method,
                 "context": retrieval_context,
             }
-            chunk = self._repo.get_chunk(chunk_id)
-            if not chunk:
+            chunk = lexical_chunk_map.get(chunk_id)
+            if chunk is None:
                 payload = payload_map.get(chunk_id, {})
                 if not payload:
                     continue
@@ -249,7 +256,7 @@ class Retriever:
                         doc_id=payload.get("doc_id", "unknown"),
                         text=payload.get("text", ""),
                         score=float(final_score),
-                        citations=[payload.get("citation", logical_id)],
+                        citations=[_payload_citation(payload, logical_id)],
                         metadata=metadata,
                     )
                 )
@@ -281,3 +288,15 @@ class Retriever:
                 )
             )
         return results
+
+
+def _payload_citation(payload: Dict[str, Any], logical_id: str) -> str:
+    doc_id = str(payload.get("doc_id") or "unknown")
+    location = payload.get("path") or payload.get("url")
+    page = payload.get("page")
+    chunk_index = payload.get("chunk_index")
+    if location and page is not None:
+        return f"{doc_id}:{location}:page={page}:chunk={chunk_index}"
+    if location:
+        return f"{doc_id}:{location}:{chunk_index}"
+    return logical_id
