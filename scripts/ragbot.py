@@ -4,21 +4,6 @@
 The implementation lives in ``ragbot_impl.py``. This thin wrapper normalizes
 unquoted ``ingest`` paths containing spaces and adds smart local-directory
 routing before delegating to the original controller.
-
-Examples::
-
-    python scripts/ragbot.py ingest "data/My Manual.pdf" --type pdf
-    python scripts/ragbot.py ingest data/My Manual.pdf --type pdf
-    python scripts/ragbot.py ingest data --tenant engineering --tag corpus
-
-For a local directory with no explicit ``--type`` the wrapper inspects the
-corpus. Text-like files keep using ``local_fs`` while PDFs are routed through
-``scripts/ingest_pdfs.py``. A PDF-only directory therefore no longer produces a
-misleading completed job with zero documents.
-
-Quoting paths is still recommended for shell portability, but it is no longer
-required for ordinary paths whose space-separated tokens appear before the
-first ingest option.
 """
 from __future__ import annotations
 
@@ -26,7 +11,9 @@ import importlib.util
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
+
+from cli.job_wait import wait_for_job
 
 _IMPL_PATH = Path(__file__).with_name("ragbot_impl.py")
 _PDF_INGEST_PATH = Path(__file__).with_name("ingest_pdfs.py")
@@ -36,18 +23,10 @@ if _SPEC is None or _SPEC.loader is None:  # pragma: no cover - installation cor
 _impl = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_impl)
 
-# Preserve the historical module surface for tests and callers that import
-# helpers directly from scripts/ragbot.py.
 for _name in dir(_impl):
     if not _name.startswith("__"):
         globals().setdefault(_name, getattr(_impl, _name))
 
-# The compatibility module intentionally exposes the implementation's path and
-# runtime constants. Tests and downstream callers historically monkeypatch
-# these names on scripts/ragbot.py. Since function objects imported from
-# ragbot_impl.py retain ragbot_impl.py as their globals namespace, copy the
-# current wrapper values back before delegated calls so monkeypatching keeps the
-# same semantics it had before the implementation split.
 _SYNCED_GLOBALS = (
     "ROOT",
     "VENV",
@@ -64,16 +43,8 @@ _SYNCED_GLOBALS = (
 
 _TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".rst", ".csv", ".log"}
 _EXCLUDED_DIRS = {
-    ".git",
-    "node_modules",
-    "__pycache__",
-    ".mypy_cache",
-    ".venv",
-    "venv",
-    "dist",
-    "build",
-    ".tox",
-    ".eggs",
+    ".git", "node_modules", "__pycache__", ".mypy_cache", ".venv", "venv",
+    "dist", "build", ".tox", ".eggs",
 }
 
 
@@ -81,6 +52,29 @@ def _sync_impl_state() -> None:
     for name in _SYNCED_GLOBALS:
         if name in globals():
             setattr(_impl, name, globals()[name])
+
+
+def _wait_for_job(
+    server: str,
+    job_id: str,
+    *,
+    headers: Dict[str, str],
+    timeout: float,
+    poll_interval: float,
+    quiet: bool = False,
+) -> Dict[str, Any]:
+    return wait_for_job(
+        _impl._api_request,
+        server,
+        job_id,
+        headers=headers,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        quiet=quiet,
+    )
+
+
+_impl._wait_for_job = _wait_for_job
 
 
 def _base_env():
@@ -114,21 +108,17 @@ def _local_location(location: str) -> str:
 
 
 def _normalize_ingest_argv(argv: Sequence[str]) -> List[str]:
-    """Join split ingest-location tokens while leaving all options untouched."""
     tokens = list(argv)
     try:
         ingest_index = tokens.index("ingest")
     except ValueError:
         return tokens
-
     start = ingest_index + 1
     if start >= len(tokens):
         return tokens
-
     end = start
     while end < len(tokens) and not tokens[end].startswith("--"):
         end += 1
-
     if end - start > 1:
         tokens[start:end] = [" ".join(tokens[start:end])]
     return tokens
@@ -163,7 +153,6 @@ def _option_values(tokens: Sequence[str], name: str) -> List[str]:
 
 
 def _resolved_directory(location: str) -> Optional[Path]:
-    """Return a resolved local directory, or ``None`` for files/remote inputs."""
     if _impl._is_remote_location(location):
         return None
     path = Path(location)
@@ -177,7 +166,6 @@ def _resolved_directory(location: str) -> Optional[Path]:
 
 
 def _directory_inventory(directory: Path) -> tuple[int, int]:
-    """Count PDF and local_fs-compatible files without reading file contents."""
     pdfs = 0
     text_files = 0
     for path in directory.rglob("*"):
@@ -185,7 +173,7 @@ def _directory_inventory(directory: Path) -> tuple[int, int]:
             continue
         try:
             relative_parts = path.relative_to(directory).parts[:-1]
-        except ValueError:  # pragma: no cover - defensive for unusual symlinks
+        except ValueError:  # pragma: no cover
             relative_parts = path.parts[:-1]
         if any(part in _EXCLUDED_DIRS for part in relative_parts):
             continue
@@ -198,7 +186,6 @@ def _directory_inventory(directory: Path) -> tuple[int, int]:
 
 
 def _pdf_directory_command(tokens: Sequence[str], directory: Path) -> List[str]:
-    """Translate common ``ragbot.py ingest`` options to ``ingest_pdfs.py``."""
     command = [sys.executable, str(_PDF_INGEST_PATH), str(directory)]
     for option in ("--tenant", "--user", "--server", "--api-key", "--chunk-size", "--chunk-overlap"):
         value = _option_value(tokens, option)
@@ -212,13 +199,6 @@ def _pdf_directory_command(tokens: Sequence[str], directory: Path) -> List[str]:
 
 
 def _smart_directory_ingest(tokens: Sequence[str]) -> Optional[int]:
-    """Ingest mixed local corpora without silently skipping PDFs.
-
-    Returns ``None`` when normal controller handling should continue. When a
-    directory contains PDFs and no explicit ``--type`` was supplied, text-like
-    files are handled by the existing local_fs path and PDFs are delegated to
-    the recursive PDF corpus helper.
-    """
     if "ingest" not in tokens or _has_option(tokens, "--type"):
         return None
     ingest_index = list(tokens).index("ingest")
