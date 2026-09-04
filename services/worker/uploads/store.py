@@ -4,7 +4,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from .uri import upload_object_id
 
@@ -105,5 +105,9 @@ def build_upload_store_from_env() -> UploadStore:
         )
     root = os.getenv("RAGBOT_UPLOAD_DIR", "").strip()
     if not root:
-        raise ValueError("Server-managed uploads require RAGBOT_UPLOAD_DIR")
+        environment = os.getenv("RAGBOT_ENV", "development").strip().lower()
+        if environment in {"production", "prod"}:
+            raise ValueError("Production server-managed uploads require RAGBOT_UPLOAD_DIR")
+        data_root = Path(os.getenv("RAGBOT_DATA_DIR", "data")).expanduser().resolve()
+        root = str(data_root.parent / "tmp" / "ragbot-uploads")
     return FilesystemUploadStore(root)
