@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 from .generation_activation import activate_inmemory_generation, activate_postgres_generation
 from .generation_repo import InMemoryGenerationMixin, PostgresGenerationMixin
@@ -26,6 +27,48 @@ _IN_MEMORY_HELPERS = (
     "_ensure_generation_state",
     "_enqueue_memory_cleanup",
 )
+
+
+def _mark_prepared_postgres(
+    repo: Any,
+    generation_id: str,
+    stats: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Prepare a generation without dropping its durable lifecycle snapshot."""
+    with repo._pool.connection() as conn:
+        result = conn.execute(
+            """
+            UPDATE knowledge_generations
+            SET status = 'prepared',
+                prepared_at = NOW(),
+                stats = COALESCE(stats, '{}'::jsonb) || %(stats)s
+            WHERE generation_id = %(generation_id)s
+              AND status IN ('staging', 'prepared')
+            """,
+            {
+                "generation_id": generation_id,
+                "stats": repo._jsonb(stats or {}),
+            },
+        )
+        if not (result.rowcount or 0):
+            raise ValueError(f"Generation is not stageable/preparable: {generation_id}")
+
+
+def _mark_prepared_inmemory(
+    repo: Any,
+    generation_id: str,
+    stats: Optional[Dict[str, Any]] = None,
+) -> None:
+    with repo._lock:
+        repo._ensure_generation_state()
+        generation = repo._knowledge_generations.get(generation_id)
+        if generation is None or generation.status not in {"staging", "prepared"}:
+            raise ValueError(f"Generation is not preparable: {generation_id}")
+        merged = dict(generation.stats or {})
+        merged.update(stats or {})
+        generation.stats = merged
+        generation.status = "prepared"
+        generation.prepared_at = datetime.now(timezone.utc).isoformat()
 
 
 def _retry_publication_outbox_postgres(
@@ -86,10 +129,12 @@ def ensure_generation_repository(repo: Any) -> Any:
         backend = PostgresGenerationMixin
         helpers = _POSTGRES_HELPERS
         fenced_activation = activate_postgres_generation
+        prepared = _mark_prepared_postgres
     elif hasattr(repo, "_lock") and hasattr(repo, "_documents") and hasattr(repo, "_chunks"):
         backend = InMemoryGenerationMixin
         helpers = _IN_MEMORY_HELPERS
         fenced_activation = activate_inmemory_generation
+        prepared = _mark_prepared_inmemory
     else:
         return repo
 
@@ -103,7 +148,9 @@ def ensure_generation_repository(repo: Any) -> Any:
         setattr(repo, "_row_to_publication_event", getattr(backend, "_row_to_publication_event"))
 
     for name in _GENERATION_METHODS:
-        if name == "activate_knowledge_generation":
+        if name == "mark_knowledge_generation_prepared":
+            method = prepared
+        elif name == "activate_knowledge_generation":
             method = fenced_activation
         elif is_postgres and name == "retry_publication_outbox":
             method = _retry_publication_outbox_postgres
