@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from ..chunking import split_text
-from ..connectors.pdf import fetch_pdf_pages
+from ..connectors.pdf import fetch_pdf_bytes
+from ..parsing import iter_document_segments, parse_document
 from services.api.app.storage.models import Chunk
 from services.worker.dedup.hashing import content_hash
 
@@ -27,11 +28,12 @@ def ingest_pdf(
     tags: Optional[list] = None,
     acl_hash: Optional[str] = None,
     chunking: Optional[dict] = None,
+    parsing: Optional[dict] = None,
 ) -> Iterable[Chunk]:
-    """Extract page-aware PDF chunks through Ragbot's document-transform port."""
+    """Fetch a PDF resource, normalize it through Parser Port, then chunk blocks."""
     logger.info("Ingesting PDF: %s (doc_id=%s)", path, doc_id)
     try:
-        pages = fetch_pdf_pages(path)
+        body = fetch_pdf_bytes(path)
     except ValueError as exc:
         if "Local source is outside RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS" not in str(exc):
             raise
@@ -42,40 +44,45 @@ def ingest_pdf(
             "PDF local path rejected: "
             f"requested={requested!r}, resolved={resolved!r}, allowed_roots={allowed!r}; {exc}"
         ) from exc
-    if not pages:
+
+    document, parser_metadata = parse_document(
+        body,
+        parsing,
+        name=Path(path).name or "document.pdf",
+        media_type="application/pdf",
+        uri=path,
+    )
+    if not document.blocks:
         logger.warning("No text extracted from PDF: %s", path)
         return
 
     chunk_index = 0
-    for page_number, page_text in pages:
-        segments, chunker_metadata = split_text(
-            page_text,
-            chunking,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
+    for segment in iter_document_segments(
+        document,
+        chunking,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    ):
+        yield Chunk(
+            chunk_id=uuid.uuid4().hex,
+            doc_id=doc_id,
+            tenant_id=tenant_id,
+            chunk_index=chunk_index,
+            text=segment.text,
+            path=path,
+            page=segment.page,
+            section=segment.section,
+            checksum=content_hash(segment.text),
+            metadata={
+                "source_type": "pdf",
+                "version": version,
+                "tags": tags or [],
+                "acl_hash": acl_hash or "public",
+                **parser_metadata,
+                **segment.metadata,
+            },
         )
-        for segment in segments:
-            chunk = Chunk(
-                chunk_id=uuid.uuid4().hex,
-                doc_id=doc_id,
-                tenant_id=tenant_id,
-                chunk_index=chunk_index,
-                text=segment,
-                path=path,
-                page=page_number,
-                checksum=content_hash(segment),
-                metadata={
-                    "source_type": "pdf",
-                    "version": version,
-                    "tags": tags or [],
-                    "acl_hash": acl_hash or "public",
-                    "parser_provider": "pypdf2",
-                    "parser_version": 1,
-                    **chunker_metadata,
-                },
-            )
-            chunk_index += 1
-            yield chunk
+        chunk_index += 1
     logger.info("PDF ingestion complete: %s -> %d chunks", path, chunk_index)
 
 
