@@ -1,292 +1,257 @@
 # Ragbot System Design
 
-## 1. Purpose and boundaries
+## 1. Purpose and production boundary
 
-Ragbot is an agent-facing, multi-tenant knowledge service. It turns PDF, web, Git, local filesystem and cloud/SaaS Sources into tenant-scoped retrievable evidence, combines semantic and lexical retrieval, and optionally invokes explicitly enabled Agent tools before synthesizing cited answers.
+Ragbot is an agent-facing, multi-tenant knowledge service. It ingests PDF, Web, Git, local filesystem and cloud/SaaS Sources, produces tenant-scoped evidence, combines semantic and lexical retrieval, and synthesizes cited answers.
 
-The production topology is intentionally split into an API/query plane and a durable ingestion worker plane. PostgreSQL is authoritative for Sources, Jobs, schedules, documents/chunks, ACL policies and lexical retrieval. Qdrant stores semantic vectors. Workers own ingestion execution through a PostgreSQL-backed lease/retry/DLQ contract.
+Production is split into:
 
-Ragbot does not use LangChain, LangGraph or LlamaIndex for orchestration; the Agent graph, retrieval fusion, connector lifecycle and durability contracts are implemented directly in this repository.
+- **API/query plane** — FastAPI, trusted principal/RBAC, Agent, retrieval, control plane and metrics endpoints;
+- **durable ingestion worker plane** — PostgreSQL-backed Job claim/lease/heartbeat/retry/DLQ and Source scheduling;
+- **PostgreSQL** — authoritative Sources, Jobs, schedules, documents/chunks, ACL and lexical state;
+- **Qdrant** — semantic vector index;
+- **Prometheus / OpenTelemetry** — replica-aggregatable production telemetry.
+
+InMemoryRepo, InMemoryQdrant, HashEmbedder and inline ingestion are development/test fallbacks and are rejected by production composition.
 
 ## 2. Runtime architecture
 
 ```mermaid
 flowchart LR
-  C[CLI / Admin UI / SDK / Applications] -->|REST / SSE / OpenAI-shaped API| API[FastAPI API]
+  C[CLI / Admin UI / SDK / Apps] -->|REST / SSE / OpenAI-shaped API| API[FastAPI]
 
-  API --> AUTH[Principal / tenant / groups / roles]
+  API --> AUTH[Principal + RBAC capability + ACL scope]
   AUTH --> AG[Agent graph]
-  AG --> RET[Hybrid retriever]
-  AG -. explicit capability .-> SQL[Isolated SQL tool]
-  AG --> CODE[Code tools]
-  AG --> WEB[Web tool]
+  AG --> RET[Hybrid Retriever]
+  AG -. explicitly enabled .-> SQL[Isolated SQL Tool]
+  AG --> CODE[Code Tool]
+  AG --> WEB[Web Tool]
 
-  RET --> EMB[Embedder]
   RET --> Q[(Qdrant)]
-  RET --> FTS[PostgreSQL FTS + CJK bigrams]
+  RET --> FTS[PostgreSQL FTS + CJK]
   FTS --> PG[(PostgreSQL)]
 
-  API --> CP[Source / Job / schedule control plane]
+  API --> CP[Source / Job / Schedule Control Plane]
   CP --> PG
 
-  W[Durable ingestion workers] -->|claim / lease / heartbeat| PG
+  W[Ingestion Workers] -->|claim / lease / heartbeat| PG
   W --> CONN[PDF / Web / Git / FS / S3 / Drive / Notion / Confluence]
-  W --> EMB
   W --> PG
   W --> Q
 
-  P[Prometheus] -->|scrape admin-protected /metrics| API
-  API --> OTEL[OpenTelemetry / OTLP]
+  PROM[Prometheus] -->|GET /metrics| API
+  API -->|optional OTLP metrics + traces| OTEL[OpenTelemetry Collector]
 ```
 
-### API/query plane
-
-`services/api/app/api.py` owns HTTP lifecycle, auth dependencies, `/chat`, `/search`, OpenAI-shaped chat completions, health/readiness, Prometheus export and router registration. `factory.py` is the composition root and decides between development fallbacks and durable external services.
-
-Production refuses InMemory metadata/vector storage, HashEmbedder and inline ingestion. API keys are mapped to trusted principals with tenant IDs, user ID, groups, roles and optional global-admin capability.
-
-### Agent layer
-
-`services/api/app/agent/graph.py` owns the loop:
+The Agent loop remains repository-native:
 
 ```text
-route → tool action → synthesize → verify → optional next action → finalize
+route → tool/retrieve → synthesize → verify → optional next action → finalize
 ```
 
-Event callbacks are transport-neutral and always close in `finally` so SSE consumers cannot hang when a tool/provider fails.
+## 3. Authorization model
 
-Tool availability and data authorization are separate concerns. In particular, SQL is a privileged data-plane capability and is fail-closed by default; a query merely looking like SQL must never grant access to Ragbot's internal PostgreSQL database.
+Authentication establishes a trusted API-key principal containing tenant scope, stable user identity, groups, roles and optional `admin=true`.
 
-### Retrieval layer
+Platform authorization is capability-based, with role inheritance:
 
-`Retriever` executes hybrid retrieval:
+| Capability | reader | operator | owner | global admin |
+|---|:---:|:---:|:---:|:---:|
+| `knowledge.query` | ✓ | ✓ | ✓ | ✓ |
+| `catalog.read` | ✓ | ✓ | ✓ | ✓ |
+| `feedback.write` | ✓ | ✓ | ✓ | ✓ |
+| `source.create` |  | ✓ | ✓ | ✓ |
+| `source.update` |  | ✓ | ✓ | ✓ |
+| `source.sync` |  | ✓ | ✓ | ✓ |
+| `ingestion.run` |  | ✓ | ✓ | ✓ |
+| `ingestion.retry` |  | ✓ | ✓ | ✓ |
+| `source.delete` |  |  | ✓ | ✓ |
+| global admin/reconcile/metrics |  |  |  | ✓ |
+
+Important separation:
+
+- `owner` is a tenant-level destructive superset of `operator`;
+- `admin=true` is a global operational identity and is not implied by owner;
+- arbitrary role strings may still participate in document ACL policy matching, but only `reader/operator/owner` grant platform capabilities;
+- production non-admin principals must have at least one recognized platform RBAC role.
+
+Tenant and user claims from requests cannot expand the trusted principal. Retrieval ACL scope is computed before evidence reaches synthesis.
+
+## 4. Retrieval architecture
 
 ```text
 query
-  ├─ semantic embedding → Qdrant vector candidates
-  └─ lexicalization     → PostgreSQL FTS candidates
-                ↓
-               RRF
-                ↓
-         optional reranker
-                ↓
-              top-k
+  ├─ embed → Qdrant semantic candidates
+  └─ lexicalize → PostgreSQL FTS/CJK candidates
+                       ↓
+                      RRF
+                       ↓
+                optional reranker
+                       ↓
+                     top-k
 ```
 
-Production lexical retrieval runs server-side through PostgreSQL GIN-backed FTS. CJK-heavy queries use Ragbot's bigram lexicalization path rather than relying only on whitespace tokenization. Tenant, ACL hash, source type, document, tag, path/URL prefix and time filters are applied before evidence reaches synthesis.
+Filters include tenant, ACL hash, Source type, document, tags, path/URL prefix and time range.
 
-## 3. Durable ingestion and queue ownership
+### Cache policy
 
-The API persists ingestion Jobs. Dedicated workers atomically claim executable Jobs from PostgreSQL, maintain leases with heartbeat, and apply bounded retry/backoff. Expired leases are reconciled; exhausted or permanent failures become `dead_lettered`.
+Ragbot intentionally has **no supported runtime RetrievalCache** today. The old cache feature flags/admin surface were removed because the process-local cache was never connected to retrieval and could not be safely invalidated across API replicas and ingestion workers.
+
+`services/api/app/cache/` retains small local cache primitives only for tests/experiments. They are not part of the runtime contract. A future production cache must be shared/distributed or otherwise generation-aware and must invalidate on Source/index generation changes before being placed on the retrieval path.
+
+## 5. Durable ingestion and queue ownership
+
+The API persists ingestion Jobs; dedicated workers atomically claim executable Jobs from PostgreSQL using the repository lease contract. Workers heartbeat leases, retry transient failures with bounded backoff, reclaim expired leases and dead-letter permanent/exhausted work.
 
 ```mermaid
 stateDiagram-v2
   [*] --> pending
   pending --> running: atomic claim
-  running --> completed: successful publish
-  running --> pending: retryable failure + backoff
+  running --> completed: success
+  running --> pending: retryable failure
   running --> dead_lettered: permanent/exhausted failure
   running --> pending: expired lease + attempts remain
   running --> dead_lettered: expired lease + attempts exhausted
-  failed --> pending: reconciliation / retryable
-  failed --> dead_lettered: permanent/exhausted
 ```
 
-The CLI treats `completed`, `failed` and `dead_lettered` as terminal states. A DLQ Job therefore fails `rag ingest --wait` immediately instead of being polled until timeout.
+There is exactly one queue architecture: repository/PostgreSQL durable Jobs. The unused legacy `services/worker/queue.py` abstraction has been removed.
+
+The CLI treats `completed`, `failed` and `dead_lettered` as terminal states; DLQ failures therefore return immediately rather than timing out.
 
 ### Scheduled sync
 
-Every worker may scan due Sources. Scheduled Job IDs are deterministic over Source ID plus schedule window; the repository uses atomic insert-if-absent. Multiple workers can therefore race without enqueueing duplicate work for one schedule window.
+Workers scan due Sources. Schedule-window Job IDs are deterministic and insertion is atomic, preventing duplicate scheduling when several workers race.
 
-### SaaS incremental refresh
+### Incremental SaaS refresh
 
-Drive, Notion and Confluence use metadata-first refresh. Remote metadata is compared against the previous indexed snapshot; unchanged documents reuse existing chunks/vectors and skip body download and embedding. Changed/new documents continue through the normal replacement-oriented ingestion path.
+Drive/Notion/Confluence compare remote metadata/version against the prior indexed snapshot. Unchanged content reuses existing chunks/vectors; changed/new content is fetched and embedded; remote deletions are pruned after successful replacement. This is metadata-first synchronization, not yet provider change-feed/cursor ingestion.
 
-## 4. Source generation fencing
+## 6. Source generation fencing
 
-Source mutations and deletion need to invalidate older queued/running work. Ragbot uses a durable lifecycle token derived from Source timestamps and stores the token in each Job's `stats.source_generation` at submission time.
-
-Worker behavior:
+Each submitted Job freezes the current Source lifecycle generation in `stats.source_generation`. The worker and pipeline revalidate that generation before execution, before publish-sensitive writes and before completion.
 
 ```text
-Job.source_generation
-        │
-        ▼
-compare current Source generation
-        ├─ mismatch before execution → dead_lettered
-        └─ match
-             ↓
-        connector/fetch
-             ↓
-        fence check before write
-             ↓
-        PG/Qdrant publish + stale cleanup
-             ↓
-        fence check before completion
+Job generation
+    ↓
+validate current Source
+    ├─ stale → permanent failure / DLQ
+    └─ current
+         ↓
+      connector
+         ↓
+      fence before write
+         ↓
+      PG + Qdrant publish/cleanup
+         ↓
+      final fence
 ```
 
-Source deletion is **tombstone-first**:
+Deletion is tombstone-first:
 
 ```text
-mark Source deleted + advance updated_at generation
+Source status=deleted + new updated_at generation
         ↓
-fences old queued/running Jobs
+fence queued/running old Jobs
         ↓
-purge PostgreSQL/Qdrant knowledge
+purge PG/Qdrant knowledge
 ```
 
-If an in-flight pipeline observes a fence failure after work has started, the failure is permanent rather than retryable. For deleted Sources, the pipeline also attempts a cleanup purge before returning failure.
+This prevents purge-then-writeback races. It is not a distributed PG/Qdrant transaction. Strict zero-partial-generation visibility would require staged generations plus an atomic active-generation pointer/outbox/reconciler.
 
-This fencing prevents the common "purge, then old worker writes the Source back" race. It is still not a distributed transaction or atomic generation cutover across PostgreSQL and Qdrant. A future version that requires strict zero-partial-view semantics should stage a complete generation and atomically activate it, with an outbox/reconciler for vector side effects.
+## 7. Storage responsibilities
 
-## 5. Ingestion data flow
+### PostgreSQL control plane
 
-```mermaid
-sequenceDiagram
-  participant API
-  participant PG as PostgreSQL
-  participant W as Worker
-  participant C as Connector
-  participant E as Embedder
-  participant Q as Qdrant
+`POSTGRES_DSN` is internal Ragbot durable state: Sources, schedules, ingestion Jobs/leases/DLQ, documents/chunks, ACL and lexical retrieval metadata.
 
-  API->>PG: persist Job + immutable Source config + source_generation
-  W->>PG: claim Job / lease
-  W->>PG: validate current Source generation
-  W->>PG: read previous source documents/chunks
-  W->>C: metadata/fetch/chunk
-  W->>W: normalize + dedup + reuse unchanged chunks
-  W->>PG: revalidate Source generation
-  W->>E: embed changed/new chunks
-  W->>PG: upsert documents/chunks
-  W->>Q: upsert changed/new vectors
-  W->>Q: delete stale points/doc vectors
-  W->>PG: delete stale chunks/documents
-  W->>PG: final Source-generation check
-  W->>PG: complete Job
-```
+### Optional Agent SQL
 
-### Replacement semantics
-
-Re-ingestion is Source reconciliation, not repository-wide checksum deduplication. Identical text in two documents or tenants remains independent evidence. Unchanged chunks preserve chunk/point IDs and are not re-embedded when content and retrieval metadata are unchanged. New/changed chunks are written before stale content is deleted to preserve a retryable last-good view where possible.
-
-PostgreSQL and Qdrant do not participate in a distributed transaction. Backup/restore likewise requires both stores, and strict point-in-time consistency requires quiescing ingestion or coordinated infrastructure snapshots.
-
-## 6. Storage responsibilities
-
-### PostgreSQL control-plane database
-
-`POSTGRES_DSN` is reserved for Ragbot internal durable state:
-
-- Sources and sync schedules;
-- ingestion Jobs, leases, retry/DLQ state;
-- Documents and Chunks;
-- ACL policies;
-- PostgreSQL lexical/FTS state;
-- related control-plane metadata.
-
-This database is **not** the Agent SQL query surface.
-
-### Optional Agent SQL database
-
-SQL is disabled by default:
-
-```dotenv
-RAGBOT_SQL_TOOL_ENABLED=false
-```
-
-Production enablement requires:
-
-```dotenv
-RAGBOT_SQL_TOOL_ENABLED=true
-RAGBOT_SQL_DSN=postgresql://read_only_user:***@analytics-db/analytics
-RAGBOT_SQL_ALLOWED_SCHEMAS=rag_views,analytics
-```
-
-Production startup rejects a SQL DSN identical to `POSTGRES_DSN`. `PostgresSqlEngine` additionally enforces single read-only SELECT statements, transaction read-only mode, timeout and row limits. Those application checks are defense-in-depth only; the real security boundary must be the database identity itself: dedicated read-only role, least-privilege views/schema grants and, for multi-tenant business data, RLS or tenant-safe views.
+Agent SQL is fail-closed and uses a distinct `RAGBOT_SQL_DSN`. Production rejects reuse of `POSTGRES_DSN` and requires an explicit schema allowlist. Application read-only checks are defense-in-depth; deployments should use a dedicated read-only DB identity, least-privilege views/grants and RLS or tenant-safe views where business SQL is multi-tenant.
 
 ### Qdrant
 
-Qdrant stores semantic vector points and retrieval payload metadata. The configured vector dimension must match the embedder dimension. Ragbot fails fast on dimension mismatches rather than querying an incompatible index.
-
-### In-memory implementations
-
-InMemoryRepo, InMemoryQdrant and HashEmbedder are development/test conveniences. They are process-local and are rejected by production composition.
-
-## 7. Security invariants
-
-1. API credentials resolve to a trusted principal before tenant/user claims are used.
-2. RAG retrieval always carries tenant scope and ACL scope into vector/lexical filtering before synthesis.
-3. Source connector secrets are references to deployment secrets; cloud tokens/passwords are not stored inline in Source config.
-4. Local filesystem/Git/PDF reads are constrained by configured roots in production.
-5. Remote web/source fetching rejects credential-bearing URLs and private/loopback/link-local destinations by default; redirects are revalidated.
-6. Agent SQL is disabled by default and must never reuse the Ragbot control-plane database in production.
-7. Source mutations fence older Jobs; deletion tombstones before purging knowledge.
-8. Changing embedding model/dimension requires a compatible collection/reindex operation.
-
-RBAC currently maps most read surfaces to tenant-scoped authenticated principals, mutations to `operator`/`owner`, and cross-tenant/global operations to `admin`. `owner` is presently an operator superset rather than a broad independent tenant-administration subsystem.
+Qdrant owns semantic vector points/payloads. Embedder dimension and collection dimension are a single compatibility contract.
 
 ## 8. OpenAI-shaped compatibility
 
-`POST /v1/chat/completions` preserves:
+`POST /v1/chat/completions` preserves system messages, prior user/assistant history, last user turn as current retrieval query, `temperature`, `max_tokens`, non-stream responses and SSE transport.
 
-- system messages;
-- prior user/assistant turns as conversation context;
-- the last non-empty user turn as the current retrieval query;
-- `temperature`;
-- `max_tokens`;
-- non-stream and SSE transport.
+Conversation history informs intent but is not treated as factual evidence. Current token usage is estimated and SSE sends chunks after the Agent final answer exists rather than provider-native token streaming.
 
-Conversation context helps resolve intent/references but is not treated as evidence; factual synthesis still requires retrieved/tool evidence and citations.
-
-Current limitations:
-
-- usage token counts are estimated rather than tokenizer/provider authoritative;
-- streaming sends chunks after the Agent final answer exists rather than exposing provider-native token-by-token generation;
-- the endpoint does not claim complete OpenAI API field/tool-call equivalence.
-
-## 9. Observability
-
-### Health/readiness
-
-`/admin/health` is liveness only. `/admin/ready` checks configured repository and vector-store readiness and returns 503 when dependencies are unavailable.
+## 9. Production observability
 
 ### Prometheus
 
-`GET /metrics` exposes Prometheus exposition format and requires a global-admin API principal. Metrics include:
+`GET /metrics` is global-admin protected. Production Agent telemetry is emitted when events occur, not reconstructed from a process-local rolling history:
 
-- HTTP requests and latency histogram;
-- ingestion Job counts by state;
-- oldest pending Job age;
-- stale running leases;
-- Source counts/state;
-- process-local Agent citation coverage, retrieval hit rate, tool failure ratio and latency gauges.
+- `ragbot_agent_requests_total{route,confidence,cited}`;
+- `ragbot_agent_request_duration_seconds{route}`;
+- `ragbot_agent_retrieval_duration_seconds{route}`;
+- `ragbot_agent_tool_calls_total{tool,status}`;
+- `ragbot_agent_tool_duration_seconds{tool}`;
+- `ragbot_agent_feedback_total{feedback}`;
+- HTTP counters/latency;
+- queue-state/oldest-pending/stale-lease gauges;
+- Source-state gauges.
 
-HTTP counters/histograms are naturally per process and Prometheus aggregates across replicas. Some Agent quality gauges currently derive from Ragbot's bounded in-process request history; production dashboards should interpret them as per-replica rolling diagnostics unless/until event-level metrics are exported directly.
+Prometheus naturally aggregates counters/histograms across API replicas. Queue/Source gauges are refreshed from shared durable repository state at scrape time.
 
-### Tracing
+### OpenTelemetry
 
-OpenTelemetry tracing can export Agent stage/tool spans over OTLP. Request IDs are propagated through application logs and responses.
+Tracing remains available through `RAGBOT_TRACING_ENABLED`. Optional OTLP metrics use:
 
-## 10. Deployment and recovery
+```dotenv
+RAGBOT_OTEL_METRICS_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+```
 
-Docker Compose provides the local durable topology. Helm provides API/worker Deployments, readiness/liveness, rolling updates, optional API HPA and optional KEDA worker scaling. KEDA scales workers from PostgreSQL queue depth, including ready pending Jobs and expired running leases.
+Agent request/tool/latency/feedback metrics are emitted through the OTel SDK's periodic exporter.
 
-Production Helm refuses unsafe process-local storage and requires the durable worker path. PostgreSQL migrations run through the explicit migration runner rather than relying only on first-boot container initialization.
+### Process-local diagnostics
 
-Disaster recovery covers both PostgreSQL and Qdrant: PostgreSQL custom-format dump plus Qdrant collection snapshot, SHA-256 manifest, destructive restore and post-restore validation. The backup is not a distributed transaction; strict consistency requires ingestion quiescence or coordinated infrastructure snapshots.
+`MetricsCollector` still keeps bounded recent request history for admin request inspection and feedback correlation. `/admin/metrics` and `/admin/metrics/history` explicitly identify themselves as process-local diagnostics. They are not the production metrics backend and must not be aggregated as authoritative cluster statistics.
 
-## 11. API and contract strategy
+## 10. CLI ownership
 
-FastAPI/Pydantic is the source of truth for HTTP OpenAPI. Use `/openapi.json`, `/docs` or `scripts/export_openapi.py`. Shared Agent/tool domain types remain under `contracts/`, and the Node client is typechecked in CI.
+There is one product CLI implementation:
 
-## 12. Remaining architecture work
+```text
+cli/rag.py
+  ├─ rag ...
+  └─ python -m cli.rag ...
+```
 
-The highest-value remaining hardening after the current production-safety boundary is:
+`scripts/ragbot.py` is a separate bootstrap/deployment controller for setup/up/down/restart/status/logs and local/Docker path mapping. Product operations (`ask/search/ingest/import/doctor`) are delegated to `cli.rag`.
 
-1. **Atomic source-version activation/outbox** — stage complete generations and switch an active pointer only after PG/Qdrant side effects are ready.
-2. **Broader tool capability policy** — extend explicit per-principal/per-tenant capability controls to code/web tools, not only SQL's fail-closed composition.
-3. **Database-native SQL tenancy policy** — standardize RLS/tenant-safe views for deployments that expose multi-tenant business SQL data.
-4. **Native streaming/token accounting** — surface provider streaming and authoritative usage where supported.
-5. **Distributed quality telemetry** — export event-level retrieval/citation/tool metrics rather than relying partly on process-local rolling history.
-6. **Generated SDK contracts** — once the public API is stable, generate clients from runtime OpenAPI rather than maintaining duplicated DTOs manually.
+The old indirection/duplication files `cli/rag_impl.py` and `scripts/ragbot_impl.py` have been removed. Shared ingestion terminal-state logic remains in `cli/job_wait.py`.
+
+## 11. Security invariants
+
+1. Trusted principal resolution precedes tenant/user use.
+2. Platform RBAC capability checks are separate from document ACL role matching.
+3. Tenant/ACL filtering happens before synthesis.
+4. Cloud connector secrets are deployment secret references, not inline Source config.
+5. Local reads stay within configured roots; remote targets are SSRF/redirect constrained.
+6. Agent SQL is disabled by default and cannot reuse the control-plane DB in production.
+7. Source mutation/deletion fences old Jobs.
+8. Embedding model/dimension changes require compatible reindex/cutover.
+9. Destructive Source deletion requires owner/global-admin capability.
+10. Production metrics are Prometheus/OTLP event metrics; bounded in-memory history is diagnostics only.
+
+## 12. Deployment and recovery
+
+Docker Compose provides a local durable topology. Helm provides API/worker Deployments, probes, rolling update configuration, optional API HPA and optional KEDA worker scaling from PostgreSQL queue depth.
+
+PostgreSQL migrations run through the explicit migration runner. Disaster recovery covers PostgreSQL plus Qdrant snapshots and validation. Since PG/Qdrant are not one distributed transaction, strict point-in-time recovery requires quiesced ingestion or coordinated infrastructure snapshots.
+
+## 13. Remaining architecture work
+
+After this P2 convergence, the highest-value remaining work is:
+
+1. atomic staged generation activation/outbox across PostgreSQL + Qdrant;
+2. explicit per-principal capability policy for code/web Agent tools, matching SQL's fail-closed model;
+3. DB-native tenancy standard for optional business SQL;
+4. provider-native streaming and authoritative token usage;
+5. durable/distributed feedback persistence instead of request-history affinity;
+6. a generation-aware distributed retrieval cache only if measurements justify it;
+7. generated SDKs from stable runtime OpenAPI.
