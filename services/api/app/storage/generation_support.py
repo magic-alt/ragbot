@@ -17,6 +17,14 @@ _GENERATION_METHODS = (
     "retry_publication_outbox",
     "reconcile_publication_outbox",
 )
+_POSTGRES_HELPERS = (
+    "_generation_source_id",
+    "_enqueue_cleanup_events",
+)
+_IN_MEMORY_HELPERS = (
+    "_ensure_generation_state",
+    "_enqueue_memory_cleanup",
+)
 
 
 def _retry_publication_outbox_postgres(
@@ -72,14 +80,24 @@ def ensure_generation_repository(repo: Any) -> Any:
     if callable(getattr(repo, "begin_knowledge_generation", None)):
         return repo
 
-    backend = None
     is_postgres = hasattr(repo, "_pool")
     if is_postgres:
         backend = PostgresGenerationMixin
+        helpers = _POSTGRES_HELPERS
     elif hasattr(repo, "_lock") and hasattr(repo, "_documents") and hasattr(repo, "_chunks"):
         backend = InMemoryGenerationMixin
-    if backend is None:
+        helpers = _IN_MEMORY_HELPERS
+    else:
         return repo
+
+    for name in helpers:
+        method = getattr(backend, name)
+        setattr(repo, name, method.__get__(repo, type(repo)))
+
+    if is_postgres:
+        # Static row mapper must remain an unbound callable when installed as an
+        # instance attribute; otherwise Python would inject repo as a first arg.
+        setattr(repo, "_row_to_publication_event", getattr(backend, "_row_to_publication_event"))
 
     for name in _GENERATION_METHODS:
         if is_postgres and name == "retry_publication_outbox":
