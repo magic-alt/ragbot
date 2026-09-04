@@ -21,6 +21,7 @@ from services.worker.jobs.embed_and_upsert import embed_and_upsert
 from services.worker.source_fence import (
     SourceFenceError,
     assert_source_fence,
+    job_source_generation,
     job_stats_for_source,
     source_generation,
 )
@@ -43,18 +44,32 @@ def run_ingest_pipeline(
     """Execute one replacement-oriented ingestion run for ``source``.
 
     The Source lifecycle token is checked before and after publish-sensitive
-    phases. A tombstone/config mutation therefore fences a stale queued/running
-    Job instead of allowing it to silently complete against a newer Source.
+    phases. Existing durable Jobs use the generation captured at submission;
+    direct pipeline calls use the repository's persisted Source generation so
+    database-generated timestamps cannot create a false fence mismatch.
     """
     now = datetime.now(timezone.utc).isoformat()
     job_id = job_id or uuid.uuid4().hex
-    expected_generation = expected_source_generation or source_generation(source)
+
+    persisted_source = repo.get_source(source.source_id)
+    current_job = repo.get_job(job_id) if existing_job else None
+    expected_generation = expected_source_generation
+    if expected_generation is None and current_job is not None:
+        expected_generation = job_source_generation(current_job)
+    if expected_generation is None:
+        expected_generation = source_generation(persisted_source or source)
+
     if existing_job:
-        current = repo.get_job(job_id)
-        if current is None:
+        if current_job is None:
             raise ValueError(f"Existing ingestion job not found: {job_id}")
-        repo.update_job(job_id, status="running", started_at=current.started_at or now, error=None)
+        repo.update_job(
+            job_id,
+            status="running",
+            started_at=current_job.started_at or now,
+            error=None,
+        )
     else:
+        generation_source = persisted_source or source
         job = IngestionJob(
             job_id=job_id,
             tenant_id=source.tenant_id,
@@ -64,7 +79,7 @@ def run_ingest_pipeline(
             status="running",
             started_at=now,
             created_at=now,
-            stats=job_stats_for_source(source),
+            stats=job_stats_for_source(generation_source),
         )
         repo.add_job(job)
 
@@ -114,7 +129,8 @@ def run_ingest_pipeline(
         assert_source_fence(source, repo, expected_generation)
 
         doc_ids = [doc.doc_id for doc in documents]
-        stats = dict((repo.get_job(job_id).stats if repo.get_job(job_id) else {}) or {})
+        latest_job = repo.get_job(job_id)
+        stats = dict((latest_job.stats if latest_job else {}) or {})
         stats.update({
             "doc_ids": doc_ids,
             "source_generation": expected_generation,
