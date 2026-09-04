@@ -1,0 +1,74 @@
+name: Parser Port Benchmark
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "benchmarks/parser_compare.py"
+      - "services/worker/parsing/**"
+      - "services/worker/jobs/ingest_pdf.py"
+      - "services/worker/jobs/ingest_web.py"
+      - "services/worker/jobs/ingest_text.py"
+      - "services/worker/jobs/ingest_s3.py"
+      - "services/worker/jobs/ingest_google_drive.py"
+      - "services/worker/connectors/pdf.py"
+      - "services/worker/connectors/web.py"
+      - "services/worker/connectors/local_fs.py"
+      - "services/worker/pipeline.py"
+      - "services/api/app/routes/sources.py"
+      - "tests/test_document_transformations.py"
+      - "tests/test_parser_compare_benchmark.py"
+      - "docs/PARSER_PORT.md"
+      - "pyproject.toml"
+      - ".github/workflows/parser-benchmark.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parser-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pdf-parser-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install parser benchmark dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,worker,parser-pymupdf]"
+
+      - name: Run parser and block-model regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_document_transformations.py \
+            tests/test_parser_compare_benchmark.py
+
+      - name: Run controlled PDF parser smoke benchmark
+        run: |
+          python -m benchmarks.parser_compare \
+            --backends pypdf2,pymupdf \
+            --synthetic-documents 12 \
+            --synthetic-queries 8 \
+            --chunk-size 400 \
+            --chunk-overlap 40 \
+            --output parser-benchmark.json
+
+      - name: Upload parser benchmark result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-benchmark
+          path: parser-benchmark.json
+          if-no-files-found: warn

@@ -22,7 +22,7 @@ def list_files(
     extensions: Optional[Set[str]] = None,
     max_files: int = 10000,
 ) -> List[str]:
-    """List allowed text files without escaping configured source roots."""
+    """List allowed source files without escaping configured source roots."""
     exts = extensions or DEFAULT_EXTENSIONS
     root = Path(validate_local_source_path(directory))
     if not root.is_dir():
@@ -36,8 +36,6 @@ def list_files(
             continue
         if file_path.suffix.lower() not in exts:
             continue
-        # Resolve every file separately so a symlink cannot escape an allowed
-        # directory when production roots are configured.
         safe_path = validate_local_source_path(str(file_path))
         result.append(safe_path)
         if len(result) >= max_files:
@@ -46,8 +44,8 @@ def list_files(
     return result
 
 
-def read_file(path: str, max_size: int = 10 * 1024 * 1024) -> str:
-    """Read at most ``max_size`` bytes from an allowed local text file."""
+def read_file_bytes(path: str, max_size: int = 10 * 1024 * 1024) -> bytes:
+    """Read bounded bytes from an allowed local resource for the parser layer."""
     file_path = Path(validate_local_source_path(path))
     if not file_path.is_file():
         raise FileNotFoundError(f"File not found: {path}")
@@ -56,5 +54,9 @@ def read_file(path: str, max_size: int = 10 * 1024 * 1024) -> str:
     if size > max_size:
         logger.warning("File too large (%d bytes), reading first %d bytes", size, max_size)
     with file_path.open("rb") as handle:
-        raw = handle.read(max_size)
-    return raw.decode("utf-8", errors="replace")
+        return handle.read(max_size)
+
+
+def read_file(path: str, max_size: int = 10 * 1024 * 1024) -> str:
+    """Backward-compatible UTF-8 text helper."""
+    return read_file_bytes(path, max_size=max_size).decode("utf-8", errors="replace")

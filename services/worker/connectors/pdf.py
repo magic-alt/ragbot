@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import logging
 import os
 import tempfile
@@ -16,13 +17,8 @@ _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _DEFAULT_MAX_PDF_BYTES = 25 * 1024 * 1024
 
 
-def fetch_pdf_pages(path: str) -> List[tuple[int, str]]:
-    """Read an allowed local/remote PDF while preserving 1-based page identity."""
-    try:
-        from PyPDF2 import PdfReader
-    except ImportError as exc:
-        raise RuntimeError("PyPDF2 is required for PDF ingestion") from exc
-
+def fetch_pdf_bytes(path: str) -> bytes:
+    """Read bounded local/remote PDF bytes; parsing belongs to worker/parsing."""
     temporary = False
     if path.startswith(("http://", "https://")):
         path = _download_to_temp(path, suffix=".pdf")
@@ -33,20 +29,36 @@ def fetch_pdf_pages(path: str) -> List[tuple[int, str]]:
     if not os.path.isfile(path):
         raise FileNotFoundError(f"PDF not found: {path}")
 
+    max_bytes = int(os.getenv("RAGBOT_PDF_MAX_BYTES", str(_DEFAULT_MAX_PDF_BYTES)))
     try:
-        reader = PdfReader(path)
-        pages: List[tuple[int, str]] = []
-        for page_number, page in enumerate(reader.pages, 1):
-            text = page.extract_text()
-            if text and text.strip():
-                pages.append((page_number, text.strip()))
-        return pages
+        if os.path.getsize(path) > max_bytes:
+            raise ValueError(f"PDF source exceeds {max_bytes} byte limit")
+        with open(path, "rb") as handle:
+            body = handle.read(max_bytes + 1)
+        if len(body) > max_bytes:
+            raise ValueError(f"PDF source exceeds {max_bytes} byte limit")
+        return body
     finally:
         if temporary:
             try:
                 os.unlink(path)
             except OSError:
                 logger.warning("Unable to remove temporary PDF: %s", path)
+
+
+def fetch_pdf_pages(path: str) -> List[tuple[int, str]]:
+    """Backward-compatible page helper implemented on top of raw PDF bytes."""
+    try:
+        from PyPDF2 import PdfReader
+    except ImportError as exc:
+        raise RuntimeError("PyPDF2 is required for PDF ingestion") from exc
+
+    pages: List[tuple[int, str]] = []
+    for page_number, page in enumerate(PdfReader(io.BytesIO(fetch_pdf_bytes(path))).pages, 1):
+        text = page.extract_text()
+        if text and text.strip():
+            pages.append((page_number, text.strip()))
+    return pages
 
 
 def fetch_pdf(path: str) -> str:

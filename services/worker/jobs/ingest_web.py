@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import uuid
+from pathlib import PurePosixPath
 from typing import Iterable, Optional
+from urllib.parse import urlparse
 
-from ..chunking import split_text
-from ..connectors.web import fetch_web
+from ..connectors.web import fetch_web_resource
+from ..parsing import iter_document_segments, parse_document
 from services.api.app.storage.models import Chunk
 from services.worker.dedup.hashing import content_hash
 
@@ -25,35 +27,59 @@ def ingest_web(
     tags: Optional[list] = None,
     acl_hash: Optional[str] = None,
     chunking: Optional[dict] = None,
+    parsing: Optional[dict] = None,
 ) -> Iterable[Chunk]:
-    """Fetch a web page and chunk it through the configured transformation adapter."""
+    """Fetch raw web content, normalize blocks, then apply the configured Chunker."""
     logger.info("Ingesting web page: %s (doc_id=%s)", url, doc_id)
-    text = fetch_web(url)
-    if not text or text == url:
+    resource = fetch_web_resource(url)
+    parser_config = _with_encoding(parsing, resource.encoding)
+    parsed_path = PurePosixPath(urlparse(resource.url).path)
+    name = parsed_path.name or ("index.html" if "html" in resource.content_type else "resource.txt")
+    document, parser_metadata = parse_document(
+        resource.body,
+        parser_config,
+        name=name,
+        media_type=resource.content_type,
+        uri=resource.url,
+    )
+    if not document.blocks:
         logger.warning("No text extracted from URL: %s", url)
         return
 
-    segments, chunker_metadata = split_text(
-        text,
+    count = 0
+    for segment in iter_document_segments(
+        document,
         chunking,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-    )
-    for idx, segment in enumerate(segments):
+    ):
         yield Chunk(
             chunk_id=uuid.uuid4().hex,
             doc_id=doc_id,
             tenant_id=tenant_id,
-            chunk_index=idx,
-            text=segment,
-            url=url,
-            checksum=content_hash(segment),
+            chunk_index=count,
+            text=segment.text,
+            url=resource.url,
+            page=segment.page,
+            section=segment.section,
+            checksum=content_hash(segment.text),
             metadata={
                 "source_type": "web",
                 "version": version,
                 "tags": tags or [],
                 "acl_hash": acl_hash or "public",
-                **chunker_metadata,
+                "content_type": resource.content_type,
+                **parser_metadata,
+                **segment.metadata,
             },
         )
-    logger.info("Web ingestion complete: %s -> %d chunks", url, len(segments))
+        count += 1
+    logger.info("Web ingestion complete: %s -> %d chunks", url, count)
+
+
+def _with_encoding(parsing: Optional[dict], encoding: str) -> dict:
+    config = dict(parsing or {})
+    options = dict(config.get("options") or {})
+    options.setdefault("encoding", encoding or "utf-8")
+    config["options"] = options
+    return config
