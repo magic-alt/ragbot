@@ -17,7 +17,7 @@ from ..agent.callbacks import AsyncQueueCallback
 from ..agent.graph import run_agent
 from ..agent.state import Constraints
 from ..auth.acl import compute_security_scope
-from ..auth.principal import authorize_identity
+from ..auth.principal import CAP_KNOWLEDGE_QUERY, authorize_identity, require_capability
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["openai-compat"])
@@ -46,8 +46,8 @@ def _prepare_messages(messages: List[Message]) -> Tuple[str, List[Dict[str, str]
     """Keep the last user turn as retrieval query and preserve prior context."""
     query_index: Optional[int] = None
     for index in range(len(messages) - 1, -1, -1):
-        msg = messages[index]
-        if msg.role.strip().lower() == "user" and msg.content.strip():
+        message = messages[index]
+        if message.role.strip().lower() == "user" and message.content.strip():
             query_index = index
             break
     if query_index is None:
@@ -83,6 +83,7 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
         request: Request,
         _key: Optional[str] = Depends(verify_api_key),
     ):
+        require_capability(_key, CAP_KNOWLEDGE_QUERY)
         services = get_services()
         tenant_id = request.headers.get("X-Tenant-ID", "default").strip() or "default"
         requested_user_id = request.headers.get("X-User-ID", "anonymous").strip() or "anonymous"
@@ -134,7 +135,7 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
             generation_max_tokens=payload.max_tokens,
         )
         answer = state.final.answer if state.final else ""
-        citations = [asdict(c) for c in state.final.citations] if state.final else []
+        citations = [asdict(citation) for citation in state.final.citations] if state.final else []
         prompt_text = "\n".join(message.content for message in payload.messages)
         prompt_tokens = _estimate_tokens(prompt_text)
         completion_tokens = _estimate_tokens(answer)
@@ -172,7 +173,7 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
         temperature: float,
         max_tokens: Optional[int],
     ) -> AsyncIterator[str]:
-        cb = AsyncQueueCallback()
+        callback = AsyncQueueCallback()
 
         async def _run() -> None:
             await run_agent(
@@ -181,7 +182,7 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
                 user_id=user_id,
                 services=services,
                 request_id=request_id,
-                callback=cb,
+                callback=callback,
                 constraints=constraints,
                 conversation_messages=conversation,
                 system_prompt=system_prompt,
@@ -193,7 +194,7 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
         created = int(time.time())
         failed = False
         try:
-            async for event in cb:
+            async for event in callback:
                 if event.event_type == "error":
                     failed = True
                     error_data = {
@@ -205,7 +206,7 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
                     yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
                 elif event.event_type == "final":
                     answer = event.data.get("answer", "")
-                    for i in range(0, len(answer), 8):
+                    for index in range(0, len(answer), 8):
                         data = {
                             "id": f"chatcmpl-{request_id}",
                             "object": "chat.completion.chunk",
@@ -214,7 +215,7 @@ def create_openai_compat_endpoint(get_services, verify_api_key):
                             "choices": [
                                 {
                                     "index": 0,
-                                    "delta": {"content": answer[i:i + 8]},
+                                    "delta": {"content": answer[index:index + 8]},
                                     "finish_reason": None,
                                 }
                             ],
