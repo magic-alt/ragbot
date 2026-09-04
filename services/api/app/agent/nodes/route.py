@@ -50,6 +50,14 @@ async def route_node(state: AgentState, services: Any) -> AgentState:
     else:
         state.route = _keyword_route(query)
 
+    # SQL is a privileged capability, not an automatic consequence of a query
+    # looking tabular. Production composition defaults to DisabledSqlEngine;
+    # route such requests through tenant-scoped RAG unless an isolated SQL
+    # query surface was explicitly enabled.
+    if state.route == ROUTE_SQL and not getattr(getattr(services, "sql_engine", None), "enabled", True):
+        logger.info("SQL route requested while SQL tool is disabled; falling back to document RAG")
+        state.route = ROUTE_DOC_RAG
+
     _infer_constraints(state)
     state.plan = _build_plan(state.route)
     return state
