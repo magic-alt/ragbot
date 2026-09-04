@@ -25,7 +25,37 @@ MODEL_DIMENSIONS: Dict[str, int] = {
     "e5-small-v2": 384,
     "e5-base-v2": 768,
     "e5-large-v2": 1024,
+    "qwen3-embedding:0.6b": 1024,
+    "qwen3-embedding:4b": 2560,
+    "qwen3-embedding:8b": 4096,
+    "qwen/qwen3-embedding-0.6b": 1024,
+    "qwen/qwen3-embedding-4b": 2560,
+    "qwen/qwen3-embedding-8b": 4096,
 }
+
+_QWEN3_QUERY_TASK = (
+    "Given a user question, retrieve relevant passages from the knowledge base "
+    "that answer the question"
+)
+
+
+def model_dimension(model: str) -> Optional[int]:
+    """Return a known native embedding dimension without case sensitivity."""
+    normalized = str(model or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized == "qwen3-embedding":
+        # Ollama's unqualified library tag currently resolves to the 8B variant.
+        return 4096
+    return MODEL_DIMENSIONS.get(normalized)
+
+
+def default_query_instruction(model: str) -> str:
+    """Return a model-specific retrieval instruction when the model benefits from one."""
+    normalized = str(model or "").strip().lower()
+    if "qwen3-embedding" in normalized:
+        return _QWEN3_QUERY_TASK
+    return ""
 
 
 @runtime_checkable
@@ -65,12 +95,22 @@ class HashEmbedder:
         norm = math.sqrt(sum(v * v for v in vec)) or 1.0
         return [v / norm for v in vec]
 
+    def embed_query(self, text: str) -> List[float]:
+        return self.embed(text)
+
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
         return [self.embed(t) for t in texts]
 
 
 class APIEmbedder:
-    """OpenAI-compatible embedding client with strict vector dimensions."""
+    """OpenAI-compatible embedding client with strict vector dimensions.
+
+    Document embeddings remain unmodified. Query embeddings can receive a
+    retrieval-task instruction; Qwen3 Embedding gets its recommended query-side
+    ``Instruct: ... / Query: ...`` shape by default while other models remain
+    unchanged. Set ``EMBEDDING_QUERY_INSTRUCTION`` to override it, or to an
+    empty string to disable an explicit configured instruction.
+    """
 
     def __init__(
         self,
@@ -80,13 +120,19 @@ class APIEmbedder:
         dimension: Optional[int] = None,
         timeout: int = 30,
         batch_size: int = 100,
+        query_instruction: Optional[str] = None,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._model = model
-        self._dimension = dimension or MODEL_DIMENSIONS.get(model, 1536)
+        self._dimension = dimension or model_dimension(model) or 1536
         self._timeout = timeout
         self._batch_size = batch_size
+        self._query_instruction = (
+            default_query_instruction(model)
+            if query_instruction is None
+            else str(query_instruction).strip()
+        )
 
     @property
     def model_name(self) -> str:
@@ -96,10 +142,24 @@ class APIEmbedder:
     def dimension(self) -> int:
         return self._dimension
 
+    @property
+    def query_instruction(self) -> str:
+        return self._query_instruction
+
     def embed(self, text: str) -> List[float]:
         return self.embed_batch([text])[0]
 
+    def embed_query(self, text: str) -> List[float]:
+        value = text
+        if self._query_instruction:
+            value = f"Instruct: {self._query_instruction}\nQuery:{text}"
+        return self._embed_raw_batch([value])[0]
+
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """Embed knowledge documents without query instructions."""
+        return self._embed_raw_batch(texts)
+
+    def _embed_raw_batch(self, texts: List[str]) -> List[List[float]]:
         if not texts:
             return []
         all_vectors: List[List[float]] = []
@@ -110,10 +170,9 @@ class APIEmbedder:
 
     def _call_api(self, texts: List[str]) -> List[List[float]]:
         url = f"{self._base_url}/v1/embeddings"
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
         payload: Dict[str, Any] = {"model": self._model, "input": texts}
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=self._timeout)
@@ -147,33 +206,34 @@ class APIEmbedder:
 def build_embedder(dimension: Optional[int] = None) -> Embedder:
     """Build an Embedder from environment variables.
 
-    Development can fall back to ``HashEmbedder``. Production startup
-    validation rejects that fallback so a missing semantic model cannot produce
-    a syntactically healthy but semantically useless persistent index.
+    Local OpenAI-compatible endpoints such as Ollama do not require a fake API
+    key: setting ``EMBEDDING_MODEL`` + ``EMBEDDING_BASE_URL`` is sufficient.
+    Development can still fall back to ``HashEmbedder``; production validation
+    rejects that fallback.
     """
-    model = os.getenv("EMBEDDING_MODEL", "")
+    model = os.getenv("EMBEDDING_MODEL", "").strip()
     api_key = os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY", "")
-    base_url = (
-        os.getenv("EMBEDDING_BASE_URL")
-        or os.getenv("OPENAI_BASE_URL")
-        or "https://api.openai.com"
-    )
+    explicit_embedding_base = os.getenv("EMBEDDING_BASE_URL", "").strip()
+    base_url = explicit_embedding_base or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com"
     dim_override = os.getenv("QDRANT_DIM")
-    effective_dimension = int(dim_override) if dim_override else dimension
+    effective_dimension = int(dim_override) if dim_override else (dimension or model_dimension(model))
+    query_instruction = os.getenv("EMBEDDING_QUERY_INSTRUCTION")
 
-    if model and api_key:
+    if model and (api_key or explicit_embedding_base):
         logger.info("Using API embedder: model=%s, base_url=%s", model, base_url)
         return APIEmbedder(
             api_key=api_key,
             base_url=base_url,
             model=model,
             dimension=effective_dimension,
+            query_instruction=query_instruction,
         )
 
     fallback_dimension = effective_dimension or 64
     logger.info(
         "Using hash-based embedder (dimension=%d); set EMBEDDING_MODEL + "
-        "EMBEDDING_API_KEY/OPENAI_API_KEY for semantic embeddings",
+        "EMBEDDING_BASE_URL for a local endpoint or EMBEDDING_API_KEY/OPENAI_API_KEY "
+        "for a hosted semantic embedding service",
         fallback_dimension,
     )
     return HashEmbedder(dim=fallback_dimension)
