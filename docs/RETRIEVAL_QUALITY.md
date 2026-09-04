@@ -18,20 +18,20 @@ query
 
 ## Retrieval modes
 
-Use the same query in all three modes before changing weights or models:
+Use the same query in all three modes before changing weights or models. Add `--no-rerank` when the goal is a clean first-stage ablation:
 
 ```powershell
 python .\scripts\ragbot.py search `
   "What techniques lower VRAM consumption when running large language models?" `
-  --tenant engineering --mode vector --top-k 10 --explain
+  --tenant engineering --mode vector --top-k 10 --no-rerank --explain
 
 python .\scripts\ragbot.py search `
   "What techniques lower VRAM consumption when running large language models?" `
-  --tenant engineering --mode lexical --top-k 10 --explain
+  --tenant engineering --mode lexical --top-k 10 --no-rerank --explain
 
 python .\scripts\ragbot.py search `
   "What techniques lower VRAM consumption when running large language models?" `
-  --tenant engineering --mode hybrid --candidate-pool 50 --top-k 10 --explain
+  --tenant engineering --mode hybrid --candidate-pool 50 --top-k 10 --no-rerank --explain
 ```
 
 `--explain` prints:
@@ -40,6 +40,7 @@ python .\scripts\ragbot.py search `
 - vector and lexical candidate counts;
 - raw vector similarity and raw FTS score for each result;
 - adaptive fusion weights and lexical confidence;
+- whether the reranker is configured/requested/applied;
 - pre-rerank score and reranker score;
 - actual reranker candidate count.
 
@@ -91,7 +92,13 @@ EMBEDDING_BASE_URL=http://127.0.0.1:11434
 QDRANT_DIM=1024
 ```
 
-No fake embedding API key is required for an explicitly configured local endpoint.
+No fake embedding API key is required for `localhost`, loopback or `host.docker.internal` endpoints. A remote endpoint without credentials must be explicitly trusted with:
+
+```dotenv
+EMBEDDING_ALLOW_ANONYMOUS=true
+```
+
+This prevents an empty hosted-provider key from silently becoming an anonymous remote request.
 
 If you use persistent Qdrant, use a collection with the correct vector dimension. Do not point a 1024D Qwen index at an existing 1536D OpenAI collection.
 
@@ -131,7 +138,7 @@ python .\scripts\rag_eval.py `
   --tenant engineering
 ```
 
-Run all retrieval modes side by side:
+Run all retrieval modes side by side, with reranking disabled by default so first-stage retrieval is isolated:
 
 ```powershell
 python .\scripts\retrieval_ablation.py `
@@ -141,7 +148,17 @@ python .\scripts\retrieval_ablation.py `
   --output .\reports\rag-eval\deepseek-ablation.json
 ```
 
-The ablation report compares `Hit@1`, `Hit@3`, `Hit@5`, `Hit@10`, and `MRR@10` for vector, lexical and hybrid retrieval.
+Then measure the configured reranker's incremental lift separately:
+
+```powershell
+python .\scripts\retrieval_ablation.py `
+  .\eval\datasets\deepseek_in_action_retrieval.json `
+  --tenant engineering `
+  --candidate-pool 50 `
+  --with-reranker
+```
+
+The ablation report compares macro `Recall@1/3/5/10` and `MRR@10`, plus separate exact/paraphrase/cross-lingual category summaries, for vector, lexical and hybrid retrieval.
 
 ## How to interpret the ablation
 
@@ -167,7 +184,7 @@ This is the strongest signal that semantic embedding quality is the limiting lay
 
 ## Reranker candidate pool
 
-When `RAGBOT_RERANK_ENABLED=true`, the reranker now receives up to `candidate_pool` fused candidates instead of being hard-wired to `top_k * 2`. This makes recall and precision budgets independently tunable.
+When `RAGBOT_RERANK_ENABLED=true`, the reranker receives up to `candidate_pool` candidates instead of being hard-wired to `top_k * 2`. This makes recall and precision budgets independently tunable.
 
 Start with:
 
@@ -176,7 +193,7 @@ RAGBOT_RETRIEVAL_CANDIDATE_POOL=50
 RAGBOT_RERANK_ENABLED=true
 ```
 
-Then compare latency and MRR/Hit@K. Avoid increasing the pool indefinitely: once relevant evidence is consistently inside the candidate set, larger pools mostly add reranker cost.
+First run `retrieval_ablation.py` without reranking, then repeat with `--with-reranker`. Compare MRR/Recall and latency. Avoid increasing the pool indefinitely: once relevant evidence is consistently inside the candidate set, larger pools mostly add reranker cost.
 
 ## Current chunking boundary
 
