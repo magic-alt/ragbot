@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import replace
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from services.api.app.storage.models import Chunk
 
@@ -29,11 +29,24 @@ def reusable_chunks(
     *,
     external_id: str,
     remote_version: str,
+    required_metadata: Mapping[str, object] | None = None,
 ) -> list[Chunk] | None:
+    """Reuse a remote document only when content and transformation identity match.
+
+    Before chunker identity was persisted, metadata-first refresh could skip a
+    download even after chunk_size/provider changed. New callers pass the stable
+    chunker metadata; legacy chunks intentionally fail this check once and are
+    rebuilt into an explicit index contract.
+    """
     items = previous.get(external_id)
     if not items:
         return None
     versions = {str((chunk.metadata or {}).get("remote_version") or "") for chunk in items}
     if versions != {str(remote_version)}:
         return None
+    if required_metadata:
+        for chunk in items:
+            metadata = chunk.metadata or {}
+            if any(metadata.get(key) != value for key, value in required_metadata.items()):
+                return None
     return [replace(chunk, metadata=dict(chunk.metadata or {})) for chunk in items]
