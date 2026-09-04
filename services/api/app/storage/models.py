@@ -17,6 +17,8 @@ class Document:
     tags: List[str] = field(default_factory=list)
     acl_policy_id: Optional[str] = None
     status: str = "active"
+    source_id: Optional[str] = None
+    generation_id: Optional[str] = None
 
 
 @dataclass
@@ -34,6 +36,8 @@ class Chunk:
     qdrant_point_id: Optional[str] = None
     created_at: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    source_id: Optional[str] = None
+    generation_id: Optional[str] = None
 
 
 @dataclass
@@ -84,6 +88,39 @@ class IngestionJob:
     heartbeat_at: Optional[str] = None
     failure_class: Optional[str] = None
     dead_lettered_at: Optional[str] = None
+
+
+@dataclass
+class KnowledgeGeneration:
+    generation_id: str
+    source_id: str
+    tenant_id: str
+    job_id: Optional[str] = None
+    status: str = "staging"
+    created_at: Optional[str] = None
+    prepared_at: Optional[str] = None
+    activated_at: Optional[str] = None
+    retired_at: Optional[str] = None
+    failed_at: Optional[str] = None
+    error: Optional[str] = None
+    stats: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PublicationOutboxEvent:
+    outbox_id: int
+    event_type: str
+    source_id: str
+    generation_id: Optional[str] = None
+    payload: Dict[str, Any] = field(default_factory=dict)
+    status: str = "pending"
+    attempts: int = 0
+    available_at: Optional[str] = None
+    lease_owner: Optional[str] = None
+    lease_expires_at: Optional[str] = None
+    last_error: Optional[str] = None
+    created_at: Optional[str] = None
+    completed_at: Optional[str] = None
 
 
 @dataclass
