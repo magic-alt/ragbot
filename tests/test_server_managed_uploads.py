@@ -11,6 +11,8 @@ from fastapi.testclient import TestClient
 
 from services.api.app.routes import uploads as upload_routes
 from services.api.app.routes.quick_import import QuickSourceSpec, _run_quick_import
+from services.api.app.routes.sources import create_sources_router
+from services.api.app.storage.models import Source, UploadedObject
 from services.api.app.storage.repo import InMemoryRepo
 from services.api.app.storage.upload_support import ensure_upload_repository
 from services.worker.connectors.security import validate_local_source_path
@@ -73,8 +75,6 @@ def test_retire_and_gc_remove_unreferenced_object(tmp_path: Path, monkeypatch: p
     temporary.write_bytes(payload)
     stored = store.commit_pdf(temporary, object_id=object_id, sha256=digest, size_bytes=len(payload))
 
-    from services.api.app.storage.models import Source, UploadedObject
-
     repo.add_uploaded_object(
         UploadedObject(
             object_id=object_id,
@@ -121,6 +121,60 @@ def test_generic_quick_import_cannot_forge_managed_upload_uri() -> None:
         )
 
     assert exc_info.value.status_code == 422
+
+
+def test_generic_sources_api_cannot_create_managed_upload_source() -> None:
+    repo = ensure_upload_repository(InMemoryRepo())
+    services = SimpleNamespace(repo=repo)
+    object_id = "0123456789abcdef0123456789abcdef"
+    app = FastAPI()
+    app.include_router(create_sources_router(lambda: services, lambda: None))
+
+    response = TestClient(app).post(
+        "/sources",
+        json={
+            "tenant_id": "tenant-a",
+            "source_type": "pdf",
+            "name": "forged.pdf",
+            "config": {"path": upload_uri(object_id)},
+        },
+    )
+
+    assert response.status_code == 422
+    assert "server-managed" in response.json()["detail"]
+
+
+def test_managed_upload_source_content_config_is_immutable() -> None:
+    repo = ensure_upload_repository(InMemoryRepo())
+    object_id = "0123456789abcdef0123456789abcdef"
+    source = Source(
+        source_id="source-a",
+        tenant_id="tenant-a",
+        source_type="pdf",
+        name="guide.pdf",
+        config={
+            "path": upload_uri(object_id),
+            "upload_object_id": object_id,
+            "upload_sha256": "a" * 64,
+        },
+    )
+    repo.add_source(source)
+    services = SimpleNamespace(repo=repo)
+    app = FastAPI()
+    app.include_router(create_sources_router(lambda: services, lambda: None))
+
+    response = TestClient(app).put(
+        "/sources/source-a",
+        json={
+            "config": {
+                "path": upload_uri("fedcba9876543210fedcba9876543210"),
+                "upload_object_id": "fedcba9876543210fedcba9876543210",
+            }
+        },
+    )
+
+    assert response.status_code == 422
+    assert "immutable" in response.json()["detail"]
 
 
 def test_upload_endpoint_persists_object_uri_not_client_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
