@@ -181,13 +181,14 @@ def test_publication_outbox_retry_is_durable_and_idempotent(monkeypatch: pytest.
         return original_delete(point_ids)
 
     qdrant.delete_points = flaky_delete  # type: ignore[method-assign]
+    monkeypatch.setattr(worker_main, "durable_retry_delay", lambda *_args, **_kwargs: 0.0)
     processed = worker_main._drain_publication_outbox(
         repo,
         qdrant,
         worker_id="worker-a",
         lease_seconds=30,
         max_attempts=5,
-        retry_base_seconds=0.0,
+        retry_base_seconds=0.01,
         retry_max_seconds=1.0,
     )
     assert processed == 0
@@ -199,7 +200,7 @@ def test_publication_outbox_retry_is_durable_and_idempotent(monkeypatch: pytest.
         worker_id="worker-a",
         lease_seconds=30,
         max_attempts=5,
-        retry_base_seconds=0.0,
+        retry_base_seconds=0.01,
         retry_max_seconds=1.0,
     )
     assert processed == 1
@@ -212,6 +213,6 @@ def test_publication_outbox_retry_is_durable_and_idempotent(monkeypatch: pytest.
         worker_id="worker-a",
         lease_seconds=30,
         max_attempts=5,
-        retry_base_seconds=0.0,
+        retry_base_seconds=0.01,
         retry_max_seconds=1.0,
     ) == 0
