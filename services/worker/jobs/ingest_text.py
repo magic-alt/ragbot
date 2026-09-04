@@ -1,14 +1,16 @@
-"""Ingest local text/markdown files through Ragbot's document transformation port."""
+"""Ingest local files through Parser Port followed by Ragbot's Chunker Port."""
 from __future__ import annotations
 
 import logging
+import mimetypes
 import uuid
 from pathlib import Path
 from typing import Iterable, List, Optional, Set
 
 from ..chunking import split_text
 from ..chunking.languages import language_for_path
-from ..connectors.local_fs import list_files, read_file
+from ..connectors.local_fs import list_files, read_file_bytes
+from ..parsing import iter_document_segments, parse_document
 from services.api.app.storage.models import Chunk
 from services.worker.dedup.hashing import content_hash
 
@@ -28,43 +30,64 @@ def ingest_text_file(
     tags: Optional[list] = None,
     acl_hash: Optional[str] = None,
     chunking: Optional[dict] = None,
+    parsing: Optional[dict] = None,
 ) -> Iterable[Chunk]:
-    logger.info("Ingesting text file: %s (doc_id=%s)", path, doc_id)
-    text = read_file(path)
-    if not text.strip():
+    logger.info("Ingesting local file: %s (doc_id=%s)", path, doc_id)
+    body = read_file_bytes(path)
+    if not body:
         logger.warning("Empty file: %s", path)
         return
 
     file_path = Path(path)
-    source_type = "markdown" if file_path.suffix.lower() in {".md", ".markdown"} else "text"
+    suffix = file_path.suffix.lower()
+    source_type = "markdown" if suffix in {".md", ".markdown"} else "text"
     language = language_for_path(path)
-    segments, chunker_metadata = split_text(
-        text,
+    media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    document, parser_metadata = parse_document(
+        body,
+        parsing,
+        name=file_path.name,
+        media_type=media_type,
+        uri=str(file_path),
+    )
+    if not document.blocks:
+        logger.warning("No content parsed from file: %s", path)
+        return
+
+    count = 0
+    for segment in iter_document_segments(
+        document,
         chunking,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         language=language,
-    )
-    for idx, segment in enumerate(segments):
+    ):
+        section = segment.section
+        if section is None and source_type == "markdown":
+            section = _extract_section(segment.text)
         yield Chunk(
             chunk_id=uuid.uuid4().hex,
             doc_id=doc_id,
             tenant_id=tenant_id,
-            chunk_index=idx,
-            text=segment,
+            chunk_index=count,
+            text=segment.text,
             path=path,
-            section=_extract_section(segment) if source_type == "markdown" else None,
-            checksum=content_hash(segment),
+            page=segment.page,
+            section=section,
+            checksum=content_hash(segment.text),
             metadata={
                 "source_type": source_type,
                 "filename": file_path.name,
+                "media_type": media_type,
                 "version": version,
                 "tags": tags or [],
                 "acl_hash": acl_hash or "public",
-                **chunker_metadata,
+                **parser_metadata,
+                **segment.metadata,
             },
         )
-    logger.info("Text file ingestion complete: %s -> %d chunks", path, len(segments))
+        count += 1
+    logger.info("Local file ingestion complete: %s -> %d chunks", path, count)
 
 
 def ingest_local_fs(
@@ -78,12 +101,13 @@ def ingest_local_fs(
     tags: Optional[list] = None,
     acl_hash: Optional[str] = None,
     chunking: Optional[dict] = None,
+    parsing: Optional[dict] = None,
 ) -> Iterable[Chunk]:
-    """Scan a directory and ingest matching files as file-level documents."""
+    """Scan a directory and ingest matching resources as file-level documents."""
     logger.info("Ingesting local_fs directory: %s (doc_id=%s)", directory, doc_id)
     ext_set: Optional[Set[str]] = None
     if extensions:
-        ext_set = {e if e.startswith(".") else f".{e}" for e in extensions}
+        ext_set = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in extensions}
 
     files = list_files(directory, extensions=ext_set)
     logger.info("Found %d files to ingest in %s", len(files), directory)
@@ -100,6 +124,7 @@ def ingest_local_fs(
             tags=tags,
             acl_hash=acl_hash,
             chunking=chunking,
+            parsing=parsing,
         ):
             total_chunks += 1
             yield chunk
