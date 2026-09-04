@@ -5,8 +5,15 @@ on:
   pull_request:
     paths:
       - "benchmarks/rag_framework_compare.py"
+      - "services/worker/chunking/**"
+      - "services/worker/jobs/**"
+      - "services/worker/connectors/incremental.py"
+      - "services/api/app/retrieval/service.py"
       - "tests/test_rag_framework_compare_benchmark.py"
+      - "tests/test_document_transformations.py"
+      - "tests/test_retrieval_parallel.py"
       - "docs/RAG_FRAMEWORK_BENCHMARK.md"
+      - "docs/DOCUMENT_TRANSFORMATIONS.md"
       - "pyproject.toml"
       - ".github/workflows/rag-framework-benchmark.yml"
 
@@ -32,13 +39,17 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install benchmark dependencies
+      - name: Install benchmark and adapter dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,worker,benchmark-frameworks]"
+          python -m pip install -e ".[dev,worker,document-transformers]"
 
-      - name: Run benchmark regression tests
-        run: python -m pytest -q tests/test_rag_framework_compare_benchmark.py
+      - name: Run transformation and retrieval regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_rag_framework_compare_benchmark.py \
+            tests/test_document_transformations.py \
+            tests/test_retrieval_parallel.py
 
       - name: Run controlled three-backend smoke benchmark
         run: |

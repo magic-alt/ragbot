@@ -1,9 +1,4 @@
-"""Incremental Google Drive folder ingestion.
-
-Each sync enumerates remote file metadata but downloads content only when the
-Drive version changed. Unchanged files reuse the prior Ragbot chunks so the
-replacement-oriented pipeline still receives a complete source snapshot.
-"""
+"""Incremental Google Drive folder ingestion."""
 from __future__ import annotations
 
 import io
@@ -15,10 +10,12 @@ from typing import Iterable, Optional
 import requests
 
 from services.api.app.storage.models import Chunk
+from services.worker.chunking import chunking_metadata, split_text
+from services.worker.chunking.languages import language_for_path
 from services.worker.connectors.credentials import resolve_json_secret, resolve_secret
 from services.worker.connectors.incremental import previous_by_external_id, reusable_chunks, stable_document_id
 from services.worker.dedup.hashing import content_hash
-from services.worker.jobs.ingest_text import _extract_section, _split_text
+from services.worker.jobs.ingest_text import _extract_section
 from services.worker.reliability import provider_request
 
 logger = logging.getLogger(__name__)
@@ -49,6 +46,7 @@ def ingest_google_drive(
     acl_hash: Optional[str] = None,
     previous_chunks: Optional[Iterable[Chunk]] = None,
     session: Optional[requests.Session] = None,
+    chunking: Optional[dict] = None,
 ) -> Iterable[Chunk]:
     if not folder_id.strip():
         raise ValueError("Google Drive folder_id must not be empty")
@@ -63,8 +61,21 @@ def ingest_google_drive(
         file_id = str(item["id"])
         name = str(item.get("name") or file_id)
         mime = str(item.get("mimeType") or "")
+        suffix = PurePosixPath(name).suffix.lower()
+        language = language_for_path(name)
         remote_version = _remote_version(item)
-        reused = reusable_chunks(previous, external_id=file_id, remote_version=remote_version)
+        required_chunking = chunking_metadata(
+            chunking,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            language=language,
+        )
+        reused = reusable_chunks(
+            previous,
+            external_id=file_id,
+            remote_version=remote_version,
+            required_metadata=required_chunking,
+        )
         if reused is not None:
             yield from reused
             continue
@@ -76,9 +87,30 @@ def ingest_google_drive(
         if not fetched or not fetched.strip():
             continue
         file_doc_id = stable_document_id(doc_id, file_id)
-        suffix = PurePosixPath(name).suffix.lower()
         uri = str(item.get("webViewLink") or f"https://drive.google.com/open?id={file_id}")
-        for index, text in enumerate(_split_text(fetched, chunk_size, chunk_overlap)):
+        segments, chunker_metadata = split_text(
+            fetched,
+            chunking,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            language=language,
+        )
+        for index, text in enumerate(segments):
+            metadata = {
+                "source_type": "gdrive",
+                "external_id": file_id,
+                "remote_version": remote_version,
+                "mime_type": mime,
+                "filename": name,
+                "document_title": name,
+                "document_uri": uri,
+                "version": version,
+                "tags": tags or [],
+                "acl_hash": acl_hash or "public",
+                **chunker_metadata,
+            }
+            if mime == "application/pdf" or suffix == ".pdf" or _GOOGLE_EXPORTS.get(mime) == "application/pdf":
+                metadata.update({"parser_provider": "pypdf2", "parser_version": 1})
             yield Chunk(
                 chunk_id=uuid.uuid4().hex,
                 doc_id=file_doc_id,
@@ -88,18 +120,7 @@ def ingest_google_drive(
                 url=uri,
                 section=_extract_section(text) if suffix in {".md", ".markdown"} else None,
                 checksum=content_hash(text),
-                metadata={
-                    "source_type": "gdrive",
-                    "external_id": file_id,
-                    "remote_version": remote_version,
-                    "mime_type": mime,
-                    "filename": name,
-                    "document_title": name,
-                    "document_uri": uri,
-                    "version": version,
-                    "tags": tags or [],
-                    "acl_hash": acl_hash or "public",
-                },
+                metadata=metadata,
             )
 
 

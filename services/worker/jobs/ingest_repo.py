@@ -6,6 +6,8 @@ import uuid
 from pathlib import Path
 from typing import Iterable, List, Optional, Set, Tuple
 
+from ..chunking import resolve_chunking_spec, split_text
+from ..chunking.languages import language_for_path
 from ..connectors.git import fetch_git
 from services.api.app.storage.models import Chunk
 from services.worker.dedup.hashing import content_hash
@@ -25,6 +27,7 @@ _EXCLUDED_DIRS: Set[str] = {
 }
 
 DEFAULT_CHUNK_SIZE = 600
+DEFAULT_CHUNK_OVERLAP = 100
 
 _LANG_MAP = {
     ".py": "python", ".js": "javascript", ".ts": "typescript",
@@ -45,15 +48,17 @@ def ingest_repo(
     tenant_id: str,
     ref: Optional[str] = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     version: str = "1.0",
     tags: Optional[list] = None,
     acl_hash: Optional[str] = None,
+    chunking: Optional[dict] = None,
 ) -> Iterable[Chunk]:
-    """Clone/open a repo and yield Chunk objects for each source file.
+    """Index repository files with native structural or framework code chunking.
 
-    Uses symbol-based chunking for Python files (functions/classes as units),
-    regex-based function detection for C-like languages,
-    and line-based chunking as fallback.
+    `ragbot/structural` remains the compatibility default. Sources can opt into
+    `langchain/code`, `langchain/recursive`, or `llamaindex/sentence` without
+    allowing those frameworks to own repository lifecycle, ACL, or persistence.
     """
     logger.info("Ingesting repo: %s (doc_id=%s)", url_or_path, doc_id)
     repo_path = fetch_git(url_or_path, ref=ref)
@@ -71,14 +76,33 @@ def ingest_repo(
         except Exception:
             continue
         rel_path = str(file_path.relative_to(root))
-        language = _LANG_MAP.get(file_path.suffix, "unknown")
+        language = language_for_path(rel_path) or _LANG_MAP.get(file_path.suffix, "unknown")
+        spec = resolve_chunking_spec(
+            chunking,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            language=language,
+            default_strategy="structural",
+        )
 
-        if file_path.suffix == ".py":
-            segments = _split_python_symbols(content, chunk_size)
-        elif file_path.suffix in {".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".c", ".cpp", ".cs"}:
-            segments = _split_by_functions(content, chunk_size)
+        if spec.provider == "ragbot" and spec.strategy == "structural":
+            if file_path.suffix == ".py":
+                segments = _split_python_symbols(content, spec.chunk_size)
+            elif file_path.suffix in {".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".c", ".cpp", ".cs"}:
+                segments = _split_by_functions(content, spec.chunk_size)
+            else:
+                segments = _split_file(content, spec.chunk_size)
+            chunker_metadata = spec.metadata()
         else:
-            segments = _split_file(content, chunk_size)
+            parts, chunker_metadata = split_text(
+                content,
+                chunking,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                language=language,
+                default_strategy="structural",
+            )
+            segments = _locate_framework_segments(content, parts)
 
         for symbol_name, start_line, end_line, segment in segments:
             chunk = Chunk(
@@ -99,6 +123,7 @@ def ingest_repo(
                     "line_start": start_line,
                     "line_end": end_line,
                     "language": language,
+                    **chunker_metadata,
                 },
             )
             yield chunk
@@ -106,11 +131,28 @@ def ingest_repo(
     logger.info("Repo ingestion complete: %s -> %d chunks", url_or_path, idx)
 
 
-# ── Python AST-based symbol chunking ──────────────────────────────────
+def _locate_framework_segments(
+    content: str,
+    parts: list[str],
+) -> List[Tuple[Optional[str], int, int, str]]:
+    """Recover best-effort line spans without coupling framework adapters to Chunk."""
+    result: List[Tuple[Optional[str], int, int, str]] = []
+    cursor = 0
+    for part in parts:
+        position = content.find(part, cursor)
+        if position < 0:
+            position = content.find(part)
+        if position < 0:
+            position = cursor
+        end = position + len(part)
+        start_line = content.count("\n", 0, position) + 1
+        end_line = content.count("\n", 0, end) + 1
+        result.append((None, start_line, end_line, part))
+        cursor = max(cursor, end)
+    return result
 
 
 def _split_python_symbols(content: str, chunk_size: int) -> List[Tuple[Optional[str], int, int, str]]:
-    """Split Python code into symbol-based chunks (functions, classes)."""
     try:
         import ast
         tree = ast.parse(content)
@@ -124,7 +166,7 @@ def _split_python_symbols(content: str, chunk_size: int) -> List[Tuple[Optional[
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             name = node.name
             start = node.lineno - 1
-            end = node.end_lineno if hasattr(node, 'end_lineno') and node.end_lineno else start + 1
+            end = node.end_lineno if hasattr(node, "end_lineno") and node.end_lineno else start + 1
             symbols.append((name, start, end))
 
     if not symbols:
@@ -150,21 +192,17 @@ def _split_python_symbols(content: str, chunk_size: int) -> List[Tuple[Optional[
     return result
 
 
-# ── Regex-based function detection for C-like languages ───────────────
-
-
 def _split_by_functions(content: str, chunk_size: int) -> List[Tuple[Optional[str], int, int, str]]:
-    """Split code using regex-based function/class detection."""
     pattern = re.compile(
-        r'^(?:(?:export\s+)?(?:async\s+)?(?:function|class|def|func|fn|pub\s+fn|public|private|protected|static)\s+\w+)',
-        re.MULTILINE
+        r"^(?:(?:export\s+)?(?:async\s+)?(?:function|class|def|func|fn|pub\s+fn|public|private|protected|static)\s+\w+)",
+        re.MULTILINE,
     )
 
     lines = content.splitlines(keepends=True)
     boundaries: List[int] = []
 
     for match in pattern.finditer(content):
-        line_num = content[:match.start()].count('\n')
+        line_num = content[:match.start()].count("\n")
         boundaries.append(line_num)
 
     if not boundaries:
@@ -194,21 +232,16 @@ def _split_by_functions(content: str, chunk_size: int) -> List[Tuple[Optional[st
 
 
 def _extract_symbol_name(line: str) -> Optional[str]:
-    """Extract the symbol name from a function/class definition line."""
-    match = re.search(r'(?:function|class|def|func|fn)\s+(\w+)', line)
+    match = re.search(r"(?:function|class|def|func|fn)\s+(\w+)", line)
     if match:
         return match.group(1)
-    match = re.search(r'(?:public|private|protected|static)\s+\w+\s+(\w+)\s*\(', line)
+    match = re.search(r"(?:public|private|protected|static)\s+\w+\s+(\w+)\s*\(", line)
     if match:
         return match.group(1)
     return None
 
 
-# ── Shared helpers ────────────────────────────────────────────────────
-
-
 def _split_large_symbol(name: str, text: str, base_line: int, chunk_size: int) -> List[Tuple[Optional[str], int, int, str]]:
-    """Split a large symbol into smaller chunks."""
     lines = text.splitlines(keepends=True)
     result = []
     current: List[str] = []
@@ -238,7 +271,6 @@ def _split_large_symbol(name: str, text: str, base_line: int, chunk_size: int) -
 
 
 def _split_file(content: str, chunk_size: int) -> List[Tuple[Optional[str], int, int, str]]:
-    """Line-based splitting fallback."""
     lines = content.splitlines(keepends=True)
     result: List[Tuple[Optional[str], int, int, str]] = []
     current: List[str] = []

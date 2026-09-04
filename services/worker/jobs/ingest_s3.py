@@ -1,10 +1,4 @@
-"""S3/MinIO object-store ingestion.
-
-Credentials are deliberately not stored in Source.config. boto3 uses its normal
-credential chain, or an optional environment prefix can map deployment secrets
-to AWS-style client arguments. Custom S3-compatible endpoints are constrained by
-an explicit production allowlist so object-store support does not reopen SSRF.
-"""
+"""S3/MinIO object-store ingestion."""
 from __future__ import annotations
 
 import hashlib
@@ -16,9 +10,11 @@ from pathlib import PurePosixPath
 from typing import Iterable, Optional
 
 from services.api.app.storage.models import Chunk
+from services.worker.chunking import split_text
+from services.worker.chunking.languages import language_for_path
 from services.worker.connectors.security import csv_values, validate_remote_url
 from services.worker.dedup.hashing import content_hash
-from services.worker.jobs.ingest_text import _extract_section, _split_text
+from services.worker.jobs.ingest_text import _extract_section
 
 logger = logging.getLogger(__name__)
 DEFAULT_EXTENSIONS = {".txt", ".md", ".markdown", ".rst", ".py", ".js", ".ts", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".go", ".rs", ".yaml", ".yml", ".json", ".toml", ".ini", ".pdf"}
@@ -40,6 +36,7 @@ def ingest_s3(
     version: str = "1.0",
     tags: Optional[list] = None,
     acl_hash: Optional[str] = None,
+    chunking: Optional[dict] = None,
 ) -> Iterable[Chunk]:
     try:
         import boto3
@@ -94,8 +91,27 @@ def ingest_s3(
 
             object_doc_id = f"{doc_id}:{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}"
             uri = f"s3://{bucket}/{key}"
-            sections = _split_text(text, chunk_size, chunk_overlap)
+            sections, chunker_metadata = split_text(
+                text,
+                chunking,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                language=language_for_path(key),
+            )
             for index, section in enumerate(sections):
+                metadata = {
+                    "source_type": "s3",
+                    "bucket": bucket,
+                    "object_key": key,
+                    "filename": PurePosixPath(key).name,
+                    "etag": str(item.get("ETag") or "").strip('"'),
+                    "version": version,
+                    "tags": tags or [],
+                    "acl_hash": acl_hash or "public",
+                    **chunker_metadata,
+                }
+                if suffix == ".pdf":
+                    metadata.update({"parser_provider": "pypdf2", "parser_version": 1})
                 yield Chunk(
                     chunk_id=uuid.uuid4().hex,
                     doc_id=object_doc_id,
@@ -105,16 +121,7 @@ def ingest_s3(
                     path=uri,
                     section=_extract_section(section) if suffix in {".md", ".markdown"} else None,
                     checksum=content_hash(section),
-                    metadata={
-                        "source_type": "s3",
-                        "bucket": bucket,
-                        "object_key": key,
-                        "filename": PurePosixPath(key).name,
-                        "etag": str(item.get("ETag") or "").strip('"'),
-                        "version": version,
-                        "tags": tags or [],
-                        "acl_hash": acl_hash or "public",
-                    },
+                    metadata=metadata,
                 )
                 total_chunks += 1
             total_objects += 1
@@ -129,9 +136,6 @@ def _validate_custom_endpoint(endpoint_url: str) -> str:
         raise ValueError(
             "Production custom S3/MinIO endpoint_url requires RAGBOT_S3_ALLOWED_HOSTS"
         )
-    # An explicitly allowlisted S3-compatible endpoint may legitimately be a
-    # private MinIO service. Without that explicit allowlist, reuse the default
-    # remote-source private-network policy.
     return validate_remote_url(
         endpoint_url,
         allowed_hosts=allowed_hosts or None,

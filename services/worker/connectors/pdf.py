@@ -16,8 +16,8 @@ _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _DEFAULT_MAX_PDF_BYTES = 25 * 1024 * 1024
 
 
-def fetch_pdf(path: str) -> str:
-    """Read an allowed local PDF or safely download a remote PDF."""
+def fetch_pdf_pages(path: str) -> List[tuple[int, str]]:
+    """Read an allowed local/remote PDF while preserving 1-based page identity."""
     try:
         from PyPDF2 import PdfReader
     except ImportError as exc:
@@ -35,18 +35,23 @@ def fetch_pdf(path: str) -> str:
 
     try:
         reader = PdfReader(path)
-        pages: List[str] = []
-        for page in reader.pages:
+        pages: List[tuple[int, str]] = []
+        for page_number, page in enumerate(reader.pages, 1):
             text = page.extract_text()
-            if text:
-                pages.append(text.strip())
-        return "\n\n".join(pages)
+            if text and text.strip():
+                pages.append((page_number, text.strip()))
+        return pages
     finally:
         if temporary:
             try:
                 os.unlink(path)
             except OSError:
                 logger.warning("Unable to remove temporary PDF: %s", path)
+
+
+def fetch_pdf(path: str) -> str:
+    """Backward-compatible flattened PDF text helper."""
+    return "\n\n".join(text for _page, text in fetch_pdf_pages(path))
 
 
 def _download_to_temp(url: str, suffix: str = "") -> str:

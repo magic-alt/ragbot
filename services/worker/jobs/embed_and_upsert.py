@@ -20,18 +20,7 @@ def embed_and_upsert(
     batch_size: int = DEFAULT_BATCH_SIZE,
     embedder: Optional[Embedder] = None,
 ) -> None:
-    """Persist chunks and vectors in bounded batches.
-
-    SQL keeps Ragbot's logical ``chunk_id`` while Qdrant receives a stable UUID
-    derived from it. The logical ID is also stored in the vector payload so
-    retrieval can fuse vector and lexical rankings without coupling SQL primary
-    keys to Qdrant's restricted point-ID type.
-
-    The embedding model + dimension are persisted on chunk metadata as part of
-    the reusable knowledge snapshot. Re-ingestion can therefore distinguish
-    unchanged text encoded by a different embedding model and force a safe
-    re-vectorization instead of silently reusing incompatible/stale vectors.
-    """
+    """Persist chunks and vectors in bounded batches."""
     emb = embedder or HashEmbedder(dim=qdrant.dim)
     vector_batch: List[Tuple[str, List[float], Dict[str, Any]]] = []
     chunk_list: List[Chunk] = []
@@ -63,7 +52,7 @@ def embed_and_upsert(
         add_chunks = getattr(repo, "add_chunks", None)
         if callable(add_chunks):
             add_chunks(chunk_list)
-        else:  # compatibility with third-party Repo implementations
+        else:
             for chunk in chunk_list:
                 repo.add_chunk(chunk)
         qdrant.upsert(vector_batch)
@@ -80,13 +69,14 @@ def embed_and_upsert(
 
 
 def _build_payload(chunk: Chunk, embedding_model: str = "hash-64") -> Dict[str, Any]:
-    ingested_at = chunk.metadata.get("ingested_at")
-    doc_updated_at = chunk.metadata.get("doc_updated_at")
-    acl_hash = chunk.metadata.get("acl_hash") or "public"
+    metadata = chunk.metadata or {}
+    ingested_at = metadata.get("ingested_at")
+    doc_updated_at = metadata.get("doc_updated_at")
+    acl_hash = metadata.get("acl_hash") or "public"
     return {
         "chunk_id": chunk.chunk_id,
         "tenant_id": chunk.tenant_id,
-        "source_type": chunk.metadata.get("source_type"),
+        "source_type": metadata.get("source_type"),
         "doc_id": chunk.doc_id,
         "chunk_index": chunk.chunk_index,
         "path": chunk.path,
@@ -97,11 +87,20 @@ def _build_payload(chunk: Chunk, embedding_model: str = "hash-64") -> Dict[str, 
         "doc_updated_at": doc_updated_at,
         "ingested_at_ts": to_epoch(ingested_at),
         "doc_updated_at_ts": to_epoch(doc_updated_at),
-        "version": chunk.metadata.get("version"),
+        "version": metadata.get("version"),
         "checksum": chunk.checksum,
         "acl_hash": acl_hash,
-        "tags": chunk.metadata.get("tags") or [],
+        "tags": metadata.get("tags") or [],
+        "parser_provider": metadata.get("parser_provider"),
+        "parser_version": metadata.get("parser_version"),
+        "chunker_provider": metadata.get("chunker_provider"),
+        "chunker_strategy": metadata.get("chunker_strategy"),
+        "chunker_version": metadata.get("chunker_version"),
+        "chunker_config_hash": metadata.get("chunker_config_hash"),
+        "chunker_language": metadata.get("chunker_language"),
+        "chunk_size": metadata.get("chunk_size"),
+        "chunk_overlap": metadata.get("chunk_overlap"),
         "embedding_model": embedding_model,
-        "embedding_dimension": chunk.metadata.get("embedding_dimension"),
+        "embedding_dimension": metadata.get("embedding_dimension"),
         "text": chunk.text,
     }

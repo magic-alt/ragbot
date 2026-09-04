@@ -8,10 +8,10 @@ from typing import Iterable, Optional
 import requests
 
 from services.api.app.storage.models import Chunk
+from services.worker.chunking import chunking_metadata, split_text
 from services.worker.connectors.credentials import resolve_secret
 from services.worker.connectors.incremental import previous_by_external_id, reusable_chunks, stable_document_id
 from services.worker.dedup.hashing import content_hash
-from services.worker.jobs.ingest_text import _split_text
 from services.worker.reliability import provider_request
 
 logger = logging.getLogger(__name__)
@@ -33,6 +33,7 @@ def ingest_notion(
     acl_hash: Optional[str] = None,
     previous_chunks: Optional[Iterable[Chunk]] = None,
     session: Optional[requests.Session] = None,
+    chunking: Optional[dict] = None,
 ) -> Iterable[Chunk]:
     root = _clean_notion_id(page_id)
     if not root:
@@ -47,6 +48,11 @@ def ingest_notion(
         }
     )
     previous = previous_by_external_id(previous_chunks or [])
+    required_chunking = chunking_metadata(
+        chunking,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
     queue: list[str] = [root]
     visited: set[str] = set()
 
@@ -58,10 +64,13 @@ def ingest_notion(
         page = _get_json(client, f"{_NOTION_API}/pages/{current}")
         remote_version = str(page.get("last_edited_time") or page.get("created_time") or "")
         title = _page_title(page) or current
-        reused = reusable_chunks(previous, external_id=current, remote_version=remote_version)
+        reused = reusable_chunks(
+            previous,
+            external_id=current,
+            remote_version=remote_version,
+            required_metadata=required_chunking,
+        )
 
-        # Descendant discovery requires reading the block list. When recursive
-        # is false an unchanged page performs only the metadata request.
         text = ""
         children: list[str] = []
         if recursive or reused is None:
@@ -78,7 +87,13 @@ def ingest_notion(
 
         notion_doc_id = stable_document_id(doc_id, current)
         uri = str(page.get("url") or f"https://www.notion.so/{current.replace('-', '')}")
-        for index, segment in enumerate(_split_text(text, chunk_size, chunk_overlap)):
+        segments, chunker_metadata = split_text(
+            text,
+            chunking,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+        for index, segment in enumerate(segments):
             yield Chunk(
                 chunk_id=uuid.uuid4().hex,
                 doc_id=notion_doc_id,
@@ -96,6 +111,7 @@ def ingest_notion(
                     "version": version,
                     "tags": tags or [],
                     "acl_hash": acl_hash or "public",
+                    **chunker_metadata,
                 },
             )
 

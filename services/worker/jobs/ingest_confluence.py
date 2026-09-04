@@ -11,11 +11,11 @@ import requests
 from bs4 import BeautifulSoup
 
 from services.api.app.storage.models import Chunk
+from services.worker.chunking import chunking_metadata, split_text
 from services.worker.connectors.credentials import resolve_secret
 from services.worker.connectors.incremental import previous_by_external_id, reusable_chunks, stable_document_id
 from services.worker.connectors.security import csv_values, validate_remote_url
 from services.worker.dedup.hashing import content_hash
-from services.worker.jobs.ingest_text import _split_text
 from services.worker.reliability import provider_request
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,7 @@ def ingest_confluence(
     acl_hash: Optional[str] = None,
     previous_chunks: Optional[Iterable[Chunk]] = None,
     session: Optional[requests.Session] = None,
+    chunking: Optional[dict] = None,
 ) -> Iterable[Chunk]:
     base = _validate_base_url(base_url)
     if not space_key.strip():
@@ -56,10 +57,20 @@ def ingest_confluence(
     client.headers.update({"Accept": "application/json"})
 
     previous = previous_by_external_id(previous_chunks or [])
+    required_chunking = chunking_metadata(
+        chunking,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
     for item in _list_pages(client, base, space_key.strip(), root_page_id=root_page_id):
         page_id = str(item["id"])
         remote_version = _remote_version(item)
-        reused = reusable_chunks(previous, external_id=page_id, remote_version=remote_version)
+        reused = reusable_chunks(
+            previous,
+            external_id=page_id,
+            remote_version=remote_version,
+            required_metadata=required_chunking,
+        )
         if reused is not None:
             yield from reused
             continue
@@ -72,7 +83,13 @@ def ingest_confluence(
         webui = str((full.get("_links") or {}).get("webui") or (item.get("_links") or {}).get("webui") or "")
         uri = urljoin(base.rstrip("/") + "/", webui.lstrip("/")) if webui else f"{base}/pages/viewpage.action?pageId={page_id}"
         confluence_doc_id = stable_document_id(doc_id, page_id)
-        for index, segment in enumerate(_split_text(text, chunk_size, chunk_overlap)):
+        segments, chunker_metadata = split_text(
+            text,
+            chunking,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+        for index, segment in enumerate(segments):
             yield Chunk(
                 chunk_id=uuid.uuid4().hex,
                 doc_id=confluence_doc_id,
@@ -91,6 +108,7 @@ def ingest_confluence(
                     "version": version,
                     "tags": tags or [],
                     "acl_hash": acl_hash or "public",
+                    **chunker_metadata,
                 },
             )
 

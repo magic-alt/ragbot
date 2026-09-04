@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from services.worker.chunking import resolve_chunking_spec
 from services.worker.connectors.credentials import validate_secret_ref
 from services.worker.pipeline import purge_source_knowledge
 from services.worker.scheduler import configure_source_sync
@@ -92,7 +93,25 @@ def _reject_inline_secrets(config: Dict[str, Any]) -> None:
         )
 
 
+def _validate_chunking_config(source_type: str, config: Dict[str, Any]) -> None:
+    raw_chunking = config.get("chunking")
+    if raw_chunking is not None and not isinstance(raw_chunking, dict):
+        raise HTTPException(status_code=422, detail="config.chunking must be an object")
+    default_size = 600 if source_type == "repo" else 800
+    default_strategy = "structural" if source_type == "repo" else None
+    try:
+        resolve_chunking_spec(
+            raw_chunking,
+            chunk_size=int(config.get("chunk_size", default_size)),
+            chunk_overlap=int(config.get("chunk_overlap", 100)),
+            default_strategy=default_strategy,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid chunking configuration: {exc}") from exc
+
+
 def _validate_source_config(source_type: str, config: Dict[str, Any]) -> None:
+    _validate_chunking_config(source_type, config)
     if source_type == "web":
         _require_string(config, "url", source_type)
         return
@@ -248,8 +267,6 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
         authorize_tenant(_key, source.tenant_id)
         require_capability(_key, CAP_SOURCE_DELETE)
 
-        # Fence first, purge second. Running workers observe the tombstone/new
-        # updated_at generation and cannot republish knowledge after the purge.
         tombstoned = services.repo.update_source(
             source_id,
             status="deleted",

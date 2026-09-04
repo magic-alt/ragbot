@@ -3,6 +3,7 @@ from __future__ import annotations
 from services.api.app.storage.models import Chunk
 from services.api.app.routes.quick_import import build_source_config, canonical_location, infer_source_type
 from services.api.app.routes.sources import _validate_source_config
+from services.worker.chunking import chunking_metadata
 from services.worker.connectors.credentials import resolve_secret, validate_secret_ref
 from services.worker.connectors.incremental import stable_document_id
 from services.worker.jobs.ingest_confluence import ingest_confluence
@@ -45,6 +46,7 @@ def _previous(base: str, external_id: str, remote_version: str, text: str = "unc
             "version": "1.0",
             "tags": [],
             "acl_hash": "public",
+            **chunking_metadata(None, chunk_size=800, chunk_overlap=100),
         },
     )
 

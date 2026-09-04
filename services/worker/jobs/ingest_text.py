@@ -1,8 +1,4 @@
-"""Ingest local text/markdown files into chunks.
-
-Supports .txt, .md, .markdown, .rst, and other text files.
-Can ingest a single file or scan an entire directory.
-"""
+"""Ingest local text/markdown files through Ragbot's document transformation port."""
 from __future__ import annotations
 
 import logging
@@ -10,6 +6,8 @@ import uuid
 from pathlib import Path
 from typing import Iterable, List, Optional, Set
 
+from ..chunking import split_text
+from ..chunking.languages import language_for_path
 from ..connectors.local_fs import list_files, read_file
 from services.api.app.storage.models import Chunk
 from services.worker.dedup.hashing import content_hash
@@ -29,8 +27,8 @@ def ingest_text_file(
     version: str = "1.0",
     tags: Optional[list] = None,
     acl_hash: Optional[str] = None,
+    chunking: Optional[dict] = None,
 ) -> Iterable[Chunk]:
-    """Ingest a single text file into chunks."""
     logger.info("Ingesting text file: %s (doc_id=%s)", path, doc_id)
     text = read_file(path)
     if not text.strip():
@@ -39,10 +37,16 @@ def ingest_text_file(
 
     file_path = Path(path)
     source_type = "markdown" if file_path.suffix.lower() in {".md", ".markdown"} else "text"
-
-    segments = _split_text(text, chunk_size, chunk_overlap)
+    language = language_for_path(path)
+    segments, chunker_metadata = split_text(
+        text,
+        chunking,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        language=language,
+    )
     for idx, segment in enumerate(segments):
-        chunk = Chunk(
+        yield Chunk(
             chunk_id=uuid.uuid4().hex,
             doc_id=doc_id,
             tenant_id=tenant_id,
@@ -57,9 +61,9 @@ def ingest_text_file(
                 "version": version,
                 "tags": tags or [],
                 "acl_hash": acl_hash or "public",
+                **chunker_metadata,
             },
         )
-        yield chunk
     logger.info("Text file ingestion complete: %s -> %d chunks", path, len(segments))
 
 
@@ -73,13 +77,9 @@ def ingest_local_fs(
     version: str = "1.0",
     tags: Optional[list] = None,
     acl_hash: Optional[str] = None,
+    chunking: Optional[dict] = None,
 ) -> Iterable[Chunk]:
-    """Scan a directory and ingest all matching text files.
-
-    Each file gets a deterministic document ID derived from the Source-level
-    base ID. This preserves file-level document semantics while allowing the
-    pipeline to create matching Document rows before persistence.
-    """
+    """Scan a directory and ingest matching files as file-level documents."""
     logger.info("Ingesting local_fs directory: %s (doc_id=%s)", directory, doc_id)
     ext_set: Optional[Set[str]] = None
     if extensions:
@@ -99,6 +99,7 @@ def ingest_local_fs(
             version=version,
             tags=tags,
             acl_hash=acl_hash,
+            chunking=chunking,
         ):
             total_chunks += 1
             yield chunk
@@ -107,19 +108,17 @@ def ingest_local_fs(
 
 
 def _split_text(text: str, chunk_size: int, overlap: int) -> list[str]:
-    segments: list[str] = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        segment = text[start:end].strip()
-        if segment:
-            segments.append(segment)
-        start = end - overlap if end < len(text) else end
+    """Compatibility shim; fixed splitting is centralized under chunking/."""
+    segments, _metadata = split_text(
+        text,
+        None,
+        chunk_size=chunk_size,
+        chunk_overlap=overlap,
+    )
     return segments
 
 
 def _extract_section(text: str) -> Optional[str]:
-    """Extract the first markdown heading from a text chunk."""
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("#"):
