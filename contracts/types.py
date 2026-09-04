@@ -38,22 +38,14 @@ class PatchResult:
     modified_lines: int
 
 
-# SourceType represents document/vector retrieval sources. Database access is a
-# separate SQL tool configured by POSTGRES_DSN; it is not an ingestible source.
 SourceType = Literal[
     "pdf", "web", "repo", "local_fs", "s3", "gdrive", "notion", "confluence"
 ]
 RouteType = Literal["doc_rag", "sql", "code", "mixed", "web_fallback"]
 Confidence = Literal["high", "medium", "low"]
 ToolName = Literal[
-    "retrieve",
-    "sql_query",
-    "code_search",
-    "web_search",
-    "web_fetch",
-    "open_file",
-    "apply_patch",
-    "explain_error",
+    "retrieve", "sql_query", "code_search", "web_search", "web_fetch",
+    "open_file", "apply_patch", "explain_error",
 ]
 
 
@@ -91,13 +83,8 @@ class Citation:
 @dataclass
 class EvidenceItem:
     kind: Literal[
-        "doc_chunk",
-        "sql_rows",
-        "code_snippets",
-        "web_snippets",
-        "file_content",
-        "patch",
-        "error_analysis",
+        "doc_chunk", "sql_rows", "code_snippets", "web_snippets",
+        "file_content", "patch", "error_analysis",
     ]
     score: float = 0.0
     text: str = ""
@@ -137,13 +124,8 @@ class Verification:
     next_query: Optional[str] = None
     next_action: Optional[
         Literal[
-            "retrieve",
-            "sql_query",
-            "code_search",
-            "web_search",
-            "open_file",
-            "apply_patch",
-            "explain_error",
+            "retrieve", "sql_query", "code_search", "web_search",
+            "open_file", "apply_patch", "explain_error",
         ]
     ] = None
 
@@ -171,6 +153,10 @@ class AgentState:
     session_id: Optional[str] = None
     query: str = ""
     constraints: Constraints = field(default_factory=Constraints)
+    conversation_messages: List[Dict[str, str]] = field(default_factory=list)
+    system_prompt: Optional[str] = None
+    generation_temperature: float = 0.2
+    generation_max_tokens: Optional[int] = None
     route: Optional[RouteType] = None
     plan: List[str] = field(default_factory=list)
     tool_calls: List[ToolCallRecord] = field(default_factory=list)
