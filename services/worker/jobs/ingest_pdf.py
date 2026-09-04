@@ -37,12 +37,9 @@ def ingest_pdf(
     except ValueError as exc:
         if "Local source is outside RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS" not in str(exc):
             raise
-        requested = str(path)
-        resolved = str(Path(requested).expanduser().resolve())
-        allowed = os.getenv("RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS", "")
         raise ValueError(
             "PDF local path rejected: "
-            f"requested={requested!r}, resolved={resolved!r}, allowed_roots={allowed!r}; {exc}"
+            f"requested={str(path)!r}, data_dir={os.getenv('RAGBOT_DATA_DIR', '')!r}; {exc}"
         ) from exc
 
     document, parser_metadata = parse_document(
