@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator, Iterator, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
@@ -22,6 +22,7 @@ from .factory import build_services_from_env
 from .main import chat
 from .middleware import setup_middleware
 from .observability.metrics import get_metrics_collector
+from .observability.prometheus import render_prometheus
 from .observability.tracing import setup_tracing
 from .routes.admin_ui import create_admin_ui_router
 from .routes.control_plane import create_control_plane_router
@@ -170,6 +171,13 @@ async def readiness_endpoint() -> dict:
     except Exception:
         logger.exception("Readiness check failed")
         raise HTTPException(status_code=503, detail="Dependencies are not ready")
+
+
+@app.get("/metrics", include_in_schema=False)
+async def prometheus_metrics_endpoint(_key: Optional[str] = Depends(verify_api_key)) -> Response:
+    require_admin(_key)
+    payload, content_type = render_prometheus(_get_services().repo)
+    return Response(content=payload, media_type=content_type)
 
 
 @app.get("/admin/metrics")
