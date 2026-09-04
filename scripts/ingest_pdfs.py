@@ -2,9 +2,9 @@
 """Recursively ingest every PDF below Ragbot's ./data directory.
 
 The helper batches discovered PDFs into Ragbot manifests (maximum 100 sources per
-HTTP batch request) and delegates submission/waiting to scripts/ragbot.py.  It
+HTTP batch request) and delegates submission/waiting to scripts/ragbot.py. It
 therefore works with both the no-Docker local runtime and the Docker Compose
-runtime without duplicating authentication, venv, or readiness logic.
+runtime without persisting executor-specific absolute paths.
 
 Examples:
     python scripts/ingest_pdfs.py
@@ -21,6 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Iterable, List, Sequence
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
@@ -29,6 +30,7 @@ STATE_FILE = TMP_DIR / "ragbot-runtime.json"
 LOCAL_PID = TMP_DIR / "ragbot-local.pid"
 CONTROLLER = ROOT / "scripts" / "ragbot.py"
 MAX_BATCH_SIZE = 100
+MANAGED_DATA_PREFIX = "ragbot-data:///"
 
 
 class UserError(RuntimeError):
@@ -144,8 +146,7 @@ def _assert_no_competing_host_worker() -> None:
         preview = " | ".join(clients[:8])
         raise UserError(
             "Competing host Python process is connected to the Docker PostgreSQL ingestion queue "
-            f"on host port {port}. It can claim a /data job outside the Docker filesystem namespace. "
-            f"Stop the stale host worker before retrying: {preview}"
+            f"on host port {port}. Stop the stale host worker before retrying: {preview}"
         )
 
 
@@ -200,6 +201,7 @@ def _discover_pdfs(root: Path, *, recursive: bool = True) -> List[Path]:
 
 
 def _runtime_location(path: Path, mode: str) -> str:
+    """Return a physical path only for runtime diagnostics/preflight."""
     resolved = path.resolve()
     relative = resolved.relative_to(DATA_DIR.resolve())
     if mode == "docker":
@@ -207,46 +209,50 @@ def _runtime_location(path: Path, mode: str) -> str:
     return str(resolved)
 
 
+def _source_location(path: Path) -> str:
+    """Return the executor-independent representation persisted in Source/Job state."""
+    relative = path.resolve().relative_to(DATA_DIR.resolve()).as_posix()
+    return f"{MANAGED_DATA_PREFIX}{quote(relative, safe='/-._~')}"
+
+
 def _docker_source_contract(paths: Path | Sequence[Path]) -> None:
-    """Verify every submitted PDF is readable by the running Docker worker."""
+    """Run the production local-source validator inside the actual Docker worker."""
     selected = [paths] if isinstance(paths, Path) else list(paths)
-    runtime_paths = [_runtime_location(path, "docker") for path in selected]
+    source_locations = [_source_location(path) for path in selected]
     probe = r'''
 import json
 import os
 import sys
 from pathlib import Path
-
-roots = [
-    Path(value).expanduser().resolve()
-    for value in os.getenv("RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS", "").split(os.pathsep)
-    if value.strip()
-]
-
-def within(candidate: Path, root: Path) -> bool:
-    try:
-        candidate.relative_to(root)
-        return True
-    except ValueError:
-        return False
+from services.worker.connectors.security import validate_local_source_path
 
 checks = []
 for requested in sys.argv[1:]:
-    resolved = Path(requested).expanduser().resolve()
-    allowed = not roots or any(within(resolved, root) for root in roots)
-    checks.append({
-        "requested": requested,
-        "resolved": str(resolved),
-        "allowed_roots": [str(root) for root in roots],
-        "allowed": allowed,
-        "is_file": resolved.is_file(),
-    })
+    try:
+        resolved = validate_local_source_path(requested)
+        checks.append({
+            "requested": requested,
+            "resolved": resolved,
+            "data_dir": os.getenv("RAGBOT_DATA_DIR", ""),
+            "allowed_roots": os.getenv("RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS", ""),
+            "allowed": True,
+            "is_file": Path(resolved).is_file(),
+        })
+    except Exception as exc:
+        checks.append({
+            "requested": requested,
+            "data_dir": os.getenv("RAGBOT_DATA_DIR", ""),
+            "allowed_roots": os.getenv("RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS", ""),
+            "allowed": False,
+            "is_file": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        })
 print(json.dumps({"checks": checks}, sort_keys=True))
 raise SystemExit(0 if checks and all(item["allowed"] and item["is_file"] for item in checks) else 3)
 '''
     try:
         result = subprocess.run(
-            ["docker", "compose", "exec", "-T", "worker", "python", "-c", probe, *runtime_paths],
+            ["docker", "compose", "exec", "-T", "worker", "python", "-c", probe, *source_locations],
             cwd=ROOT,
             text=True,
             capture_output=True,
@@ -257,11 +263,9 @@ raise SystemExit(0 if checks and all(item["allowed"] and item["is_file"] for ite
         return
     detail = (result.stdout or result.stderr or "worker probe failed").strip()
     raise UserError(
-        "Docker local-source contract mismatch. The host discovered the PDF batch, but the running "
-        "worker cannot read one or more mapped /data paths inside its configured "
-        f"RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS. Worker probe: {detail}. "
-        "Recreate the controller-managed stack with "
-        "`python scripts/ragbot.py restart --mode docker`, then retry ingestion."
+        "Docker local-source contract mismatch. The production worker validator rejected one or "
+        f"more portable ragbot-data sources. Worker probe: {detail}. Recreate the controller-managed "
+        "stack with `python scripts/ragbot.py restart --mode docker`, then retry ingestion."
     )
 
 
@@ -284,7 +288,7 @@ def _source_spec(
     if chunk_overlap is not None:
         config["chunk_overlap"] = chunk_overlap
     return {
-        "location": _runtime_location(path, mode),
+        "location": _source_location(path),
         "source_type": "pdf",
         "name": path.relative_to(DATA_DIR.resolve()).as_posix(),
         "tags": list(tags),

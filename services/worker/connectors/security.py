@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import urlsplit
 
+from .managed_data import resolve_allowed_local_root, resolve_local_source_reference
+
 
 def env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -48,11 +50,19 @@ def validate_remote_url(
 
 
 def validate_local_source_path(path: str) -> str:
-    """Restrict local PDF/text/Git sources to explicitly configured roots."""
-    resolved = Path(path).expanduser().resolve()
+    """Restrict local PDF/text/Git sources to explicitly configured roots.
+
+    ``ragbot-data:///...`` is the portable Source/Job representation for files
+    below the controller-managed Ragbot data directory. It is resolved only at
+    execution time using this worker's ``RAGBOT_DATA_DIR``. Legacy ``/data/...``
+    references are treated as an alias for the same managed root so Sources and
+    queued Jobs created by older Ragbot releases remain executable.
+    """
+    requested = str(path)
+    resolved = Path(resolve_local_source_reference(requested))
     roots_raw = os.getenv("RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS", "")
     roots = [
-        Path(value).expanduser().resolve()
+        Path(resolve_allowed_local_root(value))
         for value in roots_raw.split(os.pathsep)
         if value.strip()
     ]
@@ -64,7 +74,11 @@ def validate_local_source_path(path: str) -> str:
             )
         return str(resolved)
     if not any(_is_within(resolved, root) for root in roots):
-        raise ValueError("Local source is outside RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS")
+        allowed = os.pathsep.join(str(root) for root in roots)
+        raise ValueError(
+            "Local source is outside RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS: "
+            f"requested={requested!r}, resolved={str(resolved)!r}, allowed_roots={allowed!r}"
+        )
     return str(resolved)
 
 
