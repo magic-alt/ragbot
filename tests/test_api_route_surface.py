@@ -22,3 +22,20 @@ def test_final_app_dispatches_server_managed_pdf_upload_route() -> None:
         headers={"Content-Type": "text/plain"},
     )
     assert response.status_code == 415, response.text
+
+
+def test_runtime_identity_is_stable_for_one_api_process() -> None:
+    with TestClient(app) as client:
+        first = client.get("/admin/runtime")
+        second = client.get("/admin/runtime")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_payload = first.json()
+    second_payload = second.json()
+    assert first_payload["service"] == "ragbot-api"
+    assert first_payload["api_version"] == "0.5.0"
+    assert first_payload["boot_id"]
+    assert first_payload["boot_id"] == second_payload["boot_id"]
+    assert first_payload["pid"] == second_payload["pid"]
+    assert "server-managed-pdf-upload" in first_payload["capabilities"]
