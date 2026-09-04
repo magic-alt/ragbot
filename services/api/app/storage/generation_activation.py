@@ -65,7 +65,7 @@ def activate_postgres_generation(
         with conn.transaction():
             generation = conn.execute(
                 """
-                SELECT source_id, tenant_id, status
+                SELECT source_id, tenant_id, status, stats
                 FROM knowledge_generations
                 WHERE generation_id = %s
                 FOR UPDATE
@@ -77,6 +77,8 @@ def activate_postgres_generation(
             generation_source = str(generation["source_id"])
             generation_tenant = str(generation["tenant_id"])
             generation_status = str(generation["status"])
+            generation_stats = dict(generation.get("stats") or {})
+            durable_expected = expected_source_generation or generation_stats.get("source_generation")
             if generation_source != source_id:
                 raise ValueError(
                     f"Generation/source mismatch: generation={generation_id} source={source_id}"
@@ -103,7 +105,7 @@ def activate_postgres_generation(
                 status=str(source_row["status"]),
                 updated_at=source_row.get("updated_at"),
                 created_at=source_row.get("created_at"),
-                expected_source_generation=expected_source_generation,
+                expected_source_generation=durable_expected,
                 generation_tenant_id=generation_tenant,
             )
 
@@ -214,13 +216,14 @@ def activate_inmemory_generation(
         source = repo._sources.get(source_id)
         if source is None:
             raise RuntimeError(f"Source disappeared during ingestion: {source_id}")
+        durable_expected = expected_source_generation or (generation.stats or {}).get("source_generation")
         _assert_activation_source(
             source_id=source_id,
             tenant_id=str(source.tenant_id),
             status=str(source.status),
             updated_at=source.updated_at,
             created_at=source.created_at,
-            expected_source_generation=expected_source_generation,
+            expected_source_generation=durable_expected,
             generation_tenant_id=str(generation.tenant_id),
         )
 
