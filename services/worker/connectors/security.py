@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import urlsplit
 
+from services.worker.uploads import build_upload_store_from_env, is_upload_uri
+
 from .managed_data import resolve_allowed_local_root, resolve_local_source_reference
 
 
@@ -50,15 +52,18 @@ def validate_remote_url(
 
 
 def validate_local_source_path(path: str) -> str:
-    """Restrict local PDF/text/Git sources to explicitly configured roots.
+    """Validate local sources without conflating user paths and managed uploads.
 
-    ``ragbot-data:///...`` is the portable Source/Job representation for files
-    below the controller-managed Ragbot data directory. It is resolved only at
-    execution time using this worker's ``RAGBOT_DATA_DIR``. Legacy ``/data/...``
-    references are treated as an alias for the same managed root so Sources and
-    queued Jobs created by older Ragbot releases remain executable.
+    ``ragbot-data:///`` and legacy ``/data`` references remain constrained by
+    ``RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS``. ``ragbot-upload:///`` objects are
+    trusted server-managed references and are resolved exclusively through the
+    Ragbot-owned UploadStore port; expanding the generic local allowlist is not
+    required and would weaken the boundary between user paths and managed data.
     """
     requested = str(path)
+    if is_upload_uri(requested):
+        return str(build_upload_store_from_env().local_path(requested))
+
     resolved = Path(resolve_local_source_reference(requested))
     roots_raw = os.getenv("RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS", "")
     roots = [
