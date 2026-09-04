@@ -1,8 +1,8 @@
 """Incremental Google Drive folder ingestion."""
 from __future__ import annotations
 
-import io
 import logging
+import mimetypes
 import uuid
 from pathlib import PurePosixPath
 from typing import Iterable, Optional
@@ -10,12 +10,13 @@ from typing import Iterable, Optional
 import requests
 
 from services.api.app.storage.models import Chunk
-from services.worker.chunking import chunking_metadata, split_text
+from services.worker.chunking import chunking_metadata
 from services.worker.chunking.languages import language_for_path
 from services.worker.connectors.credentials import resolve_json_secret, resolve_secret
 from services.worker.connectors.incremental import previous_by_external_id, reusable_chunks, stable_document_id
 from services.worker.dedup.hashing import content_hash
 from services.worker.jobs.ingest_text import _extract_section
+from services.worker.parsing import iter_document_segments, parse_document, parser_metadata
 from services.worker.reliability import provider_request
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,8 @@ _GOOGLE_EXPORTS = {
     "application/vnd.google-apps.presentation": "application/pdf",
     "application/vnd.google-apps.drawing": "application/pdf",
 }
-_TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".rst", ".py", ".js", ".ts", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".go", ".rs", ".yaml", ".yml", ".json", ".toml", ".ini", ".csv"}
+_TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".rst", ".py", ".js", ".ts", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".go", ".rs", ".yaml", ".yml", ".json", ".toml", ".ini", ".csv", ".html", ".htm"}
+_OFFICE_SUFFIXES = {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
 
 
 def ingest_google_drive(
@@ -47,6 +49,7 @@ def ingest_google_drive(
     previous_chunks: Optional[Iterable[Chunk]] = None,
     session: Optional[requests.Session] = None,
     chunking: Optional[dict] = None,
+    parsing: Optional[dict] = None,
 ) -> Iterable[Chunk]:
     if not folder_id.strip():
         raise ValueError("Google Drive folder_id must not be empty")
@@ -63,18 +66,22 @@ def ingest_google_drive(
         mime = str(item.get("mimeType") or "")
         suffix = PurePosixPath(name).suffix.lower()
         language = language_for_path(name)
+        effective_media_type = _effective_media_type(name, mime)
         remote_version = _remote_version(item)
-        required_chunking = chunking_metadata(
-            chunking,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            language=language,
-        )
+        required_metadata = {
+            **chunking_metadata(
+                chunking,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                language=language,
+            ),
+            **parser_metadata(parsing, name=name, media_type=effective_media_type),
+        }
         reused = reusable_chunks(
             previous,
             external_id=file_id,
             remote_version=remote_version,
-            required_metadata=required_chunking,
+            required_metadata=required_metadata,
         )
         if reused is not None:
             yield from reused
@@ -83,45 +90,62 @@ def ingest_google_drive(
         if size and size > max_file_bytes:
             logger.warning("Skipping oversized Drive file: %s (%d bytes)", name, size)
             continue
-        fetched = _download_text(client, file_id, name, mime, max_file_bytes)
-        if not fetched or not fetched.strip():
+        fetched = _download_resource(client, file_id, name, mime, max_file_bytes)
+        if fetched is None:
+            continue
+        body, media_type = fetched
+        if not body:
             continue
         file_doc_id = stable_document_id(doc_id, file_id)
         uri = str(item.get("webViewLink") or f"https://drive.google.com/open?id={file_id}")
-        segments, chunker_metadata = split_text(
-            fetched,
+        document, parsed_metadata = parse_document(
+            body,
+            parsing,
+            name=name,
+            media_type=media_type,
+            uri=uri,
+        )
+        if not document.blocks:
+            continue
+        chunk_index = 0
+        for segment in iter_document_segments(
+            document,
             chunking,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             language=language,
-        )
-        for index, text in enumerate(segments):
+        ):
+            section = segment.section
+            if section is None and suffix in {".md", ".markdown"}:
+                section = _extract_section(segment.text)
             metadata = {
                 "source_type": "gdrive",
                 "external_id": file_id,
                 "remote_version": remote_version,
                 "mime_type": mime,
+                "media_type": media_type,
                 "filename": name,
                 "document_title": name,
                 "document_uri": uri,
                 "version": version,
                 "tags": tags or [],
                 "acl_hash": acl_hash or "public",
-                **chunker_metadata,
+                **parsed_metadata,
+                **segment.metadata,
             }
-            if mime == "application/pdf" or suffix == ".pdf" or _GOOGLE_EXPORTS.get(mime) == "application/pdf":
-                metadata.update({"parser_provider": "pypdf2", "parser_version": 1})
             yield Chunk(
                 chunk_id=uuid.uuid4().hex,
                 doc_id=file_doc_id,
                 tenant_id=tenant_id,
-                chunk_index=index,
-                text=text,
+                chunk_index=chunk_index,
+                text=segment.text,
                 url=uri,
-                section=_extract_section(text) if suffix in {".md", ".markdown"} else None,
-                checksum=content_hash(text),
+                page=segment.page,
+                section=section,
+                checksum=content_hash(segment.text),
                 metadata=metadata,
             )
+            chunk_index += 1
 
 
 def _list_folder_files(client: requests.Session, root_folder_id: str, *, recursive: bool) -> Iterable[dict]:
@@ -159,7 +183,13 @@ def _list_folder_files(client: requests.Session, root_folder_id: str, *, recursi
                 break
 
 
-def _download_text(client: requests.Session, file_id: str, name: str, mime: str, max_bytes: int) -> str:
+def _download_resource(
+    client: requests.Session,
+    file_id: str,
+    name: str,
+    mime: str,
+    max_bytes: int,
+) -> tuple[bytes, str] | None:
     export_mime = _GOOGLE_EXPORTS.get(mime)
     if export_mime:
         response = provider_request(
@@ -171,15 +201,19 @@ def _download_text(client: requests.Session, file_id: str, name: str, mime: str,
             timeout=60,
         )
         response.raise_for_status()
-        body = _read_limited(response, max_bytes)
-        if export_mime == "application/pdf":
-            return _pdf_text(body)
-        return body.decode("utf-8", errors="replace")
+        return _read_limited(response, max_bytes), export_mime
 
     suffix = PurePosixPath(name).suffix.lower()
-    if mime != "application/pdf" and not mime.startswith("text/") and suffix not in _TEXT_SUFFIXES:
+    supported = (
+        mime == "application/pdf"
+        or mime.startswith("text/")
+        or suffix in _TEXT_SUFFIXES
+        or suffix in _OFFICE_SUFFIXES
+        or suffix == ".pdf"
+    )
+    if not supported:
         logger.info("Skipping unsupported Drive file: %s mime=%s", name, mime)
-        return ""
+        return None
     response = provider_request(
         client,
         "get",
@@ -189,10 +223,17 @@ def _download_text(client: requests.Session, file_id: str, name: str, mime: str,
         timeout=60,
     )
     response.raise_for_status()
-    body = _read_limited(response, max_bytes)
-    if mime == "application/pdf" or suffix == ".pdf":
-        return _pdf_text(body)
-    return body.decode("utf-8", errors="replace")
+    return _read_limited(response, max_bytes), _effective_media_type(name, mime)
+
+
+def _download_text(client: requests.Session, file_id: str, name: str, mime: str, max_bytes: int) -> str:
+    """Backward-compatible text helper implemented through Parser Port."""
+    resource = _download_resource(client, file_id, name, mime, max_bytes)
+    if resource is None:
+        return ""
+    body, media_type = resource
+    document, _metadata = parse_document(body, None, name=name, media_type=media_type)
+    return document.text
 
 
 def _read_limited(response, limit: int) -> bytes:
@@ -208,13 +249,24 @@ def _read_limited(response, limit: int) -> bytes:
     return b"".join(chunks)
 
 
+def _effective_media_type(name: str, mime: str) -> str:
+    export_mime = _GOOGLE_EXPORTS.get(mime)
+    if export_mime:
+        return export_mime
+    if mime and mime != "application/octet-stream":
+        return mime
+    return mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+
 def _pdf_text(body: bytes) -> str:
-    try:
-        from PyPDF2 import PdfReader
-    except ImportError as exc:
-        raise RuntimeError("Google Drive PDF ingestion requires PyPDF2") from exc
-    reader = PdfReader(io.BytesIO(body))
-    return "\n\n".join((page.extract_text() or "") for page in reader.pages)
+    """Compatibility shim retained for callers/tests."""
+    document, _metadata = parse_document(
+        body,
+        None,
+        name="document.pdf",
+        media_type="application/pdf",
+    )
+    return document.text
 
 
 def _remote_version(item: dict) -> str:
