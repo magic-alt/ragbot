@@ -5,6 +5,10 @@ This intentionally reuses ``scripts/rag_eval.py`` dataset semantics so relevance
 labels, filters and top-k behavior have one contract. It calls the live /search
 endpoint in each retrieval mode and reports Hit@K / MRR@10 side by side.
 
+By default reranking is disabled so vector/lexical/fusion quality is measured in
+isolation. Use ``--with-reranker`` for a second experiment that measures the
+precision lift and latency of the configured cross-encoder.
+
 Example:
     python scripts/retrieval_ablation.py \
       eval/datasets/deepseek_in_action_retrieval.json \
@@ -63,6 +67,7 @@ def _run_mode(
     timeout: float,
     top_k_override: Optional[int],
     candidate_pool: Optional[int],
+    rerank: bool,
 ) -> dict[str, Any]:
     cases: list[dict[str, Any]] = []
     runtime: dict[str, Any] = {}
@@ -76,6 +81,7 @@ def _run_mode(
             "filters": rag_eval._case_filters(dataset, case),
             "mode": mode,
             "candidate_pool": candidate_pool,
+            "rerank": rerank,
             "explain": True,
         }
         try:
@@ -119,7 +125,13 @@ def _run_mode(
                     "error": str(exc),
                 }
             )
-    return {"mode": mode, "summary": _mode_summary(cases), "runtime": runtime, "cases": cases}
+    return {
+        "mode": mode,
+        "rerank": rerank,
+        "summary": _mode_summary(cases),
+        "runtime": runtime,
+        "cases": cases,
+    }
 
 
 def _print_table(results: list[dict[str, Any]]) -> None:
@@ -181,6 +193,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=list(MODES),
         help="Modes to evaluate; default runs all three",
     )
+    parser.add_argument(
+        "--with-reranker",
+        action="store_true",
+        help="Apply the configured reranker; default isolates first-stage retrieval/fusion",
+    )
     parser.add_argument("--output", help="Optional JSON report path")
     return parser
 
@@ -212,6 +229,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 timeout=args.timeout,
                 top_k_override=args.top_k,
                 candidate_pool=args.candidate_pool,
+                rerank=args.with_reranker,
             )
             for mode in args.modes
         ]
@@ -222,6 +240,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "server": server,
             "tenant": args.tenant,
             "candidate_pool": args.candidate_pool,
+            "reranker": args.with_reranker,
             "results": results,
         }
         _print_table(results)
