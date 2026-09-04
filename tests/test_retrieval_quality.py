@@ -161,7 +161,33 @@ def test_candidate_pool_is_recall_budget_before_reranking():
     context = results[0].metadata["_retrieval"]["context"]
     assert context["candidate_pool"] == 4
     assert context["reranker_candidate_count"] == 4
+    assert context["reranker_enabled"] is True
     assert results[0].metadata["_retrieval"]["rerank_score"] == pytest.approx(1.0)
+
+
+def test_reranker_can_be_disabled_for_clean_ablation():
+    chunks = [_chunk(f"c{i}", f"GPU evidence candidate {i}") for i in range(1, 5)]
+    repo = FakeRepo(chunks)
+    qdrant = FakeQdrant(_hits(chunks))
+    reranker = CapturingReranker()
+    retriever = Retriever(repo, qdrant, embedder=SemanticEmbedder(), reranker=reranker)
+
+    results = retriever.retrieve(
+        "GPU evidence",
+        {"tenant_id": "engineering"},
+        top_k=2,
+        mode="hybrid",
+        candidate_pool=4,
+        rerank=False,
+    )
+
+    assert reranker.documents == []
+    context = results[0].metadata["_retrieval"]["context"]
+    assert context["reranker_configured"] is True
+    assert context["reranker_requested"] is False
+    assert context["reranker_enabled"] is False
+    assert context["reranker_candidate_count"] == 0
+    assert results[0].metadata["_retrieval"]["rerank_score"] is None
 
 
 def test_adaptive_policy_prefers_balanced_fusion_for_strong_lexical_overlap():
@@ -190,7 +216,9 @@ def test_retrieval_policy_validation_and_pool_bounds(monkeypatch):
 
 def test_qwen3_dimensions_and_local_keyless_build(monkeypatch):
     assert model_dimension("qwen3-embedding:0.6b") == 1024
+    assert model_dimension("qwen3-embedding:0.6b-q8_0") == 1024
     assert model_dimension("Qwen/Qwen3-Embedding-4B") == 2560
+    assert model_dimension("Qwen/Qwen3-Embedding-4B-GGUF") == 2560
     assert model_dimension("qwen3-embedding:8b") == 4096
     assert "retrieve relevant passages" in default_query_instruction("qwen3-embedding:0.6b")
 
