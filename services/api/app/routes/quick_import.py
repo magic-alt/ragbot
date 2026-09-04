@@ -17,6 +17,8 @@ from urllib.parse import urlsplit, urlunsplit
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from services.worker.uploads import is_upload_uri, upload_object_id
+
 from ..auth.principal import authorize_tenant, require_operator
 from ..storage.models import Source
 from .ingest import assert_source_ingestible, enqueue_ingestion_job, latest_active_ingestion_job
@@ -299,13 +301,61 @@ def _upsert_source(
     return source, False
 
 
-def _run_quick_import(*, tenant_id: str, spec: QuickSourceSpec, services) -> Dict[str, Any]:
+def _validate_managed_upload_binding(
+    repo,
+    *,
+    tenant_id: str,
+    spec: QuickSourceSpec,
+    allow_managed_upload: bool,
+) -> None:
+    if not is_upload_uri(spec.location):
+        return
+    if not allow_managed_upload:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "ragbot-upload URIs are server-managed and cannot be submitted through generic Quick Import; "
+                "upload document bytes through /ingest/upload/pdf"
+            ),
+        )
+    getter = getattr(repo, "get_uploaded_object", None)
+    if not callable(getter):
+        raise HTTPException(status_code=503, detail="Upload object registry is unavailable")
+    try:
+        object_id = upload_object_id(spec.location)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    obj = getter(object_id)
+    if obj is None:
+        raise HTTPException(status_code=404, detail="Uploaded object not found")
+    if obj.tenant_id != tenant_id:
+        raise HTTPException(status_code=403, detail="Uploaded object tenant mismatch")
+    if obj.state != "staged" or int(obj.ref_count or 0) != 0:
+        raise HTTPException(status_code=409, detail="Uploaded object is already bound or not ingestible")
+    configured_id = spec.config.get("upload_object_id")
+    if configured_id is not None and str(configured_id) != object_id:
+        raise HTTPException(status_code=422, detail="upload_object_id does not match ragbot-upload URI")
+
+
+def _run_quick_import(
+    *,
+    tenant_id: str,
+    spec: QuickSourceSpec,
+    services,
+    allow_managed_upload: bool = False,
+) -> Dict[str, Any]:
     if spec.idempotency_key and not spec.reuse_source:
         raise HTTPException(
             status_code=422,
             detail="idempotency_key requires reuse_source=true so repeated requests keep the same source identity",
         )
 
+    _validate_managed_upload_binding(
+        services.repo,
+        tenant_id=tenant_id,
+        spec=spec,
+        allow_managed_upload=allow_managed_upload,
+    )
     source_type = spec.source_type or infer_source_type(spec.location)
     _validate_source_type(source_type)
     config = build_source_config(source_type, spec.location, spec.config)
