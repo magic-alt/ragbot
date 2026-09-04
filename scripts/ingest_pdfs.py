@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 TMP_DIR = ROOT / "tmp"
 STATE_FILE = TMP_DIR / "ragbot-runtime.json"
+LOCAL_PID = TMP_DIR / "ragbot-local.pid"
 CONTROLLER = ROOT / "scripts" / "ragbot.py"
 MAX_BATCH_SIZE = 100
 
@@ -49,6 +51,62 @@ def _read_runtime_state() -> dict:
             "Restart with `python scripts/ragbot.py up --mode auto`."
         )
     return raw
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _local_runtime_running() -> bool:
+    if not LOCAL_PID.exists():
+        return False
+    try:
+        pid = int(LOCAL_PID.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    return _pid_alive(pid)
+
+
+def _docker_stack_running() -> bool:
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "ps", "--status", "running", "--services"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        )
+    except OSError:
+        return False
+    if result.returncode != 0:
+        return False
+    services = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    return "api" in services and "worker" in services
+
+
+def _resolve_runtime_mode(state: dict) -> str:
+    """Resolve the live runtime instead of trusting a potentially stale state file."""
+    saved = str(state.get("mode") or "")
+    docker_running = _docker_stack_running()
+    local_running = _local_runtime_running()
+
+    if saved == "docker" and docker_running:
+        return "docker"
+    if saved == "local" and local_running:
+        return "local"
+    if docker_running and not local_running:
+        return "docker"
+    if local_running and not docker_running:
+        return "local"
+    if docker_running and local_running and saved in {"local", "docker"}:
+        return saved
+    raise UserError(
+        "Saved Ragbot runtime state is stale: neither the recorded runtime nor a replacement "
+        "runtime could be verified. Restart with `python scripts/ragbot.py up --mode auto`."
+    )
 
 
 def _resolve_root(value: str) -> Path:
@@ -85,6 +143,62 @@ def _runtime_location(path: Path, mode: str) -> str:
     if mode == "docker":
         return f"/data/{relative.as_posix()}"
     return str(resolved)
+
+
+def _docker_source_contract(path: Path) -> None:
+    """Verify that the running worker sees the same PDF under the /data contract."""
+    runtime_path = _runtime_location(path, "docker")
+    probe = r'''
+import json
+import os
+import sys
+from pathlib import Path
+
+requested = sys.argv[1]
+resolved = Path(requested).expanduser().resolve()
+roots = [
+    Path(value).expanduser().resolve()
+    for value in os.getenv("RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS", "").split(os.pathsep)
+    if value.strip()
+]
+
+def within(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+allowed = not roots or any(within(resolved, root) for root in roots)
+result = {
+    "requested": requested,
+    "resolved": str(resolved),
+    "allowed_roots": [str(root) for root in roots],
+    "allowed": allowed,
+    "is_file": resolved.is_file(),
+}
+print(json.dumps(result, sort_keys=True))
+raise SystemExit(0 if allowed and result["is_file"] else 3)
+'''
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "exec", "-T", "worker", "python", "-c", probe, runtime_path],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        )
+    except OSError as exc:
+        raise UserError("Docker Compose is unavailable while the saved runtime is Docker") from exc
+    if result.returncode == 0:
+        return
+    detail = (result.stdout or result.stderr or "worker probe failed").strip()
+    raise UserError(
+        "Docker local-source contract mismatch. The host discovered the PDF, but the running "
+        f"worker cannot read the mapped container path {runtime_path!r} inside its configured "
+        f"RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS. Worker probe: {detail}. "
+        "Recreate the controller-managed stack with "
+        "`python scripts/ragbot.py restart --mode docker`, then retry ingestion."
+    )
 
 
 def _batches(items: Sequence[Path], size: int) -> Iterable[Sequence[Path]]:
@@ -208,13 +322,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise UserError("--max-files must be greater than zero")
 
         state = _read_runtime_state()
-        mode = str(state["mode"])
+        saved_mode = str(state["mode"])
+        mode = _resolve_runtime_mode(state)
         root = _resolve_root(args.directory)
         pdfs = _discover_pdfs(root, recursive=not args.no_recursive)
         if args.max_files is not None:
             pdfs = pdfs[: args.max_files]
 
-        print(f"Runtime mode: {mode}")
+        if mode == saved_mode:
+            print(f"Runtime mode: {mode}")
+        else:
+            print(f"Runtime mode: {mode} (recovered from stale saved mode: {saved_mode})")
         print(f"PDF root: {root}")
         print(f"Discovered PDFs: {len(pdfs)}")
         if not pdfs:
@@ -225,6 +343,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             for path in pdfs:
                 print(path.relative_to(DATA_DIR.resolve()).as_posix())
             return 0
+
+        if mode == "docker":
+            _docker_source_contract(pdfs[0])
 
         batches = list(_batches(pdfs, args.batch_size))
         failed_batches = 0
