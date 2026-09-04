@@ -53,21 +53,9 @@ worker:
   providerMaxAttempts: "4"
   providerBackoffBaseSeconds: "0.5"
   providerBackoffMaxSeconds: "30"
-  # Worker-only environment is the preferred way to expose cloud connector
-  # credential references. API pods do not need SaaS credentials.
-  # extraEnv accepts ordinary Kubernetes EnvVar objects; use secretKeyRef rather
-  # than literal secret values in committed values files.
   extraEnv: []
-  # extraEnvFrom can import a dedicated connector Secret/ExternalSecret.
-  # Example:
-  # extraEnvFrom:
-  #   - secretRef:
-  #       name: ragbot-saas-connectors
   extraEnvFrom: []
   autoscaling:
-    # Optional KEDA PostgreSQL scaler. Requires the KEDA CRDs/operator to be
-    # installed in the cluster. It reads POSTGRES_DSN from the worker target and
-    # scales on ready pending Jobs plus expired running leases.
     enabled: false
     minReplicaCount: 1
     maxReplicaCount: 10
@@ -104,15 +92,20 @@ qdrant:
 otel:
   endpoint: ""
 
-# Optional existing Secret keys used by the core chart:
-#   postgres-dsn
-#   openai-api-key
-#   embedding-api-key
-#   api-keys
-#   api-key-principals
-#   qdrant-api-key
-# Cloud/SaaS credentials should normally use worker.extraEnv/extraEnvFrom so
-# secret material is not exposed to the API deployment.
+# Server-managed client uploads use a Ragbot-owned UploadStore. The filesystem
+# adapter needs one shared volume mounted by every API and worker replica.
+# For multi-node production use an RWX-capable storage class/existing claim, or
+# replace this adapter with a future object-store UploadStore implementation.
+uploadStorage:
+  enabled: false
+  mountPath: /var/lib/ragbot/uploads
+  existingClaim: ""
+  storageClassName: ""
+  accessModes:
+    - ReadWriteMany
+  size: 10Gi
+  retentionSeconds: "86400"
+
 existingSecret: ""
 
 extraVolumes: []

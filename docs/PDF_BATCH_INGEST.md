@@ -1,18 +1,24 @@
 # Recursive PDF corpus ingestion
 
-Ragbot's `local_fs` connector intentionally scans text-like files such as Markdown, TXT, RST, CSV and logs. PDF files use the dedicated `pdf` connector, so a directory Source does not implicitly parse PDFs.
+Ragbot treats client-local PDFs as uploaded objects, not server filesystem paths. The host discovers PDFs below `./data`, streams each file to the API, and the API stores the bytes through the Ragbot-owned `UploadStore` before submitting the normal durable PDF ingestion workflow.
 
-For a real document corpus, use the repository helper to recursively discover every PDF below `./data`, create one stable PDF Source per file, submit them in batches, wait for indexing, and reuse the normal Ragbot ingestion pipeline.
+The resulting Source/Job contract contains a logical URI such as:
+
+```text
+ragbot-upload:///8f36f7b3eaf445bf9cf9d681f00a1320
+```
+
+It never contains a client path such as `/Users/name/project/data/manual.pdf` or `C:\project\data\manual.pdf`.
 
 ## Fastest path
 
-Start Ragbot first:
+Start Ragbot:
 
-```powershell
-python .\scripts\ragbot.py up --mode auto
+```bash
+python3 scripts/ragbot.py up --mode auto
 ```
 
-Put PDFs anywhere below the repository `data` directory, for example:
+Put PDFs anywhere below the repository `data` directory:
 
 ```text
 data/
@@ -25,143 +31,177 @@ data/
 └─ notes.md
 ```
 
-Then ingest every PDF recursively:
-
-```powershell
-python .\scripts\ingest_pdfs.py .\data --tenant engineering
-```
-
-The directory argument is optional. This is equivalent:
-
-```powershell
-python .\scripts\ingest_pdfs.py --tenant engineering
-```
-
-Linux/macOS:
+The canonical product command is:
 
 ```bash
-python scripts/ingest_pdfs.py data --tenant engineering
+python3 scripts/ragbot.py ingest data/ \
+  --tenant engineering \
+  --type pdf
 ```
 
-## What the helper does
+The lower-level helper remains available:
 
-1. reads `tmp/ragbot-runtime.json` written by `scripts/ragbot.py up`;
-2. discovers all files whose extension is `.pdf`, case-insensitively;
-3. keeps every source below the repository `./data` security boundary;
-4. maps host paths to `/data/...` automatically when the active runtime is Docker;
-5. creates one Ragbot `pdf` Source per PDF;
-6. groups Sources into manifests of at most 100 items because the batch API limit is 100 Sources per request;
-7. delegates each manifest to `scripts/ragbot.py import`;
-8. waits for indexing by default and reports the normal Ragbot document/chunk counts.
+```bash
+python3 scripts/ingest_pdfs.py data --tenant engineering
+```
 
-Each PDF remains a distinct Source, so nested files with the same basename do not collapse into one directory Source identity.
+## Execution model
+
+```text
+client ./data/manual.pdf
+        │
+        │ streamed PDF bytes
+        ▼
+POST /ingest/upload/pdf
+        │
+        ▼
+UploadStore
+        │
+        ├─ logical object_id
+        └─ SHA-256 content blob
+        │
+        ▼
+ragbot-upload:///object_id
+        │
+        ▼
+Source + durable Job
+        │
+        ▼
+worker → Parser Port → Chunker → embedding
+        │
+        ▼
+staged knowledge generation → activation
+```
+
+`object_id` and SHA-256 are deliberately separate. Two logical uploads containing identical bytes can remain distinct Sources while the filesystem adapter stores a single content-addressed blob where hard links are available.
+
+## Local and Docker behavior
+
+Both modes use the same HTTP upload contract.
+
+### Local development
+
+When `RAGBOT_UPLOAD_DIR` is unset, development mode derives a repository-local temporary upload root. Production mode requires an explicit upload store configuration.
+
+### Docker Compose
+
+The API and worker share the named `ingestion_uploads` volume at:
+
+```text
+/var/lib/ragbot/uploads
+```
+
+PostgreSQL remains private to the Compose network; server-managed uploads do not require PostgreSQL to be published to the host.
+
+## Security boundaries
+
+Ragbot intentionally separates two trust domains:
+
+```text
+ragbot-data:///...
+    → RAGBOT_DATA_DIR
+    → RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS
+
+ragbot-upload:///...
+    → UploadStore
+    → server-managed object root
+```
+
+Uploaded objects do **not** require adding the upload directory to `RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS`. This prevents a server-managed object namespace from weakening the generic local-file allowlist.
+
+The upload endpoint also:
+
+- requires ingestion/operator capability and tenant authorization;
+- enforces `RAGBOT_PDF_MAX_BYTES`;
+- accepts PDF/octet-stream media types only;
+- verifies the `%PDF-` signature before registration;
+- stores only `Path(filename).name` as original metadata;
+- computes SHA-256 while streaming rather than buffering the whole request in memory.
+
+## Object lifecycle
+
+Uploaded objects are registered in `uploaded_objects` with states:
+
+```text
+staged → active → retired → deleted
+          │
+          └──────── failure/orphan path → orphaned → deleted
+```
+
+Deleting an uploaded Source retires its object. Garbage collection deletes unreferenced retired/orphaned objects only after `RAGBOT_UPLOAD_RETENTION_SECONDS` (default 86400 seconds).
+
+Tenant-scoped operational endpoints are available:
+
+```text
+GET  /ingest/uploads?tenant_id=<tenant>
+POST /ingest/uploads/gc?tenant_id=<tenant>&retention_seconds=<seconds>
+```
 
 ## Useful options
 
-Preview discovery without ingesting anything:
+Preview discovery:
 
-```powershell
-python .\scripts\ingest_pdfs.py .\data --dry-run
+```bash
+python3 scripts/ingest_pdfs.py data --dry-run
 ```
 
-Only scan the selected directory, not its children:
+Non-recursive scan:
 
-```powershell
-python .\scripts\ingest_pdfs.py .\data\manuals --no-recursive
+```bash
+python3 scripts/ingest_pdfs.py data/manuals --no-recursive
 ```
 
-Apply tags to every PDF:
+Tags and chunking:
 
-```powershell
-python .\scripts\ingest_pdfs.py .\data `
-  --tenant engineering `
-  --tag manuals `
-  --tag pdf
-```
-
-Override chunking:
-
-```powershell
-python .\scripts\ingest_pdfs.py .\data `
-  --tenant engineering `
-  --chunk-size 900 `
+```bash
+python3 scripts/ingest_pdfs.py data \
+  --tenant engineering \
+  --tag manuals \
+  --tag pdf \
+  --chunk-size 900 \
   --chunk-overlap 120
 ```
 
-Test only the first 20 discovered PDFs:
+Limit a validation run:
 
-```powershell
-python .\scripts\ingest_pdfs.py .\data `
-  --tenant engineering `
-  --max-files 20
+```bash
+python3 scripts/ingest_pdfs.py data --tenant engineering --max-files 20
 ```
 
-Submit jobs without waiting for indexing:
+Submit without waiting:
 
-```powershell
-python .\scripts\ingest_pdfs.py .\data `
-  --tenant engineering `
-  --no-wait
+```bash
+python3 scripts/ingest_pdfs.py data --tenant engineering --no-wait
 ```
 
-Continue with later batches if one batch fails:
+Continue after a per-file failure:
 
-```powershell
-python .\scripts\ingest_pdfs.py .\data `
-  --tenant engineering `
-  --continue-on-error
+```bash
+python3 scripts/ingest_pdfs.py data --tenant engineering --continue-on-error
 ```
 
-## Verify the corpus
+## Re-running the corpus
 
-After ingestion:
+Each client upload creates a new logical uploaded object and PDF Source. Physical blob storage is content-addressed, so identical bytes can still be deduplicated by the UploadStore adapter.
 
-```powershell
-python .\scripts\ragbot.py search `
-  "EtherCAT Distributed Clock" `
-  --tenant engineering `
-  --top-k 5
-```
+This differs intentionally from `ragbot-data:///` Source reuse: an HTTP upload represents a new client-to-server object transfer and receives an immutable object identity. Incremental reuse still happens downstream where the ingestion pipeline can reuse compatible document/chunk representations.
 
-Then test Agentic RAG:
+## Mixed local corpus
 
-```powershell
-python .\scripts\ragbot.py ask `
-  "根据文档总结 EtherCAT Distributed Clock 的同步机制，并引用来源" `
-  --tenant engineering
-```
+Text-like files may still use the local directory connector:
 
-## Re-running the command
-
-The normal Quick Import path uses stable Source identity derived from tenant + source type + normalized location. Re-running the PDF corpus helper therefore reuses the same PDF Sources instead of intentionally creating a fresh Source for every execution.
-
-This makes the command suitable for repeatable local corpus refreshes. The ingestion pipeline still decides which chunks can be reused versus re-embedded according to the current Source content and representation contract.
-
-## Important PDF limitation
-
-The current PDF connector extracts text with `PyPDF2`. It does not perform OCR.
-
-Therefore:
-
-- searchable/native-text PDFs are appropriate for direct ingestion;
-- scanned/image-only PDFs should be OCR-processed before Ragbot ingestion;
-- changing the embedding model or vector dimension requires a compatible collection/reindex strategy.
-
-## Mixed `data` corpus
-
-For text files, keep using the directory Source:
-
-```powershell
-python .\scripts\ragbot.py ingest .\data `
-  --tenant engineering `
+```bash
+python3 scripts/ragbot.py ingest data/ \
+  --tenant engineering \
   --type local_fs
 ```
 
-Then ingest all PDFs:
+PDFs use server-managed upload:
 
-```powershell
-python .\scripts\ingest_pdfs.py .\data `
-  --tenant engineering
+```bash
+python3 scripts/ragbot.py ingest data/ \
+  --tenant engineering \
+  --type pdf
 ```
 
-Together these two commands index the currently supported text-like local files plus all PDFs below the same `data` tree.
+This keeps local filesystem access and client-uploaded document bytes as separate security and lifecycle domains.

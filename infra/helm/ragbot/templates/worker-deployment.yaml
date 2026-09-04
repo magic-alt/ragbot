@@ -88,6 +88,14 @@ spec:
               value: {{ .Values.qdrant.collection | quote }}
             - name: QDRANT_DIM
               value: {{ .Values.qdrant.dim | quote }}
+            {{- if .Values.uploadStorage.enabled }}
+            - name: RAGBOT_UPLOAD_STORE
+              value: "filesystem"
+            - name: RAGBOT_UPLOAD_DIR
+              value: {{ .Values.uploadStorage.mountPath | quote }}
+            - name: RAGBOT_UPLOAD_RETENTION_SECONDS
+              value: {{ .Values.uploadStorage.retentionSeconds | quote }}
+            {{- end }}
             {{- if .Values.existingSecret }}
             - name: POSTGRES_DSN
               valueFrom:
@@ -119,15 +127,28 @@ spec:
             {{- with .Values.worker.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- with .Values.extraVolumeMounts }}
+          {{- if or .Values.uploadStorage.enabled .Values.extraVolumeMounts }}
           volumeMounts:
+            {{- if .Values.uploadStorage.enabled }}
+            - name: upload-storage
+              mountPath: {{ .Values.uploadStorage.mountPath }}
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
       terminationGracePeriodSeconds: 30
-      {{- with .Values.extraVolumes }}
+      {{- if or .Values.uploadStorage.enabled .Values.extraVolumes }}
       volumes:
+        {{- if .Values.uploadStorage.enabled }}
+        - name: upload-storage
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-upload" .Release.Name) .Values.uploadStorage.existingClaim }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
 {{- end }}

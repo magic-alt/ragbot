@@ -124,6 +124,23 @@ class PublicationOutboxEvent:
 
 
 @dataclass
+class UploadedObject:
+    object_id: str
+    tenant_id: str
+    sha256: str
+    storage_backend: str
+    storage_key: str
+    size_bytes: int
+    media_type: str
+    original_filename: str
+    state: str = "staged"  # staged, active, orphaned, retired, deleted
+    ref_count: int = 0
+    created_at: Optional[str] = None
+    last_referenced_at: Optional[str] = None
+    retired_at: Optional[str] = None
+
+
+@dataclass
 class TableData:
     name: str
     rows: List[Dict[str, Any]]
