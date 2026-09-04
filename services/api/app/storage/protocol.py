@@ -58,6 +58,7 @@ class Repo(Protocol):
         generation_id: str,
         cleanup_point_ids: Iterable[str] = (),
         previous_doc_ids: Iterable[str] = (),
+        expected_source_generation: Optional[str] = None,
     ) -> Optional[str]: ...
     def fail_knowledge_generation(
         self,
