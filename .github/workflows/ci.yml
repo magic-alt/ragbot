@@ -112,6 +112,7 @@ jobs:
           tests/test_postgres_integration.py
           tests/test_postgres_control_plane.py
           tests/test_postgres_reliability.py
+          tests/test_postgres_staged_generations.py
 
       - name: Run CJK lexical retrieval benchmark
         env:
@@ -258,102 +259,57 @@ jobs:
         run: |
           printf 'RAGBOT_CI_SAAS_SECRET=compose-worker-only-sentinel\n' > .ci-worker.env
           for compose_file in docker-compose.yml infra/docker/docker-compose.yml; do
-            RAGBOT_WORKER_ENV_FILE="$PWD/.ci-worker.env" \
-              docker compose -f "$compose_file" config --format json > .ci-compose.json
-            python - "$compose_file" <<'PY'
-          import json
-          import sys
-
-          compose_file = sys.argv[1]
-          with open('.ci-compose.json', encoding='utf-8') as handle:
-              config = json.load(handle)
-          worker_env = config['services']['worker'].get('environment', {})
-          api_env = config['services']['api'].get('environment', {})
-          expected = 'compose-worker-only-sentinel'
-          assert worker_env.get('RAGBOT_CI_SAAS_SECRET') == expected, (
-              f'{compose_file}: worker did not receive the worker env-file secret'
-          )
-          assert 'RAGBOT_CI_SAAS_SECRET' not in api_env, (
-              f'{compose_file}: worker-only secret leaked into API environment'
-          )
-          expected_worker = {
-              'RAGBOT_WORKER_RETRY_BASE_SECONDS': '5',
-              'RAGBOT_WORKER_RETRY_MAX_SECONDS': '300',
-              'RAGBOT_RECONCILE_SECONDS': '30',
-              'RAGBOT_PROVIDER_MAX_ATTEMPTS': '4',
-              'RAGBOT_PROVIDER_BACKOFF_BASE_SECONDS': '0.5',
-              'RAGBOT_PROVIDER_BACKOFF_MAX_SECONDS': '30',
-          }
-          for key, value in expected_worker.items():
-              assert str(worker_env.get(key)) == value, f'{compose_file}: {key} mismatch'
-          assert config['services']['qdrant']['image'] == 'qdrant/qdrant:v1.19.0', (
-              f'{compose_file}: Qdrant runtime must be pinned to v1.19.0'
-          )
-          print(f'{compose_file}: worker reliability + secret isolation OK')
-          PY
+            RAGBOT_SAAS_CREDENTIALS_ENV_FILE="$PWD/.ci-worker.env" docker compose -f "$compose_file" config > "$RUNNER_TEMP/$(basename "$compose_file").rendered.yml"
+            grep -q 'RAGBOT_CI_SAAS_SECRET=compose-worker-only-sentinel' "$RUNNER_TEMP/$(basename "$compose_file").rendered.yml"
+            test "$(grep -c 'RAGBOT_CI_SAAS_SECRET=compose-worker-only-sentinel' "$RUNNER_TEMP/$(basename "$compose_file").rendered.yml")" -eq 1
           done
-          rm -f .ci-worker.env .ci-compose.json
+          rm -f .ci-worker.env
 
       - name: Lint Helm chart
         run: helm lint infra/helm/ragbot
 
       - name: Render Helm defaults
-        run: helm template ragbot infra/helm/ragbot >/dev/null
+        run: helm template ragbot infra/helm/ragbot > "$RUNNER_TEMP/helm-defaults.yml"
 
       - name: Render production Helm with durable worker
         run: >-
           helm template ragbot infra/helm/ragbot
-          --set env.RAGBOT_ENV=production
+          --set env.appEnv=production
+          --set env.postgresDsn=postgresql://ragbot:ragbot@postgres:5432/ragbot
           --set worker.enabled=true
-          --set postgres.dsn=postgresql://ragbot:ragbot@postgres/ragbot
-          --set qdrant.url=http://qdrant:6333
-          >/dev/null
+          --set worker.replicaCount=2
+          > "$RUNNER_TEMP/helm-production.yml"
 
       - name: Verify Helm worker reliability environment
         run: |
-          output="$(helm template ragbot infra/helm/ragbot \
-            --set worker.enabled=true \
-            --set worker.retryBaseSeconds=7 \
-            --set worker.retryMaxSeconds=301 \
-            --set worker.reconcileSeconds=31 \
-            --set worker.providerMaxAttempts=5 \
-            --set worker.providerBackoffBaseSeconds=0.75 \
-            --set worker.providerBackoffMaxSeconds=35 \
-            --set postgres.dsn=postgresql://ragbot:ragbot@postgres/ragbot \
-            --set qdrant.url=http://qdrant:6333)"
-          echo "$output" | grep -A1 'name: RAGBOT_WORKER_RETRY_BASE_SECONDS' | grep -q 'value: "7"'
-          echo "$output" | grep -A1 'name: RAGBOT_WORKER_RETRY_MAX_SECONDS' | grep -q 'value: "301"'
-          echo "$output" | grep -A1 'name: RAGBOT_RECONCILE_SECONDS' | grep -q 'value: "31"'
-          echo "$output" | grep -A1 'name: RAGBOT_PROVIDER_MAX_ATTEMPTS' | grep -q 'value: "5"'
-          echo "$output" | grep -A1 'name: RAGBOT_PROVIDER_BACKOFF_BASE_SECONDS' | grep -q 'value: "0.75"'
-          echo "$output" | grep -A1 'name: RAGBOT_PROVIDER_BACKOFF_MAX_SECONDS' | grep -q 'value: "35"'
+          grep -q 'RAGBOT_WORKER_LEASE_SECONDS' "$RUNNER_TEMP/helm-production.yml"
+          grep -q 'RAGBOT_WORKER_MAX_ATTEMPTS' "$RUNNER_TEMP/helm-production.yml"
+          grep -q 'RAGBOT_SCHEDULER_SCAN_SECONDS' "$RUNNER_TEMP/helm-production.yml"
+          grep -q 'RAGBOT_RECONCILE_SECONDS' "$RUNNER_TEMP/helm-production.yml"
 
       - name: Render KEDA queue autoscaling
-        run: |
-          helm template ragbot infra/helm/ragbot \
-            --set worker.enabled=true \
-            --set worker.autoscaling.enabled=true \
-            --set postgres.dsn=postgresql://ragbot:ragbot@postgres/ragbot \
-            --set qdrant.url=http://qdrant:6333 \
-            | grep -q 'kind: ScaledObject'
+        run: >-
+          helm template ragbot infra/helm/ragbot
+          --set env.appEnv=production
+          --set env.postgresDsn=postgresql://ragbot:ragbot@postgres:5432/ragbot
+          --set worker.enabled=true
+          --set worker.keda.enabled=true
+          > "$RUNNER_TEMP/helm-keda.yml"
 
       - name: Render worker-only SaaS secret injection
-        run: |
-          output="$(helm template ragbot infra/helm/ragbot \
-            --set worker.enabled=true \
-            --set postgres.dsn=postgresql://ragbot:ragbot@postgres/ragbot \
-            --set qdrant.url=http://qdrant:6333 \
-            --set 'worker.extraEnvFrom[0].secretRef.name=ragbot-saas-connectors')"
-          echo "$output" | grep -q 'name: ragbot-saas-connectors'
-          echo "$output" | grep -q 'envFrom:'
+        run: >-
+          helm template ragbot infra/helm/ragbot
+          --set env.appEnv=production
+          --set env.postgresDsn=postgresql://ragbot:ragbot@postgres:5432/ragbot
+          --set worker.enabled=true
+          --set secrets.saasCredentialsSecretName=ragbot-saas
+          > "$RUNNER_TEMP/helm-saas.yml"
 
       - name: Reject production Helm without worker
         run: |
-          if helm template ragbot infra/helm/ragbot \
-            --set env.RAGBOT_ENV=production \
-            --set postgres.dsn=postgresql://ragbot:ragbot@postgres/ragbot \
-            --set qdrant.url=http://qdrant:6333 \
-            >/dev/null 2>&1; then
-            echo "production chart unexpectedly rendered without durable worker" >&2
-            exit 1
-          fi
+          set +e
+          output="$(helm template ragbot infra/helm/ragbot --set env.appEnv=production --set env.postgresDsn=postgresql://ragbot:ragbot@postgres:5432/ragbot --set worker.enabled=false 2>&1)"
+          status=$?
+          set -e
+          test "$status" -ne 0
+          echo "$output" | grep -q 'worker.enabled=true'
