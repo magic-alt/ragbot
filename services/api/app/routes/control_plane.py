@@ -145,6 +145,26 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
             "next_sync_at": overview["sources"]["next_sync_at"],
         }
 
+    @router.get("/admin/cache", deprecated=True)
+    async def retired_cache_status(_key: Optional[str] = Depends(auth_dep)):
+        """Compatibility tombstone for the retired process-local runtime cache.
+
+        This endpoint intentionally exposes no cache state and cannot enable or
+        clear caching. It exists only so pre-P2 clients get an explicit retired
+        signal instead of mistaking a transient 404 for a deployment problem.
+        """
+        require_admin(_key)
+        return {
+            "enabled": False,
+            "retired": True,
+            "reason": (
+                "Process-local retrieval/embedding caches are not part of the runtime; "
+                "a future cache requires shared generation-aware invalidation."
+            ),
+            "retrieval": {"supported": False, "runtime_wired": False},
+            "embedding": {"supported": False, "runtime_wired": False},
+        }
+
     @router.post("/admin/queue/reconcile")
     async def admin_queue_reconcile(
         max_attempts: int = Query(default=3, ge=1, le=100),
