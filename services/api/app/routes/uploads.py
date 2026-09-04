@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -12,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from services.api.app.storage.models import UploadedObject
 from services.worker.uploads import build_upload_store_from_env, upload_uri
+from services.worker.uploads.lifecycle import gc_uploaded_objects
 
 from ..auth.principal import authorize_tenant, require_operator
 from .quick_import import QuickSourceSpec, _run_quick_import
@@ -38,6 +40,13 @@ def create_upload_router(get_services: Callable, auth_dep: Any) -> APIRouter:
             raise HTTPException(status_code=415, detail="PDF upload requires application/pdf")
 
         services = get_services()
+        # Opportunistic GC prevents single-node deployments from requiring a
+        # dedicated maintenance process. The explicit endpoint below remains
+        # available for deterministic operational cleanup.
+        try:
+            gc_uploaded_objects(services.repo)
+        except Exception:
+            pass
         try:
             store = build_upload_store_from_env()
         except ValueError as exc:
@@ -45,8 +54,17 @@ def create_upload_router(get_services: Callable, auth_dep: Any) -> APIRouter:
 
         object_id = uuid.uuid4().hex
         temporary = store.temporary_path(object_id)
-        digest, size = await _stream_pdf(request, temporary, max_bytes=_positive_int_env("RAGBOT_PDF_MAX_BYTES", 25 * 1024 * 1024))
-        stored = store.commit_pdf(temporary, object_id=object_id, sha256=digest, size_bytes=size)
+        digest, size = await _stream_pdf(
+            request,
+            temporary,
+            max_bytes=_positive_int_env("RAGBOT_PDF_MAX_BYTES", 25 * 1024 * 1024),
+        )
+        stored = store.commit_pdf(
+            temporary,
+            object_id=object_id,
+            sha256=digest,
+            size_bytes=size,
+        )
         now = datetime.now(timezone.utc).isoformat()
         uploaded = UploadedObject(
             object_id=object_id,
@@ -113,6 +131,27 @@ def create_upload_router(get_services: Callable, auth_dep: Any) -> APIRouter:
             "size_bytes": size,
         }
 
+    @router.get("/uploads")
+    async def list_uploads(
+        tenant_id: str = Query(min_length=1),
+        _key: Optional[str] = Depends(auth_dep),
+    ):
+        authorize_tenant(_key, tenant_id)
+        require_operator(_key)
+        objects = get_services().repo.list_uploaded_objects(tenant_id=tenant_id)
+        return {"objects": [asdict(obj) for obj in objects]}
+
+    @router.post("/uploads/gc")
+    async def collect_uploads(
+        retention_seconds: Optional[int] = Query(default=None, ge=0),
+        _key: Optional[str] = Depends(auth_dep),
+    ):
+        require_operator(_key)
+        return gc_uploaded_objects(
+            get_services().repo,
+            retention_seconds=retention_seconds,
+        )
+
     return router
 
 
@@ -128,7 +167,10 @@ async def _stream_pdf(request: Request, temporary: Path, *, max_bytes: int) -> t
                     continue
                 written += len(chunk)
                 if written > max_bytes:
-                    raise HTTPException(status_code=413, detail=f"PDF upload exceeds {max_bytes} byte limit")
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"PDF upload exceeds {max_bytes} byte limit",
+                    )
                 if len(signature) < 5:
                     signature.extend(chunk[: 5 - len(signature)])
                 hasher.update(chunk)
