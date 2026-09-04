@@ -101,6 +101,78 @@ def test_pdf_only_directory_bypasses_zero_document_local_fs_job(
     assert "pdf" in commands[0]
 
 
+def test_explicit_pdf_directory_routes_to_pdf_corpus_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path
+    corpus = root / "data"
+    corpus.mkdir()
+    (corpus / "manual.pdf").write_bytes(b"pdf")
+    (corpus / "notes.md").write_text("text must not be sent to local_fs", encoding="utf-8")
+    helper = root / "scripts" / "ingest_pdfs.py"
+    helper.parent.mkdir()
+    helper.write_text("# test helper", encoding="utf-8")
+
+    impl_calls: list[list[str]] = []
+    commands: list[list[str]] = []
+    monkeypatch.setattr(bootstrap, "ROOT", root)
+    monkeypatch.setattr(bootstrap, "DATA_DIR", corpus)
+    monkeypatch.setattr(bootstrap, "_PDF_INGEST_PATH", helper)
+    monkeypatch.setattr(
+        bootstrap._impl,
+        "main",
+        lambda argv: impl_calls.append(list(argv)) or 0,
+    )
+
+    def fake_run(command, **kwargs):
+        commands.append([str(item) for item in command])
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", fake_run)
+
+    result = bootstrap._smart_directory_ingest(
+        ["ingest", "data/", "--tenant", "engineering", "--type", "pdf"]
+    )
+
+    assert result == 0
+    assert impl_calls == []
+    assert len(commands) == 1
+    assert commands[0][1] == str(helper)
+    assert commands[0][2] == str(corpus.resolve())
+    assert "engineering" in commands[0]
+
+
+def test_ingest_defaults_to_repo_data_for_explicit_pdf_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path
+    corpus = root / "data"
+    corpus.mkdir()
+    (corpus / "manual.pdf").write_bytes(b"pdf")
+    helper = root / "scripts" / "ingest_pdfs.py"
+    helper.parent.mkdir()
+    helper.write_text("# test helper", encoding="utf-8")
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(bootstrap, "ROOT", root)
+    monkeypatch.setattr(bootstrap, "DATA_DIR", corpus)
+    monkeypatch.setattr(bootstrap, "_PDF_INGEST_PATH", helper)
+
+    def fake_run(command, **kwargs):
+        commands.append([str(item) for item in command])
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", fake_run)
+
+    result = bootstrap._smart_directory_ingest(
+        ["ingest", "--tenant", "engineering", "--type", "pdf"]
+    )
+
+    assert result == 0
+    assert len(commands) == 1
+    assert commands[0][2] == str(corpus.resolve())
+
+
 def test_mixed_directory_ingests_text_then_pdfs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -135,7 +207,7 @@ def test_mixed_directory_ingests_text_then_pdfs(
     assert len(commands) == 1
 
 
-def test_explicit_source_type_disables_smart_directory_routing(tmp_path: Path) -> None:
+def test_explicit_non_pdf_source_type_disables_smart_directory_routing(tmp_path: Path) -> None:
     corpus = tmp_path / "data"
     corpus.mkdir()
     (corpus / "manual.pdf").write_bytes(b"pdf")
