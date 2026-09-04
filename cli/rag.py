@@ -15,7 +15,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from .job_wait import wait_for_job
+from .job_wait import format_job_knowledge, job_chunk_stats, wait_for_job
 
 
 def _api_request(
@@ -278,7 +278,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
             job = result["job"]
             print(
                 f"Ingestion complete: source={result['source_id']}, status={job['status']}, "
-                f"docs={job['doc_count']}, chunks={job['chunk_count']}"
+                f"{format_job_knowledge(job)}"
             )
         return
 
@@ -310,10 +310,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
             f"job {submission.get('job_id')} ({submission.get('status')})"
         )
         if final_job is not None:
-            print(
-                f"Knowledge ready: docs={final_job.get('doc_count', 0)}, "
-                f"chunks={final_job.get('chunk_count', 0)}"
-            )
+            print(f"Knowledge ready: {format_job_knowledge(final_job)}")
 
 
 def cmd_import(args: argparse.Namespace) -> None:
@@ -325,8 +322,13 @@ def cmd_import(args: argparse.Namespace) -> None:
         if args.json:
             print(json.dumps({"tenant_id": tenant_id, "items": results}, indent=2, ensure_ascii=False))
         else:
-            chunks = sum(int(item["job"].get("chunk_count", 0)) for item in results)
-            print(f"Batch ingestion complete: sources={len(results)}, chunks={chunks}")
+            counts = [job_chunk_stats(item["job"]) for item in results]
+            print(
+                f"Batch ingestion complete: sources={len(results)}, "
+                f"chunks={sum(item['total'] for item in counts)}, "
+                f"written={sum(item['written'] for item in counts)}, "
+                f"reused={sum(item['reused'] for item in counts)}"
+            )
         return
 
     submission = _api_request(
@@ -359,10 +361,13 @@ def cmd_import(args: argparse.Namespace) -> None:
             f"accepted={submission.get('accepted', 0)}, failed={submission.get('failed', 0)}"
         )
         if args.wait:
+            counts = [job_chunk_stats(job) for job in jobs.values()]
             print(
                 "Knowledge ready: completed_jobs="
                 f"{sum(1 for job in jobs.values() if job.get('status') == 'completed')}, "
-                f"chunks={sum(int(job.get('chunk_count', 0)) for job in jobs.values())}"
+                f"chunks={sum(item['total'] for item in counts)}, "
+                f"written={sum(item['written'] for item in counts)}, "
+                f"reused={sum(item['reused'] for item in counts)}"
             )
     if submission.get("failed"):
         raise RuntimeError(f"{submission['failed']} manifest source(s) failed to submit")
