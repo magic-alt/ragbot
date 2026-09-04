@@ -4,6 +4,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from .generation_activation import activate_inmemory_generation, activate_postgres_generation
+from .generation_recovery import (
+    fail_inmemory_generation,
+    fail_postgres_generation,
+    reconcile_inmemory_generations,
+    reconcile_postgres_generations,
+)
 from .generation_repo import InMemoryGenerationMixin, PostgresGenerationMixin
 
 _GENERATION_METHODS = (
@@ -113,13 +119,11 @@ def _retry_publication_outbox_postgres(
 
 
 def ensure_generation_repository(repo: Any) -> Any:
-    """Attach the staged-publication adapter to built-in repositories.
+    """Attach staged-publication adapters to Ragbot's built-in repositories.
 
-    Generation publication deliberately remains an additive storage capability:
-    external/custom Repo implementations can continue to exist without silently
-    pretending to provide atomic publication. Built-in PostgreSQL and in-memory
-    repositories are upgraded in-place so existing factory/test construction
-    stays source-compatible.
+    Custom repositories that already implement the generation capability are
+    left untouched. Repositories with only the baseline ``Repo`` contract keep
+    using the explicit legacy direct-publication compatibility path.
     """
     if callable(getattr(repo, "begin_knowledge_generation", None)):
         return repo
@@ -130,11 +134,15 @@ def ensure_generation_repository(repo: Any) -> Any:
         helpers = _POSTGRES_HELPERS
         fenced_activation = activate_postgres_generation
         prepared = _mark_prepared_postgres
+        failed = fail_postgres_generation
+        recover = reconcile_postgres_generations
     elif hasattr(repo, "_lock") and hasattr(repo, "_documents") and hasattr(repo, "_chunks"):
         backend = InMemoryGenerationMixin
         helpers = _IN_MEMORY_HELPERS
         fenced_activation = activate_inmemory_generation
         prepared = _mark_prepared_inmemory
+        failed = fail_inmemory_generation
+        recover = reconcile_inmemory_generations
     else:
         return repo
 
@@ -152,11 +160,17 @@ def ensure_generation_repository(repo: Any) -> Any:
             method = prepared
         elif name == "activate_knowledge_generation":
             method = fenced_activation
+        elif name == "fail_knowledge_generation":
+            method = failed
         elif is_postgres and name == "retry_publication_outbox":
             method = _retry_publication_outbox_postgres
         else:
             method = getattr(backend, name)
         setattr(repo, name, method.__get__(repo, type(repo)))
+
+    # Recovery is intentionally not part of the mandatory GenerationRepo
+    # protocol. It is a worker-side durability hook for Ragbot's built-ins.
+    setattr(repo, "reconcile_knowledge_generations", recover.__get__(repo, type(repo)))
     return repo
 
 
