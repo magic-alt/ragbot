@@ -72,6 +72,7 @@ class Retriever:
             "reranker_configured": reranker_configured,
             "reranker_enabled": reranker_configured,
             "fusion_mode": fusion_mode,
+            "generation_visibility": callable(getattr(self._repo, "active_vector_points", None)),
             "warnings": warnings,
         }
         if retrieval_context:
@@ -94,13 +95,36 @@ class Retriever:
         embedder = self._embedder or HashEmbedder(dim=self._qdrant.dim)
         is_hash_fallback = isinstance(embedder, HashEmbedder)
         cjk_query = contains_cjk(query)
+        active_points = getattr(self._repo, "active_vector_points", None)
+        generation_visibility = callable(active_points)
+        vector_search_limit = min(1000, max(pool_size, pool_size * 4)) if generation_visibility else pool_size
 
         def vector_search():
             if is_hash_fallback and cjk_query:
                 return []
             embed_query = getattr(embedder, "embed_query", None)
             query_vector = embed_query(query) if callable(embed_query) else embedder.embed(query)
-            return self._qdrant.search(query_vector, filters, pool_size)
+            hits = self._qdrant.search(query_vector, filters, vector_search_limit)
+            if not generation_visibility or not hits:
+                return hits[:pool_size]
+
+            logical_ids = [
+                str(payload.get("chunk_id") or point_id)
+                for point_id, _score, payload in hits
+            ]
+            visible_points = active_points(logical_ids)
+            visible = []
+            for point_id, score, payload in hits:
+                logical_id = str(payload.get("chunk_id") or point_id)
+                expected_point_id = visible_points.get(logical_id)
+                if expected_point_id is None:
+                    continue
+                if str(point_id) != str(expected_point_id):
+                    continue
+                visible.append((point_id, score, payload))
+                if len(visible) >= pool_size:
+                    break
+            return visible
 
         def lexical_search():
             return fts_search(self._repo, query, filters, pool_size)
@@ -132,6 +156,8 @@ class Retriever:
                 "rank": rank,
                 "score": raw_score,
                 "raw_score": raw_score,
+                "physical_point_id": str(point_id),
+                "generation_id": payload.get("generation_id"),
             }
 
         fts_ranked: List[tuple[str, float]] = []
@@ -217,6 +243,8 @@ class Retriever:
             "retrieval_mode": retrieval_mode,
             "candidate_pool": pool_size,
             "parallel_fanout": retrieval_mode == "hybrid",
+            "generation_visibility_filter": generation_visibility,
+            "vector_search_limit": vector_search_limit,
             "vector_candidates": len(qdrant_ranked),
             "lexical_candidates": len(fts_ranked),
             "fusion_method": fusion_method,
@@ -273,6 +301,8 @@ class Retriever:
                     "page": chunk.page,
                     "section": chunk.section,
                     "qdrant_point_id": chunk.qdrant_point_id,
+                    "source_id": chunk.source_id,
+                    "generation_id": chunk.generation_id,
                     "embedding_model": embedder.model_name,
                     "_retrieval": trace,
                 }

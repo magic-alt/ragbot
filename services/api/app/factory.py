@@ -14,6 +14,7 @@ from .retrieval.embedder import HashEmbedder, build_embedder, model_dimension
 from .retrieval.qdrant import InMemoryQdrant, QdrantClientAdapter
 from .retrieval.service import Retriever
 from .runtime import is_production, validate_production_environment
+from .storage.generation_support import ensure_generation_repository
 from .storage.repo import InMemoryRepo
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,12 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
         else:
             repo = InMemoryRepo()
             logger.info("Using InMemoryRepo")
+
+    # Staged knowledge generations are an additive capability layered over the
+    # existing Repo API. Installing it in every API/worker process guarantees
+    # retrieval can validate Qdrant candidates against the authoritative active
+    # PostgreSQL manifest even when that process did not perform ingestion.
+    ensure_generation_repository(repo)
 
     qdrant_url = os.getenv("QDRANT_URL")
     qdrant_api_key = os.getenv("QDRANT_API_KEY")

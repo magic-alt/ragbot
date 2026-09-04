@@ -112,6 +112,7 @@ jobs:
           tests/test_postgres_integration.py
           tests/test_postgres_control_plane.py
           tests/test_postgres_reliability.py
+          tests/test_postgres_staged_generations.py
 
       - name: Run CJK lexical retrieval benchmark
         env:

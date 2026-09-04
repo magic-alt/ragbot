@@ -7,7 +7,8 @@ Run with::
 The API persists jobs as ``pending``. Workers atomically claim jobs using the
 repository lease contract, heartbeat while connectors/embedders run, recover
 expired leases, retry bounded ingestion failures with backoff, dead-letter
-exhausted work, and periodically enqueue due recurring Source syncs.
+exhausted work, periodically enqueue due recurring Source syncs, and drain the
+publication outbox used by staged PostgreSQL/Qdrant generation cutovers.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from services.api.app.factory import build_services_from_env
+from services.api.app.storage.generation_support import ensure_generation_repository
 from services.worker.pipeline import run_ingest_pipeline
 from services.worker.reliability import (
     classify_ingestion_error,
@@ -49,9 +51,12 @@ def main() -> int:
     retry_max_seconds = _positive_float("RAGBOT_WORKER_RETRY_MAX_SECONDS", 300.0)
     scheduler_scan_seconds = _nonnegative_float("RAGBOT_SCHEDULER_SCAN_SECONDS", 30.0)
     reconcile_seconds = _nonnegative_float("RAGBOT_RECONCILE_SECONDS", 30.0)
+    publication_scan_seconds = _nonnegative_float("RAGBOT_PUBLICATION_OUTBOX_SCAN_SECONDS", 5.0)
+    publication_max_attempts = _positive_int("RAGBOT_PUBLICATION_OUTBOX_MAX_ATTEMPTS", 10)
     worker_id = os.getenv("RAGBOT_WORKER_ID") or f"{socket.gethostname()}:{os.getpid()}"
 
     services = build_services_from_env()
+    ensure_generation_repository(services.repo)
     claim = getattr(services.repo, "claim_next_job", None)
     heartbeat = getattr(services.repo, "heartbeat_job", None)
     release = getattr(services.repo, "release_job_lease", None)
@@ -60,7 +65,7 @@ def main() -> int:
         raise RuntimeError("Configured repository does not implement durable ingestion/scheduling contracts")
 
     logger.info(
-        "Ingestion worker started: worker_id=%s lease=%ss max_attempts=%d retry=%s..%ss scheduler_scan=%ss reconcile=%ss",
+        "Ingestion worker started: worker_id=%s lease=%ss max_attempts=%d retry=%s..%ss scheduler_scan=%ss reconcile=%ss publication_scan=%ss",
         worker_id,
         lease_seconds,
         max_attempts,
@@ -68,15 +73,29 @@ def main() -> int:
         retry_max_seconds,
         scheduler_scan_seconds,
         reconcile_seconds,
+        publication_scan_seconds,
     )
     next_schedule_scan = 0.0
     next_reconcile = 0.0
+    next_publication_scan = 0.0
     try:
         while not _STOP.is_set():
             monotonic_now = time.monotonic()
             if reconcile_seconds > 0 and monotonic_now >= next_reconcile:
                 _reconcile_queue(services.repo, max_attempts=max_attempts)
                 next_reconcile = monotonic_now + reconcile_seconds
+
+            if publication_scan_seconds > 0 and monotonic_now >= next_publication_scan:
+                _drain_publication_outbox(
+                    services.repo,
+                    services.qdrant,
+                    worker_id=worker_id,
+                    lease_seconds=lease_seconds,
+                    max_attempts=publication_max_attempts,
+                    retry_base_seconds=retry_base_seconds,
+                    retry_max_seconds=retry_max_seconds,
+                )
+                next_publication_scan = monotonic_now + publication_scan_seconds
 
             if scheduler_scan_seconds > 0 and monotonic_now >= next_schedule_scan:
                 try:
@@ -210,6 +229,72 @@ def _execute_claimed_job(
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=max(1.0, lease_seconds / 3))
         services.repo.release_job_lease(job.job_id, worker_id)
+
+
+def _drain_publication_outbox(
+    repo,
+    qdrant,
+    *,
+    worker_id: str,
+    lease_seconds: int,
+    max_attempts: int,
+    retry_base_seconds: float,
+    retry_max_seconds: float,
+    limit: int = 10,
+) -> int:
+    claim = getattr(repo, "claim_publication_outbox", None)
+    complete = getattr(repo, "complete_publication_outbox", None)
+    retry = getattr(repo, "retry_publication_outbox", None)
+    reconcile = getattr(repo, "reconcile_publication_outbox", None)
+    if not all(callable(item) for item in (claim, complete, retry, reconcile)):
+        return 0
+
+    try:
+        stats = reconcile(max_attempts=max_attempts)
+        if any(int(value or 0) for value in stats.values()):
+            logger.warning("Publication outbox reconciliation repaired state: %s", stats)
+    except Exception:
+        logger.exception("Publication outbox reconciliation failed")
+        return 0
+
+    processed = 0
+    try:
+        events = claim(worker_id, lease_seconds=lease_seconds, limit=limit)
+    except Exception:
+        logger.exception("Publication outbox claim failed")
+        return 0
+
+    for event in events:
+        try:
+            if event.event_type != "delete_qdrant_points":
+                raise ValueError(f"Unsupported publication outbox event: {event.event_type}")
+            point_ids = list(dict.fromkeys(str(item) for item in (event.payload.get("point_ids") or []) if item))
+            delete = getattr(qdrant, "delete_points", None)
+            if point_ids and not callable(delete):
+                raise RuntimeError("Configured vector store cannot delete staged/retired points")
+            if point_ids:
+                delete(point_ids)
+            if not complete(event.outbox_id, worker_id):
+                raise RuntimeError(f"Lost publication outbox lease: {event.outbox_id}")
+            processed += 1
+        except Exception as exc:
+            logger.exception("Publication outbox event failed: id=%s type=%s", event.outbox_id, event.event_type)
+            delay = durable_retry_delay(
+                int(event.attempts or 0),
+                base_seconds=retry_base_seconds,
+                max_seconds=retry_max_seconds,
+            )
+            try:
+                retry(
+                    event.outbox_id,
+                    worker_id,
+                    str(exc),
+                    delay,
+                    max_attempts=max_attempts,
+                )
+            except Exception:
+                logger.exception("Failed to reschedule publication outbox event: %s", event.outbox_id)
+    return processed
 
 
 def _retry_or_dead_letter(
