@@ -6,10 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from services.api.app.routes import uploads as upload_routes
+from services.api.app.routes.quick_import import QuickSourceSpec, _run_quick_import
 from services.api.app.storage.repo import InMemoryRepo
 from services.api.app.storage.upload_support import ensure_upload_repository
 from services.worker.connectors.security import validate_local_source_path
@@ -98,10 +99,28 @@ def test_retire_and_gc_remove_unreferenced_object(tmp_path: Path, monkeypatch: p
 
     assert retire_uploaded_object_for_source(repo, source) is True
     assert repo.get_uploaded_object(object_id).state == "retired"
-    stats = gc_uploaded_objects(repo, retention_seconds=0)
+    stats = gc_uploaded_objects(repo, tenant_id="tenant-a", retention_seconds=0)
     assert stats["deleted"] == 1
     assert repo.get_uploaded_object(object_id).state == "deleted"
     assert not (store.object_root / f"{object_id}.pdf").exists()
+
+
+def test_generic_quick_import_cannot_forge_managed_upload_uri() -> None:
+    repo = ensure_upload_repository(InMemoryRepo())
+    services = SimpleNamespace(repo=repo)
+    object_id = "0123456789abcdef0123456789abcdef"
+
+    with pytest.raises(HTTPException, match="server-managed") as exc_info:
+        _run_quick_import(
+            tenant_id="tenant-a",
+            spec=QuickSourceSpec(
+                location=upload_uri(object_id),
+                source_type="pdf",
+            ),
+            services=services,
+        )
+
+    assert exc_info.value.status_code == 422
 
 
 def test_upload_endpoint_persists_object_uri_not_client_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
