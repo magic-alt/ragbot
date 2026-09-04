@@ -40,11 +40,10 @@ def create_upload_router(get_services: Callable, auth_dep: Any) -> APIRouter:
             raise HTTPException(status_code=415, detail="PDF upload requires application/pdf")
 
         services = get_services()
-        # Opportunistic GC prevents single-node deployments from requiring a
-        # dedicated maintenance process. The explicit endpoint below remains
-        # available for deterministic operational cleanup.
+        # Opportunistic GC is tenant-scoped so one operator can never clean
+        # another tenant's objects. Explicit GC below follows the same rule.
         try:
-            gc_uploaded_objects(services.repo)
+            gc_uploaded_objects(services.repo, tenant_id=tenant_id)
         except Exception:
             pass
         try:
@@ -143,12 +142,15 @@ def create_upload_router(get_services: Callable, auth_dep: Any) -> APIRouter:
 
     @router.post("/uploads/gc")
     async def collect_uploads(
+        tenant_id: str = Query(min_length=1),
         retention_seconds: Optional[int] = Query(default=None, ge=0),
         _key: Optional[str] = Depends(auth_dep),
     ):
+        authorize_tenant(_key, tenant_id)
         require_operator(_key)
         return gc_uploaded_objects(
             get_services().repo,
+            tenant_id=tenant_id,
             retention_seconds=retention_seconds,
         )
 
