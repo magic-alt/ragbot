@@ -10,6 +10,7 @@
 4. `HashEmbedder`、InMemoryRepo/InMemoryQdrant、inline ingestion 仅用于开发/测试。
 5. `RAGBOT_ENV=production` 会拒绝上述非持久化回退。
 6. Production API key 必须绑定 principal，不能让请求自行扩大 tenant/user scope。
+7. **`POSTGRES_DSN` 只属于 Ragbot control plane。** Agent SQL 默认关闭；启用时使用独立 `RAGBOT_SQL_DSN`。
 
 ## 2. Runtime / durable ingestion
 
@@ -20,7 +21,14 @@
 | `RAGBOT_WORKER_ID` | hostname:pid | worker lease identity |
 | `RAGBOT_WORKER_POLL_SECONDS` | `1` | 无任务时轮询间隔 |
 | `RAGBOT_WORKER_LEASE_SECONDS` | `120` | job lease 时长 |
-| `RAGBOT_WORKER_MAX_ATTEMPTS` | `3` | crash/reclaim 后最大执行次数 |
+| `RAGBOT_WORKER_MAX_ATTEMPTS` | `3` | 最大 durable execution attempts |
+| `RAGBOT_WORKER_RETRY_BASE_SECONDS` | `5` | job-level retry 初始 backoff |
+| `RAGBOT_WORKER_RETRY_MAX_SECONDS` | `300` | job-level retry 最大 backoff |
+| `RAGBOT_RECONCILE_SECONDS` | `30` | lease/failed-job reconciliation 扫描间隔 |
+| `RAGBOT_SCHEDULER_SCAN_SECONDS` | `30` | Source scheduled-sync 扫描间隔 |
+| `RAGBOT_PROVIDER_MAX_ATTEMPTS` | `4` | provider request 内层最大重试次数 |
+| `RAGBOT_PROVIDER_BACKOFF_BASE_SECONDS` | `0.5` | provider retry 初始 backoff |
+| `RAGBOT_PROVIDER_BACKOFF_MAX_SECONDS` | `30` | provider retry 最大 backoff |
 
 `auto` 在存在 `POSTGRES_DSN` 时选择 durable worker，否则使用 inline development path。Docker Compose 显式设置 `worker` 并启动独立 worker；Helm production render 要求 `worker.enabled=true`。
 
@@ -30,7 +38,9 @@ Worker 入口：
 python -m services.worker.main
 ```
 
-任务 claim 使用 PostgreSQL `FOR UPDATE SKIP LOCKED`。Worker 会 heartbeat 续租；进程异常结束后，过期 lease 可被其他 worker reclaim。达到最大 attempts 后任务进入 `failed`。
+任务 claim 使用 PostgreSQL `FOR UPDATE SKIP LOCKED`。Worker 会 heartbeat 续租；进程异常结束后，过期 lease 可被其他 worker reclaim。达到最大 attempts、永久配置错误或 Source generation mismatch 后任务进入 `dead_lettered`。`rag ingest --wait` 会把 `dead_lettered` 当作终态立即返回失败。
+
+每个 Job 还会在 `stats.source_generation` 中记录 Source 生命周期代次。Source 更新/删除后，旧 Job 会被 fence；删除采用 tombstone-first，再 purge PostgreSQL/Qdrant knowledge。
 
 ## 3. LLM
 
@@ -46,7 +56,7 @@ python -m services.worker.main
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
 | `OLLAMA_MODEL` | `llama3` | Ollama model |
 
-当前 runtime factory 构建单一 provider；`llm/router.py` 中的 fast/strong primitives 尚不是默认生产配置契约。
+`/v1/chat/completions` 会保留 system message 和历史 user/assistant context，最后一个非空 user turn 作为当前 retrieval query；`temperature` 与 `max_tokens` 会进入 synthesis LLM 调用。当前 usage 为估算值，SSE 仍是 final-answer chunk streaming，不是 provider-native token streaming。
 
 ## 4. Embedding / Qdrant
 
@@ -82,18 +92,17 @@ Embedding API 返回维度必须严格等于 `QDRANT_DIM`；不会 truncate 或 
 6. 切换查询流量；
 7. 保留旧 collection 作为 rollback，再择机清理。
 
-## 5. PostgreSQL / lexical retrieval
+## 5. PostgreSQL control plane / lexical retrieval
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `POSTGRES_DSN` | empty | production metadata/job/FTS store |
-| `POSTGRES_ALLOWED_SCHEMAS` | empty | Agent SQL 可访问 schema allowlist |
-| `POSTGRES_SQL_LIMIT` | `200` | Agent SQL result limit |
-| `POSTGRES_SQL_TIMEOUT_MS` | `3000` | Agent SQL statement timeout |
+| `POSTGRES_DSN` | empty | Ragbot production metadata/job/queue/FTS store |
+
+`POSTGRES_DSN` 是 Ragbot 内部权威数据库，保存 Sources、Jobs、schedules、documents/chunks、ACL、queue leases 与 lexical state。**它不应直接暴露给 Agent SQL。**
 
 Migrations 位于 `infra/migrations/`，由 `python -m services.api.app.storage.migrations` 按顺序、advisory lock 保护执行。
 
-Migration 006 增加 durable queue lease 字段和 `chunks.fts_text`。英文/数字保留 PostgreSQL `simple` FTS；CJK 文本额外生成 overlapping bigrams。`lexical_version` 属于 chunk reuse contract，因此首次升级后 re-ingest 会重写旧 lexical representation，后续相同内容仍可复用。
+英文/数字使用 PostgreSQL `simple` FTS；CJK 文本额外生成 overlapping bigrams。`lexical_version` 属于 chunk reuse contract，因此 representation 升级后 re-ingest 会重写旧 lexical representation，后续相同内容仍可复用。
 
 回归基准：
 
@@ -101,9 +110,37 @@ Migration 006 增加 durable queue lease 字段和 `chunks.fts_text`。英文/�
 POSTGRES_TEST_DSN='postgresql://...' python -m eval.cjk_retrieval
 ```
 
-当前 release floor：Recall@5 ≥ 0.90、MRR ≥ 0.80。真实企业 corpus 应继续比较 bigram baseline 与 PGroonga/pg_jieba/external lexical index。
+当前 release floor：Recall@5 ≥ 0.90、MRR ≥ 0.80。
 
-## 6. Reranker
+## 6. Optional Agent SQL
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RAGBOT_SQL_TOOL_ENABLED` | `false` | 是否允许 Agent SQL route/tool |
+| `RAGBOT_SQL_DSN` | empty | 独立结构化查询数据库 DSN |
+| `RAGBOT_SQL_ALLOWED_SCHEMAS` | empty | Agent SQL schema allowlist；production 启用时必填 |
+| `RAGBOT_SQL_LIMIT` | `200` | SQL result row limit |
+| `RAGBOT_SQL_TIMEOUT_MS` | `3000` | statement timeout |
+
+默认配置是 fail-closed：
+
+```dotenv
+RAGBOT_SQL_TOOL_ENABLED=false
+```
+
+生产启用示例：
+
+```dotenv
+RAGBOT_SQL_TOOL_ENABLED=true
+RAGBOT_SQL_DSN=postgresql://ragbot_reader:***@analytics-db:5432/analytics
+RAGBOT_SQL_ALLOWED_SCHEMAS=rag_views,analytics
+RAGBOT_SQL_LIMIT=200
+RAGBOT_SQL_TIMEOUT_MS=3000
+```
+
+Production startup 会拒绝 `RAGBOT_SQL_DSN == POSTGRES_DSN`，也会拒绝空 schema allowlist。数据库本身仍必须使用 dedicated read-only role、最小 schema/view grant；如果业务数据是多租户，使用 PostgreSQL RLS 或 tenant-safe views。应用层单条 SELECT / READ ONLY transaction / timeout / limit 只是 defense-in-depth。
+
+## 7. Reranker
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -116,7 +153,7 @@ POSTGRES_TEST_DSN='postgresql://...' python -m eval.cjk_retrieval
 
 Reranker 是 optional quality layer。Provider failure 时 Retriever 回退到 RRF，不中断整体检索。
 
-## 7. API identity / ACL
+## 8. API identity / ACL
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -134,7 +171,7 @@ RAGBOT_API_KEY_PRINCIPALS='{"tenant-a-key":{"tenant_ids":["tenant-a"],"user_id":
 
 Production 每个 API key 都必须有 stable `user_id` 和 tenant scope 或 `admin=true`。
 
-## 8. Source boundaries
+## 9. Source boundaries
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -149,21 +186,28 @@ Production 每个 API key 都必须有 stable `user_id` 和 tenant scope 或 `ad
 | `RAGBOT_PDF_MAX_BYTES` | `26214400` | PDF download hard limit |
 | `CODE_REPO_ROOT` | `.` | server-owned code-search root |
 
-`RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS` 使用操作系统 path separator 表示多个根目录。生产中建议只读挂载 Source data。
+`RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS` 使用操作系统 path separator 表示多个根目录。生产中建议只读挂载 Source data。应用层 URL 验证不是 egress firewall 的替代品；敏感环境应同时限制网络出口。
 
-应用层 URL 验证不是 egress firewall 的替代品；敏感环境应同时限制网络出口。
-
-## 9. Cache / tracing
+## 10. Cache / tracing / metrics
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `RAGBOT_CACHE_ENABLED` | `true` | cache feature flag |
-| `RAGBOT_CACHE_TTL_SECONDS` | `300` | retrieval cache TTL |
+| `RAGBOT_CACHE_TTL_SECONDS` | `300` | cache TTL configuration |
 | `RAGBOT_CACHE_MAX_ENTRIES` | `1000` | cache capacity |
 | `RAGBOT_TRACING_ENABLED` | `false` | OpenTelemetry export |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | empty | OTLP endpoint |
 
-## 10. Staging smoke
+Prometheus endpoint：
+
+```text
+GET /metrics
+X-API-Key: <global-admin-key>
+```
+
+它输出 HTTP request/latency、queue status、oldest pending age、stale leases、Source counts，以及 Agent quality/latency gauges。`/admin/metrics` 仍保留用于诊断的 JSON 聚合。
+
+## 11. Staging smoke
 
 `.github/workflows/staging-smoke.yml` 是手动 release gate。GitHub `staging` environment 至少配置：
 
@@ -174,7 +218,7 @@ Production 每个 API key 都必须有 stable `user_id` 和 tenant scope 或 `ad
 
 Workflow 以 production mode 启动真实 PostgreSQL/Qdrant/API/worker，运行 `eval/staging_smoke.py`，覆盖 local_fs、Web、PDF、Git、hybrid search、Agent `/chat` 和 ACL negative isolation。
 
-## 11. 安装
+## 12. 安装
 
 ```bash
 # minimal
@@ -189,7 +233,7 @@ pip install -r requirements.txt
 
 `pyproject.toml` 是 package metadata source of truth；`requirements.txt` 是 Docker 完整 runtime 集合。
 
-## 12. Production checklist
+## 13. Production checklist
 
 - `RAGBOT_ENV=production`；
 - external PostgreSQL + Qdrant；
@@ -197,8 +241,9 @@ pip install -r requirements.txt
 - `RAGBOT_INGESTION_MODE=worker` + 至少一个 durable worker；
 - scoped API-key principals；
 - source roots/egress allowlist；
+- Agent SQL 默认关闭；若启用则 isolated read-only DSN + schema allowlist + DB-native tenancy；
 - TLS、rate limit、secret management；
+- Prometheus/OTLP 监控接入；
 - PostgreSQL backup/restore 与 Qdrant snapshot/restore 实测；
-- immutable application/container release reference；
 - embedding reindex、migration、rollback runbook；
 - CI + manual staging smoke 均通过后才发布 `v1.0.0`。
