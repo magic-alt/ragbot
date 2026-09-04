@@ -15,6 +15,16 @@ from .observability.prometheus import observe_http
 logger = logging.getLogger(__name__)
 
 
+def _metric_path(request: Request) -> str:
+    route = request.scope.get("route")
+    template = getattr(route, "path", None)
+    if isinstance(template, str) and template:
+        return template
+    # Unmatched/error paths can still contain unbounded user input. Collapse
+    # them rather than creating one Prometheus label value per literal URL.
+    return "__unmatched__"
+
+
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     """Logs request_id/method/path/status/latency and records Prometheus metrics."""
 
@@ -29,7 +39,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             status = response.status_code
         finally:
             latency_seconds = max(0.0, time.perf_counter() - start)
-            observe_http(request.method, request.url.path, status, latency_seconds)
+            observe_http(request.method, _metric_path(request), status, latency_seconds)
 
         latency_ms = int(latency_seconds * 1000)
         client_ip = request.client.host if request.client else "-"
