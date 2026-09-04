@@ -38,6 +38,7 @@ from .routes.openai_compat import create_openai_compat_endpoint
 from .routes.quick_import import create_quick_import_router
 from .routes.search import create_search_endpoint
 from .routes.sources import create_sources_router
+from .routes.uploads import create_upload_router
 from .runtime import validate_production_environment
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,7 @@ app.include_router(create_openai_compat_endpoint(_get_services, verify_api_key))
 app.include_router(create_sources_router(_get_services, verify_api_key))
 app.include_router(create_ingest_router(_get_services, verify_api_key))
 app.include_router(create_quick_import_router(_get_services, verify_api_key))
+app.include_router(create_upload_router(_get_services, verify_api_key))
 app.include_router(create_control_plane_router(_get_services, verify_api_key))
 app.include_router(create_admin_ui_router())
 
