@@ -50,6 +50,7 @@ def run_ingest_pipeline(
     """
     now = datetime.now(timezone.utc).isoformat()
     job_id = job_id or uuid.uuid4().hex
+    embedding_model, embedding_dimension = _embedding_identity(embedder, qdrant)
 
     persisted_source = repo.get_source(source.source_id)
     current_job = repo.get_job(job_id) if existing_job else None
@@ -97,7 +98,13 @@ def run_ingest_pipeline(
         # remote metadata, reuse unchanged documents and download only changed
         # content while still returning a complete replacement snapshot.
         candidate_chunks = list(_run_connector(source, repo, previous_chunks.values()))
-        _normalize_chunk_metadata(source, candidate_chunks, now)
+        _normalize_chunk_metadata(
+            source,
+            candidate_chunks,
+            now,
+            embedding_model=embedding_model,
+            embedding_dimension=embedding_dimension,
+        )
         candidate_chunks = _dedup_chunks(candidate_chunks)
         current_chunks, chunks_to_write, chunks_reused = _reuse_unchanged_chunks(
             candidate_chunks, previous_chunks.values()
@@ -134,6 +141,8 @@ def run_ingest_pipeline(
         stats.update({
             "doc_ids": doc_ids,
             "source_generation": expected_generation,
+            "embedding_model": embedding_model,
+            "embedding_dimension": embedding_dimension,
             "chunks_total": len(current_chunks),
             "chunks_ingested": len(chunks_to_write),
             "chunks_reused": chunks_reused,
@@ -155,7 +164,7 @@ def run_ingest_pipeline(
             lease_expires_at=None,
         )
         logger.info(
-            "Pipeline completed: job=%s source=%s documents=%d chunks_total=%d written=%d reused=%d removed=%d",
+            "Pipeline completed: job=%s source=%s documents=%d chunks_total=%d written=%d reused=%d removed=%d embedding=%s/%d",
             job_id,
             source.source_id,
             len(documents),
@@ -163,6 +172,8 @@ def run_ingest_pipeline(
             len(chunks_to_write),
             chunks_reused,
             chunks_removed,
+            embedding_model,
+            embedding_dimension,
         )
     except SourceFenceError as exc:
         logger.warning("Pipeline fenced: job=%s source=%s error=%s", job_id, source.source_id, exc)
@@ -343,13 +354,29 @@ def _resolve_acl_hash(source: Source, repo: Repo) -> str:
     return "public"
 
 
-def _normalize_chunk_metadata(source: Source, chunks: list[Chunk], now: str) -> None:
+def _embedding_identity(embedder: Optional[Embedder], qdrant: object) -> tuple[str, int]:
+    dimension = int(getattr(embedder, "dimension", getattr(qdrant, "dim", 64)))
+    model = str(getattr(embedder, "model_name", f"hash-{dimension}"))
+    return model, dimension
+
+
+def _normalize_chunk_metadata(
+    source: Source,
+    chunks: list[Chunk],
+    now: str,
+    embedding_model: Optional[str] = None,
+    embedding_dimension: Optional[int] = None,
+) -> None:
     for chunk in chunks:
         metadata = dict(chunk.metadata or {})
         metadata["source_type"] = source.source_type
         metadata["tags"] = list(source.tags)
         metadata.setdefault("version", source.config.get("version", "1.0"))
         metadata["lexical_version"] = LEXICAL_VERSION
+        if embedding_model:
+            metadata["embedding_model"] = embedding_model
+        if embedding_dimension is not None:
+            metadata["embedding_dimension"] = int(embedding_dimension)
         metadata["ingested_at"] = now
         metadata["doc_updated_at"] = now
         chunk.metadata = metadata
@@ -410,6 +437,8 @@ def _reuse_key(chunk: Chunk) -> tuple:
         metadata.get("version"),
         metadata.get("remote_version"),
         metadata.get("lexical_version"),
+        metadata.get("embedding_model"),
+        metadata.get("embedding_dimension"),
     )
 
 
