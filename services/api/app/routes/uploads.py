@@ -104,6 +104,7 @@ def create_upload_router(get_services: Callable, auth_dep: Any) -> APIRouter:
                     reuse_source=False,
                 ),
                 services=services,
+                allow_managed_upload=True,
             )
         except Exception:
             services.repo.update_uploaded_object(
