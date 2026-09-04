@@ -41,13 +41,7 @@ def run_ingest_pipeline(
     existing_job: bool = False,
     expected_source_generation: Optional[str] = None,
 ) -> IngestionJob:
-    """Execute one replacement-oriented ingestion run for ``source``.
-
-    The Source lifecycle token is checked before and after publish-sensitive
-    phases. Existing durable Jobs use the generation captured at submission;
-    direct pipeline calls use the repository's persisted Source generation so
-    database-generated timestamps cannot create a false fence mismatch.
-    """
+    """Execute one replacement-oriented ingestion run for ``source``."""
     now = datetime.now(timezone.utc).isoformat()
     job_id = job_id or uuid.uuid4().hex
     embedding_model, embedding_dimension = _embedding_identity(embedder, qdrant)
@@ -94,9 +88,6 @@ def run_ingest_pipeline(
             for chunk in repo.list_chunks(doc_id)
         }
 
-        # Cloud/SaaS connectors receive the previous snapshot so they can list
-        # remote metadata, reuse unchanged documents and download only changed
-        # content while still returning a complete replacement snapshot.
         candidate_chunks = list(_run_connector(source, repo, previous_chunks.values()))
         _normalize_chunk_metadata(
             source,
@@ -110,7 +101,6 @@ def run_ingest_pipeline(
             candidate_chunks, previous_chunks.values()
         )
 
-        # A connector can be slow; re-check immediately before the first write.
         assert_source_fence(source, repo, expected_generation)
         documents = _ensure_documents(source, repo, current_chunks)
         if chunks_to_write:
@@ -130,9 +120,6 @@ def run_ingest_pipeline(
         _delete_qdrant_documents(qdrant, removed_doc_ids)
         documents_removed = repo.delete_documents(removed_doc_ids)
 
-        # If a delete/update raced with the write phase, do not publish a false
-        # completed state. A delete handler tombstones before its final purge,
-        # so the normal race resolves to a fenced failure plus clean knowledge.
         assert_source_fence(source, repo, expected_generation)
 
         doc_ids = [doc.doc_id for doc in documents]
@@ -143,6 +130,7 @@ def run_ingest_pipeline(
             "source_generation": expected_generation,
             "embedding_model": embedding_model,
             "embedding_dimension": embedding_dimension,
+            "chunking_contracts": _chunking_contracts(current_chunks),
             "chunks_total": len(current_chunks),
             "chunks_ingested": len(chunks_to_write),
             "chunks_reused": chunks_reused,
@@ -265,6 +253,7 @@ def _run_connector(source: Source, repo: Repo, previous_chunks: Iterable[Chunk] 
         version=config.get("version", "1.0"),
         tags=source.tags,
         acl_hash=_resolve_acl_hash(source, repo),
+        chunking=config.get("chunking"),
     )
 
     if source_type == "pdf":
@@ -277,10 +266,21 @@ def _run_connector(source: Source, repo: Repo, previous_chunks: Iterable[Chunk] 
         )
     if source_type == "web":
         from services.worker.jobs.ingest_web import ingest_web
-        return ingest_web(url=config["url"], **common)
+        return ingest_web(
+            url=config["url"],
+            chunk_size=int(config.get("chunk_size", 800)),
+            chunk_overlap=int(config.get("chunk_overlap", 100)),
+            **common,
+        )
     if source_type == "repo":
         from services.worker.jobs.ingest_repo import ingest_repo
-        return ingest_repo(url_or_path=config["path"], ref=config.get("ref"), **common)
+        return ingest_repo(
+            url_or_path=config["path"],
+            ref=config.get("ref"),
+            chunk_size=int(config.get("chunk_size", 600)),
+            chunk_overlap=int(config.get("chunk_overlap", 100)),
+            **common,
+        )
     if source_type == "local_fs":
         from services.worker.jobs.ingest_text import ingest_local_fs
         return ingest_local_fs(
@@ -437,9 +437,34 @@ def _reuse_key(chunk: Chunk) -> tuple:
         metadata.get("version"),
         metadata.get("remote_version"),
         metadata.get("lexical_version"),
+        metadata.get("parser_provider"),
+        metadata.get("parser_version"),
+        metadata.get("chunker_provider"),
+        metadata.get("chunker_strategy"),
+        metadata.get("chunker_version"),
+        metadata.get("chunker_config_hash"),
         metadata.get("embedding_model"),
         metadata.get("embedding_dimension"),
     )
+
+
+def _chunking_contracts(chunks: Iterable[Chunk]) -> list[dict[str, object]]:
+    contracts: dict[str, dict[str, object]] = {}
+    for chunk in chunks:
+        metadata = chunk.metadata or {}
+        config_hash = str(metadata.get("chunker_config_hash") or "")
+        if not config_hash or config_hash in contracts:
+            continue
+        contracts[config_hash] = {
+            "provider": metadata.get("chunker_provider"),
+            "strategy": metadata.get("chunker_strategy"),
+            "version": metadata.get("chunker_version"),
+            "config_hash": config_hash,
+            "chunk_size": metadata.get("chunk_size"),
+            "chunk_overlap": metadata.get("chunk_overlap"),
+            "language": metadata.get("chunker_language"),
+        }
+    return list(contracts.values())
 
 
 def _ensure_documents(source: Source, repo: Repo, chunks: list[Chunk]) -> list[Document]:
