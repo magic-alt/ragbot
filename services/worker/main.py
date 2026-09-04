@@ -161,6 +161,10 @@ def _execute_claimed_job(
     )
     heartbeat_thread.start()
     try:
+        # Preserve the established six-argument pipeline call contract. The
+        # pipeline reads the durable Job generation snapshot itself; avoiding a
+        # new positional argument keeps tests/extensions that monkeypatch the
+        # pipeline callable source-compatible.
         result = run_ingest_pipeline(
             source,
             services.repo,
@@ -168,7 +172,6 @@ def _execute_claimed_job(
             job.job_id,
             services.embedder,
             True,
-            expected_generation,
         )
         if result.status == "failed":
             classification = classify_persisted_failure(result.error)
