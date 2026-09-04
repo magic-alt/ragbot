@@ -7,6 +7,7 @@ from typing import Any, Optional
 from .agent.graph import AgentServices
 from .agent.nodes.code import CodeSearch
 from .agent.nodes.sql import PostgresSqlEngine, SqlEngine
+from .agent.sql_disabled import DisabledSqlEngine
 from .llm.provider import build_model_provider
 from .retrieval.cross_encoder import build_reranker
 from .retrieval.embedder import HashEmbedder, build_embedder
@@ -16,6 +17,13 @@ from .runtime import is_production, validate_production_environment
 from .storage.repo import InMemoryRepo
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
@@ -71,21 +79,34 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
     reranker = build_reranker()
     retriever = Retriever(repo, qdrant, embedder=embedder, reranker=reranker)
 
-    if postgres_dsn:
-        allowed_schemas_raw = os.getenv("POSTGRES_ALLOWED_SCHEMAS")
-        allowed_schemas = (
-            [s.strip() for s in allowed_schemas_raw.split(",") if s.strip()]
-            if allowed_schemas_raw
-            else None
-        )
-        sql_engine = PostgresSqlEngine(
-            dsn=postgres_dsn,
-            allowed_schemas=allowed_schemas,
-            limit=int(os.getenv("POSTGRES_SQL_LIMIT", "200")),
-            timeout_ms=int(os.getenv("POSTGRES_SQL_TIMEOUT_MS", "3000")),
-        )
+    sql_enabled = _env_flag("RAGBOT_SQL_TOOL_ENABLED", False)
+    if sql_enabled:
+        sql_dsn = (os.getenv("RAGBOT_SQL_DSN") or "").strip()
+        if postgres_dsn and not sql_dsn and not is_production():
+            # Development-only compatibility: production validation forbids this
+            # implicit reuse because the control-plane database is not a tenant-
+            # safe Agent query surface.
+            sql_dsn = postgres_dsn
+        if sql_dsn:
+            allowed_schemas_raw = os.getenv("RAGBOT_SQL_ALLOWED_SCHEMAS", "")
+            allowed_schemas = [
+                s.strip() for s in allowed_schemas_raw.split(",") if s.strip()
+            ] or None
+            sql_engine = PostgresSqlEngine(
+                dsn=sql_dsn,
+                allowed_schemas=allowed_schemas,
+                limit=int(os.getenv("RAGBOT_SQL_LIMIT", "200")),
+                timeout_ms=int(os.getenv("RAGBOT_SQL_TIMEOUT_MS", "3000")),
+            )
+        elif isinstance(repo, InMemoryRepo):
+            sql_engine = SqlEngine(repo)
+        else:
+            raise RuntimeError(
+                "RAGBOT_SQL_TOOL_ENABLED=true requires RAGBOT_SQL_DSN "
+                "or an in-memory development repository"
+            )
     else:
-        sql_engine = SqlEngine(repo)
+        sql_engine = DisabledSqlEngine()
 
     repo_root = os.getenv("CODE_REPO_ROOT", ".")
     code_search = CodeSearch(repo_roots={"default": repo_root})
