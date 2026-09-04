@@ -64,6 +64,35 @@ def test_resolve_runtime_mode_prefers_live_docker_when_saved_local_is_stale(monk
     assert MODULE._resolve_runtime_mode({"mode": "local"}) == "docker"
 
 
+def test_docker_postgres_host_port_reads_compose_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(MODULE, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        MODULE.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="127.0.0.1:49173\n",
+            stderr="",
+        ),
+    )
+
+    assert MODULE._docker_postgres_host_port() == 49173
+
+
+def test_competing_host_python_client_blocks_docker_submission(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(MODULE, "_docker_postgres_host_port", lambda: 49173)
+    monkeypatch.setattr(
+        MODULE,
+        "_host_postgres_python_clients",
+        lambda _port: ["Python 4242 kaermax 12u IPv4 TCP 127.0.0.1:60000->127.0.0.1:49173"],
+    )
+
+    with pytest.raises(MODULE.UserError, match="Competing host Python process"):
+        MODULE._assert_no_competing_host_worker()
+
+
 def test_docker_source_contract_probes_worker_container_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -77,7 +106,7 @@ def test_docker_source_contract_probes_worker_container_path(
 
     def fake_run(command, **kwargs):
         captured.append((command, kwargs))
-        return SimpleNamespace(returncode=0, stdout='{"allowed": true, "is_file": true}', stderr="")
+        return SimpleNamespace(returncode=0, stdout='{"checks": [{"allowed": true, "is_file": true}]}', stderr="")
 
     monkeypatch.setattr(MODULE.subprocess, "run", fake_run)
     MODULE._docker_source_contract(pdf)
@@ -87,6 +116,29 @@ def test_docker_source_contract_probes_worker_container_path(
     assert command[-1] == "/data/manuals/guide.pdf"
     assert kwargs["cwd"] == tmp_path
     assert kwargs["capture_output"] is True
+
+
+def test_docker_source_contract_probes_every_pdf_in_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data"
+    first = data / "a.pdf"
+    second = data / "nested" / "b.pdf"
+    second.parent.mkdir(parents=True)
+    first.write_bytes(b"pdf")
+    second.write_bytes(b"pdf")
+    monkeypatch.setattr(MODULE, "DATA_DIR", data)
+    monkeypatch.setattr(MODULE, "ROOT", tmp_path)
+    captured = []
+
+    def fake_run(command, **kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout='{"checks": []}', stderr="")
+
+    monkeypatch.setattr(MODULE.subprocess, "run", fake_run)
+    MODULE._docker_source_contract([first, second])
+
+    assert captured[0][-2:] == ["/data/a.pdf", "/data/nested/b.pdf"]
 
 
 def test_docker_source_contract_fails_early_with_recreate_command(
@@ -104,7 +156,7 @@ def test_docker_source_contract_fails_early_with_recreate_command(
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=3,
-            stdout='{"allowed": false, "allowed_roots": ["/old-data"], "is_file": false}',
+            stdout='{"checks": [{"allowed": false, "allowed_roots": ["/old-data"], "is_file": false}]}',
             stderr="",
         ),
     )
