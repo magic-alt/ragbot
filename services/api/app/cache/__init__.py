@@ -1,1 +1,1 @@
-"""Caching layer for ragbot: retrieval cache and embedding cache."""
+"""Experimental local cache primitives; not part of the Ragbot runtime path."""
