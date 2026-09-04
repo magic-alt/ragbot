@@ -94,13 +94,12 @@ async def run_agent(
     request_id: Optional[str] = None,
     callback: Optional[EventCallback] = None,
     initial_evidence: Optional[list] = None,
+    conversation_messages: Optional[List[Dict[str, str]]] = None,
+    system_prompt: Optional[str] = None,
+    generation_temperature: float = 0.2,
+    generation_max_tokens: Optional[int] = None,
 ) -> AgentState:
-    """Run the agent graph and always terminate the event stream.
-
-    Event callbacks are closed in ``finally`` so SSE consumers cannot hang if a
-    provider/tool raises before finalization. Error events intentionally expose
-    only a stable public message; the original exception remains server-side.
-    """
+    """Run the agent graph and always terminate the event stream."""
     cb = callback or NullCallback()
     state = build_initial_state(
         query=query,
@@ -109,6 +108,10 @@ async def run_agent(
         session_id=session_id,
         constraints=constraints,
         request_id=request_id,
+        conversation_messages=conversation_messages,
+        system_prompt=system_prompt,
+        generation_temperature=generation_temperature,
+        generation_max_tokens=generation_max_tokens,
     )
     tracer = RequestTracer(request_id=state.request_id)
 
