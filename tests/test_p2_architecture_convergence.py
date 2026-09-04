@@ -126,8 +126,14 @@ def test_agent_events_are_exposed_as_prometheus_counters_and_histograms() -> Non
     assert "ragbot_agent_feedback_total" in text
 
 
-def test_admin_cache_surface_is_removed() -> None:
+def test_admin_cache_surface_is_retired_tombstone() -> None:
+    from fastapi.testclient import TestClient
     from services.api.app.api import app
 
-    paths = {route.path for route in app.routes}
-    assert "/admin/cache" not in paths
+    response = TestClient(app).get("/admin/cache")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["enabled"] is False
+    assert payload["retired"] is True
+    assert payload["retrieval"] == {"supported": False, "runtime_wired": False}
+    assert payload["embedding"] == {"supported": False, "runtime_wired": False}
