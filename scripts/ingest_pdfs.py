@@ -25,6 +25,7 @@ TMP_DIR = ROOT / "tmp"
 STATE_FILE = TMP_DIR / "ragbot-runtime.json"
 LOCAL_PID = TMP_DIR / "ragbot-local.pid"
 MAX_BATCH_SIZE = 100
+UPLOAD_ENDPOINT = "/ingest/upload/pdf"
 
 
 class UserError(RuntimeError):
@@ -129,10 +130,52 @@ def _request_json(url: str, *, api_key: str | None = None, timeout: float = 60.0
             raw = response.read().decode("utf-8")
     except Exception as exc:
         raise UserError(f"Could not query Ragbot API: {url}: {exc}") from exc
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise UserError(f"Expected JSON from {url}") from exc
     if not isinstance(data, dict):
         raise UserError(f"Expected JSON object from {url}")
     return data
+
+
+def _runtime_restart_command(mode: str) -> str:
+    resolved = mode if mode in {"local", "docker"} else "auto"
+    return f"python3 scripts/ragbot.py restart --mode {resolved}"
+
+
+def _assert_upload_transport_available(
+    server: str,
+    *,
+    api_key: str | None,
+    mode: str,
+) -> None:
+    """Fail before reading PDF bodies when the running API is from an older revision.
+
+    Readiness alone proves that dependencies are healthy; it does not prove that
+    a controller/CLI and a long-lived API container expose the same product
+    contract. OpenAPI is the authoritative runtime surface and is available on
+    both local and Docker FastAPI deployments.
+    """
+    openapi_url = f"{server.rstrip('/')}/openapi.json"
+    try:
+        spec = _request_json(openapi_url, api_key=api_key, timeout=15.0)
+    except UserError as exc:
+        raise UserError(
+            "Ragbot is reachable but its API contract could not be verified before PDF upload. "
+            f"Recreate the {mode} runtime with `{_runtime_restart_command(mode)}` and retry. "
+            f"Contract probe error: {exc}"
+        ) from exc
+
+    paths = spec.get("paths")
+    route = paths.get(UPLOAD_ENDPOINT) if isinstance(paths, dict) else None
+    if not isinstance(route, dict) or "post" not in {str(method).lower() for method in route}:
+        raise UserError(
+            "Ragbot API is READY but does not expose POST /ingest/upload/pdf. "
+            "The local controller/CLI and the running API are from different revisions "
+            "(typically a stale Docker image/container after git pull). "
+            f"Rebuild and recreate it with `{_runtime_restart_command(mode)}`, then retry ingestion."
+        )
 
 
 def _upload_pdf(
@@ -156,7 +199,7 @@ def _upload_pdf(
         query.append(("chunk_size", str(chunk_size)))
     if chunk_overlap is not None:
         query.append(("chunk_overlap", str(chunk_overlap)))
-    endpoint = f"{parsed.path.rstrip('/')}/ingest/upload/pdf?{urlencode(query)}"
+    endpoint = f"{parsed.path.rstrip('/')}{UPLOAD_ENDPOINT}?{urlencode(query)}"
     connection_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
     connection = connection_cls(parsed.hostname, parsed.port, timeout=timeout)
     size = path.stat().st_size
@@ -176,6 +219,11 @@ def _upload_pdf(
                 connection.send(chunk)
         response = connection.getresponse()
         raw = response.read().decode("utf-8", errors="replace")
+        if response.status == 404:
+            raise UserError(
+                "PDF upload endpoint disappeared after the preflight contract check. "
+                "The API was likely replaced by a stale/different replica; recreate the runtime and retry."
+            )
         if response.status >= 400:
             raise UserError(f"PDF upload failed: HTTP {response.status}: {raw[:1200]}")
         data = json.loads(raw)
@@ -266,6 +314,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             for path in pdfs:
                 print(path.relative_to(DATA_DIR.resolve()).as_posix())
             return 0
+
+        _assert_upload_transport_available(
+            server,
+            api_key=args.api_key,
+            mode=mode,
+        )
+        print("Upload API contract: compatible")
 
         failures = 0
         completed = 0
