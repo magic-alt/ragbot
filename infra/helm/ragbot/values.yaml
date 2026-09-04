@@ -48,6 +48,8 @@ worker:
   retryMaxSeconds: "300"
   reconcileSeconds: "30"
   schedulerScanSeconds: "30"
+  publicationOutboxScanSeconds: "5"
+  publicationOutboxMaxAttempts: "10"
   providerMaxAttempts: "4"
   providerBackoffBaseSeconds: "0.5"
   providerBackoffMaxSeconds: "30"
