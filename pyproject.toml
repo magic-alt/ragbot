@@ -35,6 +35,7 @@ observability = [
     "prometheus-client>=0.20",
 ]
 benchmark-frameworks = [
+    "langchain-core>=0.3",
     "langchain-text-splitters>=0.3",
     "llama-index-core>=0.12",
 ]
