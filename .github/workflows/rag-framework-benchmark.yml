@@ -13,6 +13,7 @@ on:
       - "services/api/app/retrieval/service.py"
       - "tests/test_rag_framework_compare_benchmark.py"
       - "tests/test_rag_native_compare_benchmark.py"
+      - "tests/test_rag_benchmark_script.py"
       - "tests/test_document_transformations.py"
       - "tests/test_retrieval_parallel.py"
       - "docs/RAG_FRAMEWORK_BENCHMARK.md"
@@ -53,6 +54,7 @@ jobs:
           python -m pytest -q \
             tests/test_rag_framework_compare_benchmark.py \
             tests/test_rag_native_compare_benchmark.py \
+            tests/test_rag_benchmark_script.py \
             tests/test_document_transformations.py \
             tests/test_retrieval_parallel.py
 
