@@ -70,7 +70,15 @@ python .\scripts\verify_ragbot.py `
 
 If scoped API principals are enabled, use a tenant that the key can operate and pass the key with `RAGBOT_API_KEY` or `--api-key`.
 
-`--pytest auto` is the default. It runs pytest when installed and otherwise marks the functional suite as skipped. Use `--pytest on` for a release-grade run; a missing pytest installation then fails the overall gate instead of silently skipping it.
+### Functional-test Python environment
+
+The quality gate must be runnable from a machine where Ragbot was deployed but development test dependencies were never installed. The policies are therefore:
+
+- `--pytest auto` (default): run the functional suite only when an existing Python environment already has pytest; never install packages.
+- `--pytest on`: release-grade behavior. Prefer the repository `.venv`; if pytest is unavailable, create/repair `.venv` and install `.[dev,postgres,qdrant,worker,s3,saas,observability]`, matching the functional dependency surface used by GitHub CI. The system/Homebrew Python is not modified.
+- `--pytest off`: skip the repository functional suite and run only the live/domain RAG gates.
+
+This means the recommended `--pytest on` command is self-contained after deployment: a missing local pytest installation no longer causes a false overall failure before the RAG quality result is considered.
 
 ## Measure your real document corpus
 
