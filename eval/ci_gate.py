@@ -1,4 +1,4 @@
-"""CI gate for evaluation quality.
+"""CI gate for in-process agent evaluation quality.
 
 Usage:
     python -m eval.ci_gate --threshold 0.70 --dataset full
@@ -7,6 +7,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import sys
@@ -50,44 +51,47 @@ def main() -> None:
         help="Path to write detailed results JSON",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Enable verbose logging",
     )
     args = parser.parse_args()
+
+    if not 0.0 <= args.threshold <= 1.0:
+        parser.error("--threshold must be between 0.0 and 1.0")
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Load dataset
-    if args.dataset == "full":
-        cases = build_full_dataset()
-    else:
-        cases = build_sample_dataset()
-
+    cases = (
+        build_full_dataset()
+        if args.dataset == "full"
+        else build_sample_dataset()
+    )
     logger.info("Loaded %d evaluation cases (dataset=%s)", len(cases), args.dataset)
 
-    # Run evaluation
-    results = run_eval_suite(
-        cases,
-        category_filter=args.category,
-        tag_filter=args.tag,
+    # run_eval_suite is async. The old CLI passed the coroutine object directly
+    # into summarize_results, making the advertised CI gate unusable.
+    results = asyncio.run(
+        run_eval_suite(
+            cases,
+            category_filter=args.category,
+            tag_filter=args.tag,
+        )
     )
-
-    # Summarize
     summary = summarize_results(results)
 
-    # Output
     print("\n" + "=" * 60)
     print("EVALUATION RESULTS")
     print("=" * 60)
     print(f"Total:       {summary['total']}")
     print(f"Passed:      {summary['passed']}")
     print(f"Failed:      {summary['failed']}")
-    print(f"Pass rate:   {summary['pass_rate']:.1%}")
-    print(f"Avg latency: {summary['avg_duration_ms']:.0f}ms")
+    print(f"Pass rate:   {summary.get('pass_rate', 0.0):.1%}")
+    print(f"Avg latency: {summary.get('avg_duration_ms', 0.0):.0f}ms")
     if summary.get("retrieval_eval_count", 0) > 0:
         print(f"MRR@10:      {summary['avg_mrr_at_10']:.4f}")
         print(f"Recall@10:   {summary['avg_recall_at_10']:.4f}")
@@ -95,41 +99,40 @@ def main() -> None:
 
     if summary.get("by_category"):
         print("By category:")
-        for cat, stats in summary["by_category"].items():
+        for category, stats in summary["by_category"].items():
             rate = stats["passed"] / stats["total"] if stats["total"] else 0
-            print(f"  {cat}: {stats['passed']}/{stats['total']} ({rate:.0%})")
+            print(
+                f"  {category}: {stats['passed']}/{stats['total']} ({rate:.0%})"
+            )
         print()
 
     if summary.get("failure_categories"):
         print("Failure breakdown:")
-        for fcat, count in summary["failure_categories"].items():
-            print(f"  {fcat}: {count}")
+        for failure_category, count in summary["failure_categories"].items():
+            print(f"  {failure_category}: {count}")
         print()
 
-    # Write detailed results
     if args.output:
         from dataclasses import asdict
+
         data = {
             "summary": summary,
-            "results": [asdict(r) for r in results],
+            "results": [asdict(result) for result in results],
         }
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        with open(args.output, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
         logger.info("Detailed results written to %s", args.output)
 
-    # Gate check
-    threshold = args.threshold
-    pass_rate = summary["pass_rate"]
-
+    pass_rate = float(summary.get("pass_rate") or 0.0)
     print("=" * 60)
-    if pass_rate >= threshold:
-        print(f"GATE PASSED: {pass_rate:.1%} >= {threshold:.1%}")
+    if pass_rate >= args.threshold:
+        print(f"GATE PASSED: {pass_rate:.1%} >= {args.threshold:.1%}")
         print("=" * 60)
-        sys.exit(0)
-    else:
-        print(f"GATE FAILED: {pass_rate:.1%} < {threshold:.1%}")
-        print("=" * 60)
-        sys.exit(1)
+        raise SystemExit(0)
+
+    print(f"GATE FAILED: {pass_rate:.1%} < {args.threshold:.1%}")
+    print("=" * 60)
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":
