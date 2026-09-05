@@ -5,14 +5,19 @@ on:
   pull_request:
     paths:
       - "benchmarks/rag_framework_compare.py"
+      - "benchmarks/rag_native_compare.py"
+      - "scripts/rag_benchmark.py"
       - "services/worker/chunking/**"
       - "services/worker/jobs/**"
       - "services/worker/connectors/incremental.py"
       - "services/api/app/retrieval/service.py"
       - "tests/test_rag_framework_compare_benchmark.py"
+      - "tests/test_rag_native_compare_benchmark.py"
+      - "tests/test_rag_benchmark_script.py"
       - "tests/test_document_transformations.py"
       - "tests/test_retrieval_parallel.py"
       - "docs/RAG_FRAMEWORK_BENCHMARK.md"
+      - "docs/GOLDEN_DATASET_BENCHMARK.md"
       - "docs/DOCUMENT_TRANSFORMATIONS.md"
       - "pyproject.toml"
       - ".github/workflows/rag-framework-benchmark.yml"
@@ -42,12 +47,14 @@ jobs:
       - name: Install benchmark and adapter dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,worker,document-transformers]"
+          python -m pip install -e ".[dev,worker,benchmark-frameworks]"
 
       - name: Run transformation and retrieval regression tests
         run: |
           python -m pytest -q \
             tests/test_rag_framework_compare_benchmark.py \
+            tests/test_rag_native_compare_benchmark.py \
+            tests/test_rag_benchmark_script.py \
             tests/test_document_transformations.py \
             tests/test_retrieval_parallel.py
 
@@ -61,10 +68,26 @@ jobs:
             --chunk-overlap 60 \
             --output rag-framework-benchmark.json
 
-      - name: Upload benchmark result
+      - name: Run native LangChain and LlamaIndex retrieval smoke
+        run: |
+          python -m benchmarks.rag_native_compare \
+            --backends langchain,llamaindex \
+            --embedding hash \
+            --hash-dimension 128 \
+            --synthetic-documents 24 \
+            --synthetic-queries 12 \
+            --chunk-size 400 \
+            --chunk-overlap 60 \
+            --top-k 10 \
+            --output-dir reports/rag-benchmark/native
+
+      - name: Upload benchmark results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rag-framework-benchmark
-          path: rag-framework-benchmark.json
+          path: |
+            rag-framework-benchmark.json
+            reports/rag-benchmark/native/*.json
+            reports/rag-benchmark/native/*.md
           if-no-files-found: warn
