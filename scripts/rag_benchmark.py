@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Run Ragbot Level 2 Golden Dataset evaluation and Level 3 framework comparison."""
+"""Run Ragbot Level 2 Golden Dataset evaluation and Level 3 framework comparison.
+
+The entry point intentionally imports only the Python standard library until the
+runtime bootstrap has completed. This lets users invoke the command with a bare
+system/Homebrew Python even when Ragbot, requests, LangChain or LlamaIndex are
+installed only in the repository .venv.
+"""
 from __future__ import annotations
 
 import argparse
@@ -15,18 +21,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from benchmarks.rag_native_compare import (
-    audit_golden_dataset,
-    load_corpus_units,
-    load_golden_dataset,
-    markdown_report as native_markdown_report,
-    run_comparison,
-    write_reports as write_native_reports,
-)
-
 DEFAULT_REPORT_DIR = ROOT / "reports" / "rag-benchmark"
 DEFAULT_SERVER = "http://127.0.0.1:8000"
 VENV = ROOT / ".venv"
+BASE_EXTRAS = "worker"
 BENCHMARK_EXTRAS = "worker,benchmark-frameworks"
 
 
@@ -34,11 +32,17 @@ def _venv_python() -> Path:
     return VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def _python_has_frameworks(executable: Path | str) -> bool:
-    probe = "import langchain_core, langchain_text_splitters, llama_index.core"
+def _runtime_probe(require_frameworks: bool) -> str:
+    modules = ["requests"]
+    if require_frameworks:
+        modules.extend(["langchain_core", "langchain_text_splitters", "llama_index.core"])
+    return "; ".join(f"import {module}" for module in modules)
+
+
+def _python_has_runtime(executable: Path | str, *, require_frameworks: bool) -> bool:
     try:
         result = subprocess.run(
-            [str(executable), "-c", probe],
+            [str(executable), "-c", _runtime_probe(require_frameworks)],
             cwd=ROOT,
             check=False,
             stdout=subprocess.DEVNULL,
@@ -49,43 +53,79 @@ def _python_has_frameworks(executable: Path | str) -> bool:
     return result.returncode == 0
 
 
-def _ensure_level3_runtime(argv: Sequence[str], *, bootstrap: bool) -> Optional[int]:
-    """Ensure native framework extras exist, preferring the repository .venv."""
+def _python_has_frameworks(executable: Path | str) -> bool:
+    """Backward-compatible helper used by focused entrypoint tests."""
+    return _python_has_runtime(executable, require_frameworks=True)
+
+
+def _ensure_runtime(
+    argv: Sequence[str],
+    *,
+    require_frameworks: bool,
+    bootstrap: bool,
+) -> Optional[int]:
+    """Ensure required runtime deps exist before importing any Ragbot module.
+
+    Prefer the repository .venv. If the invoking interpreter is missing even a
+    base dependency such as ``requests``, re-execute this script with .venv
+    before importing ``benchmarks.rag_native_compare``. Level 3 additionally
+    requires native LangChain/LlamaIndex benchmark extras.
+    """
     current = Path(sys.executable)
-    if _python_has_frameworks(current):
+    if _python_has_runtime(current, require_frameworks=require_frameworks):
         return None
 
     venv_python = _venv_python()
-    if _python_has_frameworks(venv_python):
+    if _python_has_runtime(venv_python, require_frameworks=require_frameworks):
         if current.resolve() != venv_python.resolve():
-            print(f"[runtime] re-running Level 3 benchmark with {venv_python}")
-            return subprocess.run([str(venv_python), str(Path(__file__).resolve()), *argv], cwd=ROOT, check=False).returncode
+            print(f"[runtime] re-running benchmark with {venv_python}")
+            return subprocess.run(
+                [str(venv_python), str(Path(__file__).resolve()), *argv],
+                cwd=ROOT,
+                check=False,
+            ).returncode
         return None
 
+    extras = BENCHMARK_EXTRAS if require_frameworks else BASE_EXTRAS
     if not bootstrap:
+        requirement = "native framework dependencies" if require_frameworks else "Ragbot runtime dependencies"
         raise RuntimeError(
-            "native framework dependencies are missing; install "
-            f"-e '.[{BENCHMARK_EXTRAS}]' in .venv or omit --no-bootstrap-deps"
+            f"{requirement} are missing; install -e '.[{extras}]' in .venv "
+            "or omit --no-bootstrap-deps"
         )
 
     if not venv_python.exists():
         print(f"[runtime] creating benchmark virtualenv: {VENV}")
-        created = subprocess.run([sys.executable, "-m", "venv", str(VENV)], cwd=ROOT, check=False)
+        created = subprocess.run(
+            [sys.executable, "-m", "venv", str(VENV)], cwd=ROOT, check=False
+        )
         if created.returncode != 0:
             raise RuntimeError(f"could not create {VENV} (exit {created.returncode})")
 
-    print(f"[runtime] installing benchmark dependencies in .venv (extras: {BENCHMARK_EXTRAS})")
+    print(f"[runtime] installing benchmark dependencies in .venv (extras: {extras})")
     install = subprocess.run(
-        [str(venv_python), "-m", "pip", "install", "-e", f".[{BENCHMARK_EXTRAS}]"],
+        [str(venv_python), "-m", "pip", "install", "-e", f".[{extras}]"],
         cwd=ROOT,
         check=False,
     )
-    if install.returncode != 0 or not _python_has_frameworks(venv_python):
+    if install.returncode != 0 or not _python_has_runtime(
+        venv_python, require_frameworks=require_frameworks
+    ):
         raise RuntimeError("benchmark dependency bootstrap failed")
+
     if current.resolve() != venv_python.resolve():
-        print(f"[runtime] re-running Level 3 benchmark with {venv_python}")
-        return subprocess.run([str(venv_python), str(Path(__file__).resolve()), *argv], cwd=ROOT, check=False).returncode
+        print(f"[runtime] re-running benchmark with {venv_python}")
+        return subprocess.run(
+            [str(venv_python), str(Path(__file__).resolve()), *argv],
+            cwd=ROOT,
+            check=False,
+        ).returncode
     return None
+
+
+def _ensure_level3_runtime(argv: Sequence[str], *, bootstrap: bool) -> Optional[int]:
+    """Compatibility wrapper for the Level 3 runtime bootstrap."""
+    return _ensure_runtime(argv, require_frameworks=True, bootstrap=bootstrap)
 
 
 def _runtime_server() -> str:
@@ -178,6 +218,14 @@ def _run_level3(
     enforce_embedding_match: bool,
     report_dir: Path,
 ) -> dict[str, Any]:
+    # Deliberately lazy: project/framework imports happen only after runtime bootstrap.
+    from benchmarks.rag_native_compare import (
+        load_corpus_units,
+        markdown_report as native_markdown_report,
+        run_comparison,
+        write_reports as write_native_reports,
+    )
+
     print("\n[level3] native Ragbot / LangChain / LlamaIndex comparison")
     units = load_corpus_units(corpus_dir)
     report = run_comparison(
@@ -257,8 +305,12 @@ def _write_summary(
     if level3 and level3.get("markdown"):
         lines.append(f"- Level 3 report: `{level3['markdown']}`")
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    (report_dir / "latest-summary.json").write_text(json_path.read_text(encoding="utf-8"), encoding="utf-8")
-    (report_dir / "latest-summary.md").write_text(md_path.read_text(encoding="utf-8"), encoding="utf-8")
+    (report_dir / "latest-summary.json").write_text(
+        json_path.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (report_dir / "latest-summary.md").write_text(
+        md_path.read_text(encoding="utf-8"), encoding="utf-8"
+    )
     return {"json": json_path, "markdown": md_path}
 
 
@@ -284,7 +336,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--corpus-dir",
-        help="Local corpus for Level 3; must match the corpus indexed in live Ragbot",
+        help="Local corpus for Level 3; replace examples with the real directory matching the corpus indexed in Ragbot",
     )
     parser.add_argument("--backends", default="ragbot,langchain,llamaindex")
     parser.add_argument("--embedding", choices=["env", "hash"], default="env")
@@ -302,13 +354,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ragbot-mode", choices=["vector", "lexical", "hybrid"], default="vector")
     parser.add_argument("--rerank", action="store_true")
     parser.add_argument("--no-enforce-embedding-match", action="store_true")
-    parser.add_argument("--no-bootstrap-deps", action="store_true", help="Do not auto-install Level 3 framework extras into .venv")
+    parser.add_argument(
+        "--no-bootstrap-deps",
+        action="store_true",
+        help="Do not auto-install required benchmark dependencies into .venv",
+    )
     parser.add_argument("--report-dir", default=str(DEFAULT_REPORT_DIR))
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = build_parser().parse_args(raw_argv)
     dataset_path = Path(args.dataset)
     if not dataset_path.is_absolute():
         dataset_path = (Path.cwd() / dataset_path).resolve()
@@ -325,22 +382,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("ERROR: --corpus-dir is required for Level 3", file=sys.stderr)
         return 2
 
-    if args.level in {"3", "all"}:
-        try:
-            child_code = _ensure_level3_runtime(
-                list(argv) if argv is not None else sys.argv[1:],
-                bootstrap=not args.no_bootstrap_deps,
-            )
-        except RuntimeError as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            return 2
-        if child_code is not None:
-            return child_code
+    # Critical ordering: bootstrap/re-exec before importing any Ragbot module.
+    try:
+        child_code = _ensure_runtime(
+            raw_argv,
+            require_frameworks=args.level in {"3", "all"},
+            bootstrap=not args.no_bootstrap_deps,
+        )
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if child_code is not None:
+        return child_code
 
     try:
+        from benchmarks.rag_native_compare import audit_golden_dataset, load_golden_dataset
+
         dataset = load_golden_dataset(dataset_path)
         audit = audit_golden_dataset(dataset, args.dataset_profile)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (ImportError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -373,7 +433,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not corpus_dir.is_absolute():
             corpus_dir = (Path.cwd() / corpus_dir).resolve()
         if not corpus_dir.is_dir():
-            print(f"ERROR: corpus directory not found: {corpus_dir}", file=sys.stderr)
+            print(
+                "ERROR: corpus directory not found: "
+                f"{corpus_dir}\n"
+                "Replace the --corpus-dir example placeholder with the real local directory "
+                "containing the same logical documents already indexed in Ragbot.",
+                file=sys.stderr,
+            )
             return 2
         try:
             level3 = _run_level3(
