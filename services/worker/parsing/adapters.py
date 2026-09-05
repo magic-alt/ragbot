@@ -40,7 +40,9 @@ class RagbotParser:
         blocks: list[DocumentBlock] = []
         reader = PdfReader(io.BytesIO(data))
         for page_number, page in enumerate(reader.pages, 1):
-            text = (page.extract_text() or "").strip()
+            # Some PDFs expose unmapped glyphs as NUL. PostgreSQL text/JSONB
+            # cannot store those characters; normalize before chunking/hashing.
+            text = (page.extract_text() or "").replace("\x00", "").strip()
             if text:
                 blocks.append(
                     DocumentBlock(

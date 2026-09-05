@@ -172,8 +172,9 @@ def _assert_upload_transport_available(
     if not isinstance(route, dict) or "post" not in {str(method).lower() for method in route}:
         raise UserError(
             "Ragbot API is READY but does not expose POST /ingest/upload/pdf. "
-            "The local controller/CLI and the running API are from different revisions "
-            "(typically a stale Docker image/container after git pull). "
+            "The local controller/CLI and the reached API are from different revisions. "
+            "This can be a stale image or a local API shadowing Docker's published port on macOS. "
+            "Check `lsof -nP -iTCP:8000 -sTCP:LISTEN` (use your server port) for a conflicting Python API. "
             f"Rebuild and recreate it with `{_runtime_restart_command(mode)}`, then retry ingestion."
         )
 

@@ -62,6 +62,8 @@ Durable queue 唯一实现位于 repository/PostgreSQL lease contract；旧 `ser
 | `EMBEDDING_API_KEY` | `OPENAI_API_KEY` | embedding API key |
 | `EMBEDDING_BASE_URL` | `OPENAI_BASE_URL` | embedding endpoint |
 | `EMBEDDING_ALLOW_ANONYMOUS` | `false` | 显式允许无认证的远端 embedding endpoint；localhost/loopback/`host.docker.internal` 自动允许 |
+| `EMBEDDING_TIMEOUT_SECONDS` | `30` | 每批 embedding HTTP 请求超时（正整数秒）；本机大模型可设为 `300` |
+| `EMBEDDING_BATCH_SIZE` | `100` | 每次 embedding 请求的文本数（正整数）；本机大模型可设为 `8` |
 | `EMBEDDING_QUERY_INSTRUCTION` | model default | query-side retrieval instruction；Qwen3 Embedding 自动提供默认 instruction |
 | `QDRANT_URL` | empty | development 为空时 InMemoryQdrant |
 | `QDRANT_API_KEY` | empty | Qdrant API key |

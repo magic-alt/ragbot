@@ -25,6 +25,53 @@ docker compose up -d --build
 
 Both Compose variants set `RAGBOT_INGESTION_MODE=worker` and now expose the same durable retry/reconcile/provider retry settings.
 
+### macOS Docker Desktop with host Ollama
+
+When Ollama runs on the Mac, set the following in `.env` (the model must already
+be installed in Ollama):
+
+```dotenv
+RAGBOT_LLM_PROVIDER=ollama
+RAGBOT_DOCKER_OLLAMA_BASE_URL=http://host.docker.internal:11434
+EMBEDDING_MODEL=qwen3-embedding:8b
+EMBEDDING_BASE_URL=http://host.docker.internal:11434
+EMBEDDING_TIMEOUT_SECONDS=300
+EMBEDDING_BATCH_SIZE=8
+QDRANT_DIM=4096
+QDRANT_COLLECTION=rag_chunks_qwen3_8b_4096
+```
+
+Set `OLLAMA_MODEL` separately to your installed chat model. The Docker Ollama
+URL defaults to `http://ollama:11434` for the optional container profile;
+`RAGBOT_DOCKER_OLLAMA_BASE_URL` selects the host installation. Setting only
+`OLLAMA_BASE_URL` does not configure the embedding endpoint. API and worker
+must use the same embedding model, dimension and collection. A model/dimension
+change requires re-ingesting the corpus into a compatible collection; keep the
+old collection until that work is verified.
+
+```bash
+python3 scripts/ragbot.py restart --mode docker
+python3 scripts/ragbot.py ingest data/ --tenant engineering --type pdf
+```
+
+Docker Desktop can publish port 8000 while an older local Python API still owns
+`127.0.0.1:8000`. In that case the CLI reaches the old API even after rebuilding
+Docker, and may report a missing `/ingest/upload/pdf` route. The controller now
+stops a verified local API recorded in its PID file before Docker startup and
+compares `/admin/runtime` boot IDs through the container and host addresses
+before recording a successful Docker runtime. If an unmanaged process conflicts,
+inspect `lsof -nP -iTCP:8000 -sTCP:LISTEN`, stop the conflicting API, or choose
+`--port 8001`. Readiness alone does not establish which process the CLI reaches.
+
+The shared image's HTTP healthcheck applies to the API. Worker and migration
+services disable that inherited check because they have no HTTP listener;
+inspect worker logs and durable job completion to verify ingestion.
+
+PDF uploads default to a 25 MiB limit. For larger documents, set
+`RAGBOT_PDF_MAX_BYTES=67108864` (64 MiB) in `.env` and recreate the services with
+the controller before retrying the affected file. An HTTP 413 response indicates
+this upload limit, rather than an embedding failure.
+
 ### Worker-only SaaS credentials
 
 Cloud connector credentials should exist only in the worker. Both Compose files support:

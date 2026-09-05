@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from services.api.app.retrieval.embedder import APIEmbedder, HashEmbedder, build_embedder
 
 
@@ -49,3 +51,38 @@ def test_remote_anonymous_endpoint_requires_explicit_opt_in(monkeypatch):
 
     monkeypatch.setenv("EMBEDDING_ALLOW_ANONYMOUS", "true")
     assert isinstance(build_embedder(), APIEmbedder)
+
+
+def test_local_embedding_respects_batch_and_timeout(monkeypatch):
+    _clear_embedding_auth(monkeypatch)
+    monkeypatch.setenv("EMBEDDING_MODEL", "qwen3-embedding:8b")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://host.docker.internal:11434")
+    monkeypatch.setenv("EMBEDDING_TIMEOUT_SECONDS", "300")
+    monkeypatch.setenv("EMBEDDING_BATCH_SIZE", "2")
+    calls = []
+
+    def post(url, *, headers, json, timeout):
+        calls.append((len(json["input"]), timeout))
+        class Response:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"data": [{"index": i, "embedding": [0.0] * 4096}
+                                 for i in range(len(json["input"]))]}
+        return Response()
+
+    monkeypatch.setattr("services.api.app.retrieval.embedder.requests.post", post)
+    vectors = build_embedder().embed_batch(["one", "two", "three"])
+    assert len(vectors) == 3
+    assert calls == [(2, 300), (1, 300)]
+
+
+@pytest.mark.parametrize("variable", ["EMBEDDING_TIMEOUT_SECONDS", "EMBEDDING_BATCH_SIZE"])
+def test_embedding_rejects_nonpositive_limits(monkeypatch, variable):
+    _clear_embedding_auth(monkeypatch)
+    monkeypatch.setenv("EMBEDDING_MODEL", "qwen3-embedding:8b")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://host.docker.internal:11434")
+    monkeypatch.setenv(variable, "0")
+    with pytest.raises(ValueError, match="must be > 0"):
+        build_embedder()

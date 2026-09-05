@@ -22,8 +22,13 @@ services:
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.openai.com}
-      OLLAMA_BASE_URL: http://ollama:11434
+      EMBEDDING_ALLOW_ANONYMOUS: ${EMBEDDING_ALLOW_ANONYMOUS:-false}
+      EMBEDDING_TIMEOUT_SECONDS: ${EMBEDDING_TIMEOUT_SECONDS:-30}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-100}
+      OLLAMA_BASE_URL: ${RAGBOT_DOCKER_OLLAMA_BASE_URL:-http://ollama:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-300}
+      OLLAMA_REASONING_EFFORT: ${OLLAMA_REASONING_EFFORT:-none}
       QDRANT_URL: http://qdrant:6333
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-rag_chunks}
@@ -72,6 +77,9 @@ services:
       dockerfile: Dockerfile
     image: ragbot:local
     command: ["python", "-m", "services.worker.main"]
+    # The shared image probes an HTTP API; the worker has no HTTP listener.
+    healthcheck:
+      disable: true
     env_file:
       - ${RAGBOT_WORKER_ENV_FILE:-.env.worker.example}
     environment:
@@ -94,8 +102,13 @@ services:
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.openai.com}
-      OLLAMA_BASE_URL: http://ollama:11434
+      EMBEDDING_ALLOW_ANONYMOUS: ${EMBEDDING_ALLOW_ANONYMOUS:-false}
+      EMBEDDING_TIMEOUT_SECONDS: ${EMBEDDING_TIMEOUT_SECONDS:-30}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-100}
+      OLLAMA_BASE_URL: ${RAGBOT_DOCKER_OLLAMA_BASE_URL:-http://ollama:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-300}
+      OLLAMA_REASONING_EFFORT: ${OLLAMA_REASONING_EFFORT:-none}
       QDRANT_URL: http://qdrant:6333
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-rag_chunks}
@@ -134,6 +147,8 @@ services:
       dockerfile: Dockerfile
     image: ragbot:local
     command: ["python", "-m", "services.api.app.storage.migrations"]
+    healthcheck:
+      disable: true
     environment:
       POSTGRES_DSN: postgresql://${POSTGRES_USER:-ragbot}:${POSTGRES_PASSWORD:-ragbot}@postgres:5432/${POSTGRES_DB:-ragbot}
     depends_on:
