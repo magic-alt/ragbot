@@ -26,6 +26,66 @@ from benchmarks.rag_native_compare import (
 
 DEFAULT_REPORT_DIR = ROOT / "reports" / "rag-benchmark"
 DEFAULT_SERVER = "http://127.0.0.1:8000"
+VENV = ROOT / ".venv"
+BENCHMARK_EXTRAS = "worker,benchmark-frameworks"
+
+
+def _venv_python() -> Path:
+    return VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def _python_has_frameworks(executable: Path | str) -> bool:
+    probe = "import langchain_core, langchain_text_splitters, llama_index.core"
+    try:
+        result = subprocess.run(
+            [str(executable), "-c", probe],
+            cwd=ROOT,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def _ensure_level3_runtime(argv: Sequence[str], *, bootstrap: bool) -> Optional[int]:
+    """Ensure native framework extras exist, preferring the repository .venv."""
+    current = Path(sys.executable)
+    if _python_has_frameworks(current):
+        return None
+
+    venv_python = _venv_python()
+    if _python_has_frameworks(venv_python):
+        if current.resolve() != venv_python.resolve():
+            print(f"[runtime] re-running Level 3 benchmark with {venv_python}")
+            return subprocess.run([str(venv_python), str(Path(__file__).resolve()), *argv], cwd=ROOT, check=False).returncode
+        return None
+
+    if not bootstrap:
+        raise RuntimeError(
+            "native framework dependencies are missing; install "
+            f"-e '.[{BENCHMARK_EXTRAS}]' in .venv or omit --no-bootstrap-deps"
+        )
+
+    if not venv_python.exists():
+        print(f"[runtime] creating benchmark virtualenv: {VENV}")
+        created = subprocess.run([sys.executable, "-m", "venv", str(VENV)], cwd=ROOT, check=False)
+        if created.returncode != 0:
+            raise RuntimeError(f"could not create {VENV} (exit {created.returncode})")
+
+    print(f"[runtime] installing benchmark dependencies in .venv (extras: {BENCHMARK_EXTRAS})")
+    install = subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "-e", f".[{BENCHMARK_EXTRAS}]"],
+        cwd=ROOT,
+        check=False,
+    )
+    if install.returncode != 0 or not _python_has_frameworks(venv_python):
+        raise RuntimeError("benchmark dependency bootstrap failed")
+    if current.resolve() != venv_python.resolve():
+        print(f"[runtime] re-running Level 3 benchmark with {venv_python}")
+        return subprocess.run([str(venv_python), str(Path(__file__).resolve()), *argv], cwd=ROOT, check=False).returncode
+    return None
 
 
 def _runtime_server() -> str:
@@ -220,7 +280,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset-profile",
         choices=["off", "development", "production"],
         default="development",
-        help="Dataset maturity gate; production requires >=50 cases and >=80% stable labels",
+        help="Dataset maturity gate; production requires >=50 cases and >=80%% stable labels",
     )
     parser.add_argument(
         "--corpus-dir",
@@ -242,6 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ragbot-mode", choices=["vector", "lexical", "hybrid"], default="vector")
     parser.add_argument("--rerank", action="store_true")
     parser.add_argument("--no-enforce-embedding-match", action="store_true")
+    parser.add_argument("--no-bootstrap-deps", action="store_true", help="Do not auto-install Level 3 framework extras into .venv")
     parser.add_argument("--report-dir", default=str(DEFAULT_REPORT_DIR))
     return parser
 
@@ -263,6 +324,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.level in {"3", "all"} and not args.corpus_dir:
         print("ERROR: --corpus-dir is required for Level 3", file=sys.stderr)
         return 2
+
+    if args.level in {"3", "all"}:
+        try:
+            child_code = _ensure_level3_runtime(
+                list(argv) if argv is not None else sys.argv[1:],
+                bootstrap=not args.no_bootstrap_deps,
+            )
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        if child_code is not None:
+            return child_code
 
     try:
         dataset = load_golden_dataset(dataset_path)
