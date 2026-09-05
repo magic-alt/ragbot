@@ -11,9 +11,12 @@ import time
 from pathlib import Path
 from typing import Optional, Sequence
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from eval.system_quality import PROFILES, run_live_gate, write_report
 
-ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPORT_DIR = ROOT / "reports" / "quality-gate"
 DEFAULT_SERVER = "http://127.0.0.1:8000"
 
@@ -153,8 +156,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.top_k < 5:
-        print("ERROR: --top-k must be >= 5 for Hit@5 gates", file=sys.stderr)
+    if not 5 <= args.top_k <= 50:
+        print(
+            "ERROR: --top-k must be between 5 and 50 for the built-in Hit@5/candidate-pool gates",
+            file=sys.stderr,
+        )
         return 2
     if args.repetitions < 1:
         print("ERROR: --repetitions must be >= 1", file=sys.stderr)
