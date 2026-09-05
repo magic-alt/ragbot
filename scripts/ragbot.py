@@ -251,11 +251,12 @@ def _health(url: str, path: str = "/admin/ready", timeout: float = 2.0) -> bool:
         return False
 
 
-def _wait_ready(server: str, timeout: float = 60.0) -> None:
+def _wait_ready(server: str, timeout: float = 60.0, *, announce: bool = True) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _health(server):
-            print(f"Ragbot is READY: {server}")
+            if announce:
+                print(f"Ragbot is READY: {server}")
             return
         time.sleep(1)
     raise UserError(f"Ragbot did not become ready within {timeout:.0f}s")
@@ -327,12 +328,78 @@ def _start_docker(args: argparse.Namespace) -> None:
     # runtimes always mount <repo>/data at /data so CLI path rewriting and the
     # worker allowlist cannot drift apart because of an old .env value.
     env["RAGBOT_DATA_DIR"] = str(DATA_DIR.resolve())
+    _stop_local_before_docker()
     _run(["docker", "compose", "up", "-d", "--build"], env=env)
     server = f"http://{args.host}:{args.port}"
-    _write_state("docker", server)
-    _wait_ready(server, timeout=max(args.timeout, 120.0))
+    _wait_ready(server, timeout=max(args.timeout, 120.0), announce=False)
+    identity = _assert_docker_runtime(server, env=env)
+    _write_state("docker", server, boot_id=identity["boot_id"])
+    print(f"Ragbot is READY: {server}")
+    print("Docker API routing: verified")
     print(f"Admin UI: {server}/admin/ui")
     print(f"Data directory: {DATA_DIR.resolve()} -> {DOCKER_DATA_DIR}")
+
+
+def _stop_local_before_docker() -> None:
+    """Release a controller-managed local API before publishing Docker ports."""
+    pid = _read_pid()
+    if not pid or not _pid_alive(pid):
+        return
+    # A stale PID file can refer to a reused PID. Never signal that process
+    # unless its command still identifies Ragbot's local uvicorn server.
+    if os.name != "nt":
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            text=True, capture_output=True,
+        )
+        if result.returncode == 0 and "-m uvicorn services.api.app.api:app" in result.stdout:
+            print(f"Stopping controller-managed local API (PID {pid}) before Docker startup")
+            _stop_local()
+            return
+    raise UserError(
+        f"Local runtime PID {pid} is still alive, but its identity could not be verified. "
+        "Inspect that process and stop the local Ragbot API before starting Docker."
+    )
+
+
+def _assert_docker_runtime(server: str, *, env: Dict[str, str]) -> dict:
+    """Prove the published port reaches the API process inside this stack.
+
+    Docker Desktop can publish an IPv6 wildcard while a stale local API still
+    owns IPv4 loopback on the same port. Both APIs may report READY.
+    """
+    probe = (
+        "import urllib.request; "
+        "print(urllib.request.urlopen('http://127.0.0.1:8000/admin/runtime', "
+        "timeout=5).read().decode())"
+    )
+    internal = _run(
+        ["docker", "compose", "exec", "-T", "api", "python", "-c", probe],
+        env=env, capture=True, check=False,
+    )
+    try:
+        if internal.returncode != 0:
+            raise ValueError("container runtime identity is unavailable")
+        expected = json.loads(internal.stdout)
+        with urllib.request.urlopen(server.rstrip("/") + "/admin/runtime", timeout=5) as response:
+            actual = json.load(response)
+        if (
+            not isinstance(expected, dict)
+            or not isinstance(actual, dict)
+            or not expected.get("boot_id")
+            or actual.get("boot_id") != expected["boot_id"]
+            or actual.get("service") != "ragbot-api"
+            or "server-managed-pdf-upload" not in actual.get("capabilities", [])
+        ):
+            raise ValueError("published endpoint does not match the container API")
+    except Exception as exc:
+        raise UserError(
+            f"Docker API routing verification failed for {server}: {exc}. "
+            "A local API or another stack may be occupying the host port, even when READY. "
+            "On macOS inspect `lsof -nP -iTCP:8000 -sTCP:LISTEN` "
+            "(use your configured port), stop the conflicting API, or start Docker with --port 8001."
+        ) from exc
+    return actual
 
 
 def _stop_local() -> None:

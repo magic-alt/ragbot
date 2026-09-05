@@ -255,12 +255,18 @@ def build_embedder(dimension: Optional[int] = None) -> Embedder:
     )
 
     if model and (api_key or anonymous_allowed):
+        timeout = int(os.getenv("EMBEDDING_TIMEOUT_SECONDS", "30"))
+        batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", "100"))
+        if timeout <= 0 or batch_size <= 0:
+            raise ValueError("EMBEDDING_TIMEOUT_SECONDS and EMBEDDING_BATCH_SIZE must be > 0")
         logger.info("Using API embedder: model=%s, base_url=%s", model, base_url)
         return APIEmbedder(
             api_key=api_key,
             base_url=base_url,
             model=model,
             dimension=effective_dimension,
+            timeout=timeout,
+            batch_size=batch_size,
             query_instruction=query_instruction,
         )
 

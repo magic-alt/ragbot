@@ -55,9 +55,9 @@ def fetch_pdf_pages(path: str) -> List[tuple[int, str]]:
 
     pages: List[tuple[int, str]] = []
     for page_number, page in enumerate(PdfReader(io.BytesIO(fetch_pdf_bytes(path))).pages, 1):
-        text = page.extract_text()
-        if text and text.strip():
-            pages.append((page_number, text.strip()))
+        text = (page.extract_text() or "").replace("\x00", "").strip()
+        if text:
+            pages.append((page_number, text))
     return pages
 
 
