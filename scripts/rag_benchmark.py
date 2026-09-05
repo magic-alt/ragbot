@@ -11,8 +11,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -26,6 +28,7 @@ DEFAULT_SERVER = "http://127.0.0.1:8000"
 VENV = ROOT / ".venv"
 BASE_EXTRAS = "worker"
 BENCHMARK_EXTRAS = "worker,benchmark-frameworks"
+SUPPORTED_CORPUS_SUFFIXES = {".txt", ".md", ".rst", ".pdf"}
 
 
 def _venv_python() -> Path:
@@ -58,6 +61,15 @@ def _python_has_frameworks(executable: Path | str) -> bool:
     return _python_has_runtime(executable, require_frameworks=True)
 
 
+def _reexec_with(executable: Path, argv: Sequence[str]) -> int:
+    print(f"[runtime] re-running benchmark with {executable}")
+    return subprocess.run(
+        [str(executable), str(Path(__file__).resolve()), *argv],
+        cwd=ROOT,
+        check=False,
+    ).returncode
+
+
 def _ensure_runtime(
     argv: Sequence[str],
     *,
@@ -66,41 +78,67 @@ def _ensure_runtime(
 ) -> Optional[int]:
     """Ensure required runtime deps exist before importing any Ragbot module.
 
-    Prefer the repository .venv. If the invoking interpreter is missing even a
-    base dependency such as ``requests``, re-execute this script with .venv
-    before importing ``benchmarks.rag_native_compare``. Level 3 additionally
-    requires native LangChain/LlamaIndex benchmark extras.
+    The repository virtualenv is authoritative whenever it exists. This avoids
+    partially configured Homebrew/system Python installations changing local
+    benchmark behavior. A missing or incomplete .venv is repaired when
+    bootstrapping is enabled; only repositories without a .venv may fall back
+    to an already-complete invoking interpreter.
     """
     current = Path(sys.executable)
+    venv_python = _venv_python()
+    extras = BENCHMARK_EXTRAS if require_frameworks else BASE_EXTRAS
+
+    if venv_python.exists():
+        if _python_has_runtime(venv_python, require_frameworks=require_frameworks):
+            if current.resolve() != venv_python.resolve():
+                return _reexec_with(venv_python, argv)
+            return None
+
+        if not bootstrap:
+            requirement = (
+                "native framework dependencies"
+                if require_frameworks
+                else "Ragbot runtime dependencies"
+            )
+            raise RuntimeError(
+                f"{requirement} are missing from repository .venv; install "
+                f"-e '.[{extras}]' in .venv or omit --no-bootstrap-deps"
+            )
+
+        print(f"[runtime] installing benchmark dependencies in .venv (extras: {extras})")
+        install = subprocess.run(
+            [str(venv_python), "-m", "pip", "install", "-e", f".[{extras}]"],
+            cwd=ROOT,
+            check=False,
+        )
+        if install.returncode != 0 or not _python_has_runtime(
+            venv_python, require_frameworks=require_frameworks
+        ):
+            raise RuntimeError("benchmark dependency bootstrap failed")
+        if current.resolve() != venv_python.resolve():
+            return _reexec_with(venv_python, argv)
+        return None
+
     if _python_has_runtime(current, require_frameworks=require_frameworks):
         return None
 
-    venv_python = _venv_python()
-    if _python_has_runtime(venv_python, require_frameworks=require_frameworks):
-        if current.resolve() != venv_python.resolve():
-            print(f"[runtime] re-running benchmark with {venv_python}")
-            return subprocess.run(
-                [str(venv_python), str(Path(__file__).resolve()), *argv],
-                cwd=ROOT,
-                check=False,
-            ).returncode
-        return None
-
-    extras = BENCHMARK_EXTRAS if require_frameworks else BASE_EXTRAS
     if not bootstrap:
-        requirement = "native framework dependencies" if require_frameworks else "Ragbot runtime dependencies"
+        requirement = (
+            "native framework dependencies"
+            if require_frameworks
+            else "Ragbot runtime dependencies"
+        )
         raise RuntimeError(
-            f"{requirement} are missing; install -e '.[{extras}]' in .venv "
+            f"{requirement} are missing; create .venv and install -e '.[{extras}]' "
             "or omit --no-bootstrap-deps"
         )
 
-    if not venv_python.exists():
-        print(f"[runtime] creating benchmark virtualenv: {VENV}")
-        created = subprocess.run(
-            [sys.executable, "-m", "venv", str(VENV)], cwd=ROOT, check=False
-        )
-        if created.returncode != 0:
-            raise RuntimeError(f"could not create {VENV} (exit {created.returncode})")
+    print(f"[runtime] creating benchmark virtualenv: {VENV}")
+    created = subprocess.run(
+        [sys.executable, "-m", "venv", str(VENV)], cwd=ROOT, check=False
+    )
+    if created.returncode != 0:
+        raise RuntimeError(f"could not create {VENV} (exit {created.returncode})")
 
     print(f"[runtime] installing benchmark dependencies in .venv (extras: {extras})")
     install = subprocess.run(
@@ -112,14 +150,8 @@ def _ensure_runtime(
         venv_python, require_frameworks=require_frameworks
     ):
         raise RuntimeError("benchmark dependency bootstrap failed")
-
     if current.resolve() != venv_python.resolve():
-        print(f"[runtime] re-running benchmark with {venv_python}")
-        return subprocess.run(
-            [str(venv_python), str(Path(__file__).resolve()), *argv],
-            cwd=ROOT,
-            check=False,
-        ).returncode
+        return _reexec_with(venv_python, argv)
     return None
 
 
@@ -137,6 +169,32 @@ def _runtime_server() -> str:
         return str(payload.get("server") or DEFAULT_SERVER).rstrip("/")
     except Exception:
         return DEFAULT_SERVER
+
+
+def _resolve_corpus_source(raw: str) -> Path:
+    """Resolve a corpus directory or one supported document path.
+
+    ``strip`` is intentional: quoted shell paths can accidentally include a
+    trailing space, which is especially easy to miss with long PDF filenames.
+    """
+    value = str(raw or "").strip()
+    if not value:
+        raise ValueError("--corpus/--corpus-dir is required for Level 3")
+    source = Path(value).expanduser()
+    if not source.is_absolute():
+        source = (Path.cwd() / source).resolve()
+    else:
+        source = source.resolve()
+    if not source.exists():
+        raise ValueError(f"corpus source not found: {source}")
+    if source.is_file() and source.suffix.lower() not in SUPPORTED_CORPUS_SUFFIXES:
+        supported = ", ".join(sorted(SUPPORTED_CORPUS_SUFFIXES))
+        raise ValueError(
+            f"unsupported corpus file: {source.name}; supported suffixes: {supported}"
+        )
+    if not source.is_file() and not source.is_dir():
+        raise ValueError(f"corpus source must be a regular file or directory: {source}")
+    return source
 
 
 def _print_audit(audit: dict[str, Any]) -> None:
@@ -197,10 +255,27 @@ def _run_level2(
     }
 
 
+def _load_corpus_source(source: Path):
+    """Load a directory directly or stage one file for the existing loader."""
+    from benchmarks.rag_native_compare import load_corpus_units
+
+    if source.is_dir():
+        return load_corpus_units(source)
+
+    with tempfile.TemporaryDirectory(prefix="ragbot-benchmark-corpus-") as tmp:
+        staging = Path(tmp)
+        staged_file = staging / source.name
+        try:
+            staged_file.symlink_to(source)
+        except OSError:
+            shutil.copy2(source, staged_file)
+        return load_corpus_units(staging)
+
+
 def _run_level3(
     *,
     dataset: dict[str, Any],
-    corpus_dir: Path,
+    corpus_source: Path,
     backends: str,
     embedding: str,
     hash_dimension: int,
@@ -220,14 +295,13 @@ def _run_level3(
 ) -> dict[str, Any]:
     # Deliberately lazy: project/framework imports happen only after runtime bootstrap.
     from benchmarks.rag_native_compare import (
-        load_corpus_units,
         markdown_report as native_markdown_report,
         run_comparison,
         write_reports as write_native_reports,
     )
 
     print("\n[level3] native Ragbot / LangChain / LlamaIndex comparison")
-    units = load_corpus_units(corpus_dir)
+    units = _load_corpus_source(corpus_source)
     report = run_comparison(
         dataset=dataset,
         units=units,
@@ -335,8 +409,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Dataset maturity gate; production requires >=50 cases and >=80%% stable labels",
     )
     parser.add_argument(
+        "--corpus",
         "--corpus-dir",
-        help="Local corpus for Level 3; replace examples with the real directory matching the corpus indexed in Ragbot",
+        dest="corpus_dir",
+        help=(
+            "Local corpus file or directory for Level 3; must represent the same "
+            "logical documents already indexed in Ragbot"
+        ),
     )
     parser.add_argument("--backends", default="ragbot,langchain,llamaindex")
     parser.add_argument("--embedding", choices=["env", "hash"], default="env")
@@ -379,7 +458,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("ERROR: --repetitions must be >=1", file=sys.stderr)
         return 2
     if args.level in {"3", "all"} and not args.corpus_dir:
-        print("ERROR: --corpus-dir is required for Level 3", file=sys.stderr)
+        print("ERROR: --corpus/--corpus-dir is required for Level 3", file=sys.stderr)
         return 2
 
     # Critical ordering: bootstrap/re-exec before importing any Ragbot module.
@@ -429,22 +508,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     if args.level in {"3", "all"}:
-        corpus_dir = Path(args.corpus_dir)
-        if not corpus_dir.is_absolute():
-            corpus_dir = (Path.cwd() / corpus_dir).resolve()
-        if not corpus_dir.is_dir():
-            print(
-                "ERROR: corpus directory not found: "
-                f"{corpus_dir}\n"
-                "Replace the --corpus-dir example placeholder with the real local directory "
-                "containing the same logical documents already indexed in Ragbot.",
-                file=sys.stderr,
-            )
+        try:
+            corpus_source = _resolve_corpus_source(args.corpus_dir)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
             return 2
         try:
             level3 = _run_level3(
                 dataset=dataset,
-                corpus_dir=corpus_dir,
+                corpus_source=corpus_source,
                 backends=args.backends,
                 embedding=args.embedding,
                 hash_dimension=args.hash_dimension,
