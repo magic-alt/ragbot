@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import os
 import subprocess
 import sys
@@ -19,6 +18,8 @@ from eval.system_quality import PROFILES, run_live_gate, write_report
 
 DEFAULT_REPORT_DIR = ROOT / "reports" / "quality-gate"
 DEFAULT_SERVER = "http://127.0.0.1:8000"
+VENV = ROOT / ".venv"
+FUNCTIONAL_EXTRAS = "dev,postgres,qdrant,worker,s3,saas,observability"
 
 
 def _runtime_server() -> str:
@@ -34,25 +35,104 @@ def _runtime_server() -> str:
         return DEFAULT_SERVER
 
 
-def _run_pytest(mode: str) -> dict[str, object]:
-    available = importlib.util.find_spec("pytest") is not None
+def _venv_python() -> Path:
+    return VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def _python_has_pytest(executable: Path | str) -> bool:
+    try:
+        result = subprocess.run(
+            [str(executable), "-c", "import pytest"],
+            cwd=ROOT,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def _existing_pytest_python() -> Optional[Path]:
+    """Prefer the repository virtualenv, then the invoking interpreter."""
+    venv_python = _venv_python()
+    candidates = []
+    if venv_python.exists():
+        candidates.append(venv_python)
+    current = Path(sys.executable)
+    if current not in candidates:
+        candidates.append(current)
+    for executable in candidates:
+        if _python_has_pytest(executable):
+            return executable
+    return None
+
+
+def _bootstrap_functional_test_env() -> tuple[Optional[Path], Optional[str]]:
+    """Create/repair .venv with the same functional extras used by GitHub CI."""
+    venv_python = _venv_python()
+    if not venv_python.exists():
+        print(f"[functional] creating test virtualenv: {VENV}")
+        created = subprocess.run(
+            [sys.executable, "-m", "venv", str(VENV)],
+            cwd=ROOT,
+            check=False,
+        )
+        if created.returncode != 0:
+            return None, f"could not create {VENV} (exit {created.returncode})"
+
+    print(
+        "[functional] installing/repairing test dependencies in .venv "
+        f"(extras: {FUNCTIONAL_EXTRAS})"
+    )
+    install = subprocess.run(
+        [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+            "-e",
+            f".[{FUNCTIONAL_EXTRAS}]",
+        ],
+        cwd=ROOT,
+        check=False,
+    )
+    if install.returncode != 0:
+        return None, f"test dependency installation failed (exit {install.returncode})"
+    if not _python_has_pytest(venv_python):
+        return None, "pytest is still unavailable after bootstrapping .venv"
+    return venv_python, None
+
+
+def _resolve_pytest_python(mode: str) -> tuple[Optional[Path], dict[str, object]]:
     if mode == "off":
-        return {"status": "skipped", "reason": "disabled by --pytest=off"}
-    if not available:
-        if mode == "on":
-            return {
-                "status": "failed",
-                "reason": "pytest is not installed; install the project with .[dev]",
-            }
-        return {
+        return None, {"status": "skipped", "reason": "disabled by --pytest=off"}
+
+    executable = _existing_pytest_python()
+    if executable is not None:
+        return executable, {"status": "ready", "python": str(executable), "bootstrapped": False}
+
+    if mode == "auto":
+        return None, {
             "status": "skipped",
-            "reason": "pytest not installed in this environment",
+            "reason": "pytest not installed; use --pytest on to bootstrap .venv automatically",
         }
 
-    print("\n[functional] running repository pytest suite")
+    executable, error = _bootstrap_functional_test_env()
+    if executable is None:
+        return None, {"status": "failed", "reason": error or "test environment bootstrap failed"}
+    return executable, {"status": "ready", "python": str(executable), "bootstrapped": True}
+
+
+def _run_pytest(mode: str) -> dict[str, object]:
+    executable, resolution = _resolve_pytest_python(mode)
+    if executable is None:
+        return resolution
+
+    print(f"\n[functional] running repository pytest suite with {executable}")
     start = time.perf_counter()
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q"],
+        [str(executable), "-m", "pytest", "-q"],
         cwd=ROOT,
         check=False,
     )
@@ -61,6 +141,8 @@ def _run_pytest(mode: str) -> dict[str, object]:
         "status": "passed" if result.returncode == 0 else "failed",
         "returncode": result.returncode,
         "elapsed_ms": elapsed,
+        "python": str(executable),
+        "bootstrapped": bool(resolution.get("bootstrapped")),
     }
 
 
@@ -139,7 +221,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--pytest",
         choices=["auto", "on", "off"],
         default="auto",
-        help="Run the full repository test suite when pytest is available (default: auto)",
+        help=(
+            "Functional suite policy: auto runs when pytest already exists; "
+            "on bootstraps repository .venv/test extras when needed; off disables it"
+        ),
     )
     parser.add_argument(
         "--dataset",
@@ -174,10 +259,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"  profile: {args.profile}")
 
     functional = _run_pytest(args.pytest)
-    print(
-        f"[functional] {functional['status']}: "
-        f"{functional.get('reason', '')}"
-    )
+    detail = functional.get("reason") or functional.get("python") or ""
+    print(f"[functional] {functional['status']}: {detail}")
 
     try:
         print(
