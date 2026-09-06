@@ -124,6 +124,7 @@ def markdown_report(payload: dict[str, Any]) -> str:
             "## Interpretation",
             "",
             "- `PROMOTE` means the candidate passed the configured offline promotion contract; it does not mutate production defaults.",
+            "- Peak memory is steady-state Python allocation measured after warming the exact splitter runtime; one-time optional-framework imports are excluded from the ratio gate.",
             "- Production profile requires a reviewed, stable-label, source-pinned PDF Structure Golden Suite.",
             "- After an offline PROMOTE, validate the candidate in isolated Qdrant/PostgreSQL ingestion and live hybrid/reranker A/B before changing the default Source contract.",
         ]
@@ -141,6 +142,7 @@ def run(argv: Sequence[str] | None = None) -> tuple[dict[str, Any], int]:
         raise ValueError("coalesce-target-multiplier must be >=1")
 
     from benchmarks.component_compare import load_raw_pdfs
+    from benchmarks.factorial_compare import splitter_config
     from benchmarks.pdf_promotion import (
         CANDIDATE_PIPELINE,
         CONTROL_PIPELINE,
@@ -151,6 +153,7 @@ def run(argv: Sequence[str] | None = None) -> tuple[dict[str, Any], int]:
         run_pipeline,
     )
     from benchmarks.rag_native_compare import load_golden_dataset
+    from benchmarks.runtime_warmup import warm_chunker_runtime
     from services.api.app.retrieval.embedder import HashEmbedder, build_embedder
 
     dataset_path = Path(args.dataset).expanduser().resolve()
@@ -169,6 +172,25 @@ def run(argv: Sequence[str] | None = None) -> tuple[dict[str, Any], int]:
         coalescing=CANDIDATE_PIPELINE.coalescing,
         coalesce_target_multiplier=args.coalesce_target_multiplier,
     )
+
+    def warm_spec(spec: PipelineSpec) -> dict[str, object]:
+        config = splitter_config(
+            spec.splitter,
+            coalesced=spec.coalescing == "coalesced",
+            chunk_size=args.chunk_size,
+            coalesce_target_multiplier=spec.coalesce_target_multiplier,
+        )
+        return warm_chunker_runtime(
+            config,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap,
+        )
+
+    runtime_warmup = {
+        "control": warm_spec(CONTROL_PIPELINE),
+        "candidate": warm_spec(candidate_spec),
+    }
+
     control = run_pipeline(
         control_parser,
         CONTROL_PIPELINE,
@@ -206,7 +228,9 @@ def run(argv: Sequence[str] | None = None) -> tuple[dict[str, Any], int]:
             "top_k": args.top_k,
             "repetitions": args.repetitions,
             "coalesce_target_multiplier": args.coalesce_target_multiplier,
+            "memory_measurement": "steady_state_tracemalloc_after_exact_splitter_warmup",
         },
+        "runtime_warmup": runtime_warmup,
         "suite_audit": suite_audit,
         "control": control,
         "candidate": candidate,
