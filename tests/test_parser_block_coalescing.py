@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from benchmarks.factorial_compare import compact_factorial_cells, splitter_config
+from services.worker.chunking import chunking_metadata, resolve_chunking_spec
 from services.worker.parsing import (
     DocumentBlock,
     NormalizedDocument,
@@ -68,6 +69,39 @@ def test_bridge_coalescing_is_opt_in_and_reduces_parser_fragmentation():
     assert raw[0].metadata["block_coalescing"]["enabled"] is False
     assert coalesced[0].metadata["block_coalescing"]["enabled"] is True
     assert coalesced[0].metadata["block_metadata"]["source_block_count"] == 3
+
+
+def test_coalescing_changes_durable_chunk_contract_but_disabled_path_keeps_legacy_hash():
+    legacy = chunking_metadata(None, chunk_size=800, chunk_overlap=100)
+    explicit_disabled = chunking_metadata(
+        {"block_coalescing": {"enabled": False}},
+        chunk_size=800,
+        chunk_overlap=100,
+    )
+    enabled = chunking_metadata(
+        {"block_coalescing": {"enabled": True, "target_chars": 3200}},
+        chunk_size=800,
+        chunk_overlap=100,
+    )
+    enabled_other_target = chunking_metadata(
+        {"block_coalescing": {"enabled": True, "target_chars": 2400}},
+        chunk_size=800,
+        chunk_overlap=100,
+    )
+
+    assert explicit_disabled["chunker_config_hash"] == legacy["chunker_config_hash"]
+    assert enabled["chunker_config_hash"] != legacy["chunker_config_hash"]
+    assert enabled_other_target["chunker_config_hash"] != enabled["chunker_config_hash"]
+    assert enabled["block_coalescing_enabled"] is True
+    assert enabled["block_coalescing_target_chars"] == 3200
+
+    spec = resolve_chunking_spec(
+        {"block_coalescing": True},
+        chunk_size=800,
+        chunk_overlap=100,
+    )
+    assert spec.block_coalescing_enabled is True
+    assert spec.block_coalescing_target_chars == 3200
 
 
 def test_table_blocks_remain_structural_boundaries():
