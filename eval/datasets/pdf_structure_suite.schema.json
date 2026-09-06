@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/magic-alt/ragbot/eval/datasets/pdf_structure_suite.schema.json",
+  "title": "Ragbot PDF Structure Golden Suite",
+  "type": "object",
+  "required": ["schema_version", "name", "pdf_structure_suite", "cases"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "name": {"type": "string", "minLength": 1},
+    "pdf_structure_suite": {
+      "type": "object",
+      "required": ["version", "requirements", "documents"],
+      "properties": {
+        "version": {"const": 1},
+        "requirements": {
+          "type": "object",
+          "required": ["min_documents", "min_reviewed_rate", "required_document_types", "required_case_tags"],
+          "properties": {
+            "min_documents": {"type": "integer", "minimum": 1},
+            "min_reviewed_rate": {"type": "number", "minimum": 0, "maximum": 1},
+            "required_document_types": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+            "required_case_tags": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+          },
+          "additionalProperties": false
+        },
+        "documents": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["path", "sha256", "page_count", "document_type", "languages"],
+            "properties": {
+              "path": {"type": "string", "minLength": 1},
+              "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "page_count": {"type": "integer", "minimum": 1},
+              "document_type": {"type": "string", "minLength": 1},
+              "languages": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+              "notes": {"type": "string"}
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "category", "tags", "query", "relevance", "review"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "category": {"type": "string", "minLength": 1},
+          "tags": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+          "query": {"type": "string", "minLength": 1},
+          "answer": {"type": "string"},
+          "relevance": {
+            "type": "object",
+            "properties": {
+              "expected_chunk_ids": {"type": "array", "items": {"type": "string"}},
+              "doc_ids": {"type": "array", "items": {"type": "string"}},
+              "pages": {"type": "array", "items": {"type": ["integer", "string"]}},
+              "path_contains": {"type": "array", "items": {"type": "string"}},
+              "all_terms": {"type": "array", "items": {"type": "string"}},
+              "any_terms": {"type": "array", "items": {"type": "string"}},
+              "max_rank": {"type": "integer", "minimum": 1}
+            },
+            "minProperties": 1,
+            "additionalProperties": false
+          },
+          "review": {
+            "type": "object",
+            "required": ["status"],
+            "properties": {
+              "status": {"enum": ["draft", "approved"]},
+              "notes": {"type": "string"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}
