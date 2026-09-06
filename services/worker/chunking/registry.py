@@ -19,6 +19,32 @@ _VALID_STRATEGIES = {
 }
 
 
+def _block_coalescing_fields(
+    raw: Mapping[str, Any],
+    *,
+    chunk_size: int,
+) -> tuple[bool, int | None, bool, bool]:
+    value = raw.get("block_coalescing")
+    if value in (None, False):
+        return False, None, True, True
+    if value is True:
+        return True, chunk_size * 4, True, True
+    if not isinstance(value, Mapping):
+        raise ValueError("chunking.block_coalescing must be a boolean or object")
+    enabled = bool(value.get("enabled", True))
+    if not enabled:
+        return False, None, True, True
+    target_chars = int(value.get("target_chars") or chunk_size * 4)
+    if target_chars < 1:
+        raise ValueError("chunking.block_coalescing.target_chars must be >= 1")
+    return (
+        True,
+        target_chars,
+        bool(value.get("respect_page", True)),
+        bool(value.get("respect_section", True)),
+    )
+
+
 def resolve_chunking_spec(
     config: Mapping[str, Any] | None,
     *,
@@ -41,13 +67,23 @@ def resolve_chunking_spec(
             f"Unsupported chunker strategy {provider}/{strategy}; "
             f"expected one of {sorted(_VALID_STRATEGIES[provider])}"
         )
+    effective_chunk_size = int(raw.get("chunk_size", chunk_size))
+    effective_chunk_overlap = int(raw.get("chunk_overlap", chunk_overlap))
+    coalescing_enabled, coalescing_target, respect_page, respect_section = _block_coalescing_fields(
+        raw,
+        chunk_size=effective_chunk_size,
+    )
     return ChunkingSpec(
         provider=provider,
         strategy=strategy,
         version=int(raw.get("version", 1)),
-        chunk_size=int(raw.get("chunk_size", chunk_size)),
-        chunk_overlap=int(raw.get("chunk_overlap", chunk_overlap)),
+        chunk_size=effective_chunk_size,
+        chunk_overlap=effective_chunk_overlap,
         language=str(language).strip().lower() if language else None,
+        block_coalescing_enabled=coalescing_enabled,
+        block_coalescing_target_chars=coalescing_target,
+        block_coalescing_respect_page=respect_page,
+        block_coalescing_respect_section=respect_section,
     )
 
 
