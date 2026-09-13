@@ -13,11 +13,14 @@ from .agent.nodes.sql import PostgresSqlEngine, SqlEngine
 from .agent.sql_disabled import DisabledSqlEngine
 from .llm.router import build_model_router
 from .retrieval.embedder import HashEmbedder, model_dimension
+from .retrieval.embedding_router import ActiveIndexEmbedder, build_embedding_router
+from .retrieval.index_lifecycle import IndexLifecycleService
 from .retrieval.qdrant import InMemoryQdrant
 from .retrieval.service import Retriever
 from .runtime import is_production, validate_production_environment
 from .runtime_registry import runtime_component_registry
 from .storage.generation_support import ensure_generation_repository
+from .storage.index_support import ensure_index_repository, supports_index_lifecycle
 from .storage.repo import InMemoryRepo
 from .storage.upload_support import ensure_upload_repository
 
@@ -49,14 +52,31 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
 
     ensure_generation_repository(repo)
     ensure_upload_repository(repo)
+    ensure_index_repository(repo)
 
     qdrant_url = os.getenv("QDRANT_URL")
     qdrant_api_key = os.getenv("QDRANT_API_KEY")
     qdrant_collection = os.getenv("QDRANT_COLLECTION", "rag_chunks")
+    qdrant_alias = (
+        os.getenv("QDRANT_INDEX_ALIAS", f"{qdrant_collection}_active").strip()
+        if qdrant_url
+        else ""
+    )
     qdrant_dim_raw = os.getenv("QDRANT_DIM")
     embedding_model = os.getenv("EMBEDDING_MODEL", "").strip()
     inferred_dim = model_dimension(embedding_model)
-    if qdrant_dim_raw:
+
+    # After the first lifecycle bootstrap, PostgreSQL records the active schema.
+    # Use it to configure a restarting API even when the default/standby embedding
+    # environment contains multiple dimensions.
+    active_index = None
+    if qdrant_alias and supports_index_lifecycle(repo):
+        active_index = repo.get_active_index_version(qdrant_alias)
+    active_dense = (active_index.vector_schema.get("dense") or {}) if active_index else {}
+    active_dim = int(active_dense.get("dimension") or 0)
+    if active_dim:
+        qdrant_dim = active_dim
+    elif qdrant_dim_raw:
         qdrant_dim = int(qdrant_dim_raw)
     elif inferred_dim:
         qdrant_dim = inferred_dim
@@ -66,14 +86,39 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
     qdrant = components.build(
         "vector",
         profile.vector_provider,
-        {"url": qdrant_url, "api_key": qdrant_api_key, "collection_name": qdrant_collection, "dim": qdrant_dim},
+        {
+            "url": qdrant_url,
+            "api_key": qdrant_api_key,
+            "collection_name": qdrant_collection,
+            "alias_name": qdrant_alias or None,
+            "dim": qdrant_dim,
+        },
     )
-    embedder = components.build("embedding", profile.embedding_provider, {"dimension": qdrant_dim})
+    default_embedder = components.build(
+        "embedding", profile.embedding_provider, {"dimension": qdrant_dim}
+    )
+    embedding_router = build_embedding_router(default_embedder)
+    index_lifecycle = None
+    embedder = default_embedder
+
+    if qdrant_alias and supports_index_lifecycle(repo) and not isinstance(qdrant, InMemoryQdrant):
+        index_lifecycle = IndexLifecycleService(
+            repo, qdrant, embedding_router, alias_name=qdrant_alias
+        )
+        index_lifecycle.bootstrap_current(default_embedder)
+        embedder = ActiveIndexEmbedder(
+            repo,
+            embedding_router,
+            qdrant_alias,
+            default_embedder,
+            vector_store=qdrant,
+        )
+
     if embedder.dimension != qdrant.dim:
         raise RuntimeError(
-            "Embedding dimension does not match vector store: "
-            f"embedder={embedder.dimension}, qdrant={qdrant.dim}. "
-            "Set QDRANT_DIM consistently and reindex after changing embedding models."
+            "Active embedding contract does not match vector index: "
+            f"embedder={embedder.dimension}, vector={qdrant.dim}. "
+            "Register the active embedding contract or reconcile the index alias before serving traffic."
         )
 
     if is_production():
@@ -82,7 +127,11 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
             unsafe.append("InMemoryRepo")
         if isinstance(qdrant, InMemoryQdrant):
             unsafe.append("InMemoryQdrant")
-        if isinstance(embedder, HashEmbedder):
+        try:
+            active_raw_embedder = embedding_router.get(embedder.contract_id)
+        except (KeyError, AttributeError):
+            active_raw_embedder = default_embedder
+        if isinstance(active_raw_embedder, HashEmbedder):
             unsafe.append("HashEmbedder")
         if unsafe:
             raise RuntimeError("Production services cannot use development fallbacks: " + ", ".join(unsafe))
@@ -117,7 +166,8 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
 
     logger.info("Resolved Ragbot runtime profile: %s", profile.as_public_dict())
     logger.info("Resolved model router: %s", llm.diagnostics())
-    return AgentServices(
+    logger.info("Resolved embedding contracts: %s", embedding_router.public_metadata())
+    services = AgentServices(
         repo=repo,
         qdrant=qdrant,
         retriever=retriever,
@@ -127,3 +177,8 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
         embedder=embedder,
         reranker=reranker,
     )
+    # Keep the public AgentServices dataclass source-compatible while exposing
+    # lifecycle components to admin routes/operational tooling.
+    setattr(services, "embedding_router", embedding_router)
+    setattr(services, "index_lifecycle", index_lifecycle)
+    return services
