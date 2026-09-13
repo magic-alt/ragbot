@@ -181,7 +181,7 @@ class APIEmbedder:
         provider_id: str = "openai-compatible",
         revision: str = "",
         document_instruction: str = "",
-        normalize: bool = True,
+        normalize: bool = False,
         max_batch_bytes: int = 1_000_000,
         max_attempts: int = 4,
         concurrency: int = 8,
@@ -435,7 +435,7 @@ def build_embedder(dimension: Optional[int] = None) -> Embedder:
             concurrency=concurrency,
             query_instruction=query_instruction,
             document_instruction=document_instruction,
-            normalize=_env_flag("EMBEDDING_NORMALIZE", True),
+            normalize=_env_flag("EMBEDDING_NORMALIZE", False),
             cache=cache,
         )
 
