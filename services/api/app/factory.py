@@ -57,18 +57,12 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
     qdrant_url = os.getenv("QDRANT_URL")
     qdrant_api_key = os.getenv("QDRANT_API_KEY")
     qdrant_collection = os.getenv("QDRANT_COLLECTION", "rag_chunks")
-    qdrant_alias = (
-        os.getenv("QDRANT_INDEX_ALIAS", f"{qdrant_collection}_active").strip()
-        if qdrant_url
-        else ""
-    )
+    explicit_alias = os.getenv("QDRANT_INDEX_ALIAS", "").strip()
+    qdrant_alias = (explicit_alias or f"{qdrant_collection}_active") if qdrant_url else ""
     qdrant_dim_raw = os.getenv("QDRANT_DIM")
     embedding_model = os.getenv("EMBEDDING_MODEL", "").strip()
     inferred_dim = model_dimension(embedding_model)
 
-    # After the first lifecycle bootstrap, PostgreSQL records the active schema.
-    # Use it to configure a restarting API even when the default/standby embedding
-    # environment contains multiple dimensions.
     active_index = None
     if qdrant_alias and supports_index_lifecycle(repo):
         active_index = repo.get_active_index_version(qdrant_alias)
@@ -177,8 +171,6 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
         embedder=embedder,
         reranker=reranker,
     )
-    # Keep the public AgentServices dataclass source-compatible while exposing
-    # lifecycle components to admin routes/operational tooling.
     setattr(services, "embedding_router", embedding_router)
     setattr(services, "index_lifecycle", index_lifecycle)
     return services
