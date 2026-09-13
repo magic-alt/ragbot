@@ -84,18 +84,11 @@ def _build_memory_vector(config: Mapping[str, Any]):
     return InMemoryQdrant(dim=int(config["dim"]))
 
 
-def _qdrant_alias_dimension(
+def _qdrant_alias_target(
     url: str,
     api_key: Any,
     alias_name: str,
-) -> Optional[int]:
-    """Resolve the query-visible schema before constructing the adapter.
-
-    Activation deliberately switches the Qdrant alias before the PostgreSQL
-    control-plane transaction. If the process crashes in that interval, the
-    next process must accept the alias target's dimension (not stale QDRANT_DIM
-    or stale PostgreSQL state) so reconciliation can run.
-    """
+) -> Optional[str]:
     if not alias_name:
         return None
     try:
@@ -105,13 +98,28 @@ def _qdrant_alias_dimension(
     client = QdrantClient(url=url, api_key=api_key)
     try:
         aliases = client.get_aliases()
-        target = None
         for item in getattr(aliases, "aliases", None) or []:
             if str(getattr(item, "alias_name", "")) == alias_name:
-                target = str(getattr(item, "collection_name", "")) or None
-                break
-        if not target:
-            return None
+                return str(getattr(item, "collection_name", "")) or None
+        return None
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+
+def _qdrant_alias_dimension(
+    url: str,
+    api_key: Any,
+    alias_name: str,
+) -> Optional[int]:
+    """Resolve the query-visible schema before constructing the adapter."""
+    target = _qdrant_alias_target(url, api_key, alias_name)
+    if not target:
+        return None
+    from qdrant_client import QdrantClient
+    client = QdrantClient(url=url, api_key=api_key)
+    try:
         info = client.get_collection(target)
         vectors = getattr(getattr(getattr(info, "config", None), "params", None), "vectors", None)
         actual = getattr(vectors, "size", None)
@@ -125,22 +133,83 @@ def _qdrant_alias_dimension(
             close()
 
 
+def _ensure_qdrant_alias(
+    url: str,
+    api_key: Any,
+    alias_name: str,
+    collection_name: str,
+) -> None:
+    """Create the bootstrap alias once, tolerating another replica winning."""
+    target = _qdrant_alias_target(url, api_key, alias_name)
+    if target:
+        if target != collection_name:
+            # A pre-existing alias target is authoritative. Do not overwrite it
+            # during startup; activation/reconcile owns later transitions.
+            return
+        return
+
+    from qdrant_client import QdrantClient
+    from qdrant_client.http import models as rest
+
+    client = QdrantClient(url=url, api_key=api_key)
+    try:
+        try:
+            client.update_collection_aliases(
+                change_aliases_operations=[
+                    rest.CreateAliasOperation(
+                        create_alias=rest.CreateAlias(
+                            collection_name=collection_name,
+                            alias_name=alias_name,
+                        )
+                    )
+                ]
+            )
+        except Exception:
+            # API and worker commonly start at the same time after migrations.
+            # If the other replica created the same alias first, converge rather
+            # than failing this process startup.
+            current = _qdrant_alias_target(url, api_key, alias_name)
+            if current != collection_name:
+                raise
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+
 def _build_qdrant_vector(config: Mapping[str, Any]):
     from services.api.app.retrieval.qdrant import QdrantClientAdapter
+
     url = str(config.get("url") or "").strip()
     if not url:
         raise ValueError("vector:qdrant requires url")
+    api_key = config.get("api_key")
+    collection_name = str(config.get("collection_name") or "rag_chunks")
     alias_name = str(config.get("alias_name") or "").strip() or None
     configured_dim = int(config["dim"])
+
+    if alias_name and _qdrant_alias_target(url, api_key, alias_name) is None:
+        # Ensure the legacy physical collection/payload indexes first. This
+        # direct adapter has no alias side effects.
+        bootstrap = QdrantClientAdapter(
+            url=url,
+            api_key=api_key,
+            collection_name=collection_name,
+            dim=configured_dim,
+            alias_name=None,
+        )
+        bootstrap.close()
+        _ensure_qdrant_alias(url, api_key, alias_name, collection_name)
+
     visible_dim = (
-        _qdrant_alias_dimension(url, config.get("api_key"), alias_name)
+        _qdrant_alias_dimension(url, api_key, alias_name)
         if alias_name
         else None
     )
     return QdrantClientAdapter(
         url=url,
-        api_key=config.get("api_key"),
-        collection_name=str(config.get("collection_name") or "rag_chunks"),
+        api_key=api_key,
+        collection_name=collection_name,
         dim=visible_dim or configured_dim,
         alias_name=alias_name,
     )
