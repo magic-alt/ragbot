@@ -41,6 +41,22 @@ for path, expected in checks:
 print('Backup checksums verified')
 PY
 
+restore_collection="$(MANIFEST="$MANIFEST" QDRANT_COLLECTION="$QDRANT_COLLECTION" python - <<'PY'
+import json, os
+with open(os.environ['MANIFEST'], encoding='utf-8') as f:
+    manifest = json.load(f)
+print((manifest.get('qdrant') or {}).get('collection') or os.environ['QDRANT_COLLECTION'])
+PY
+)"
+restore_alias="$(MANIFEST="$MANIFEST" QDRANT_COLLECTION="$QDRANT_COLLECTION" python - <<'PY'
+import json, os
+with open(os.environ['MANIFEST'], encoding='utf-8') as f:
+    manifest = json.load(f)
+qdrant = manifest.get('qdrant') or {}
+print(qdrant.get('alias') or os.environ.get('QDRANT_INDEX_ALIAS') or f"{os.environ['QDRANT_COLLECTION']}_active")
+PY
+)"
+
 printf 'Restoring PostgreSQL...\n'
 pg_restore \
   --dbname="$POSTGRES_DSN" \
@@ -52,10 +68,39 @@ if [[ -n "${QDRANT_API_KEY:-}" ]]; then
   headers=(-H "api-key: ${QDRANT_API_KEY}")
 fi
 
-printf 'Restoring Qdrant collection %s...\n' "$QDRANT_COLLECTION"
+printf 'Restoring Qdrant physical collection %s...\n' "$restore_collection"
 curl -fsS -X POST \
-  "${QDRANT_URL%/}/collections/${QDRANT_COLLECTION}/snapshots/upload?wait=true&priority=snapshot" \
+  "${QDRANT_URL%/}/collections/${restore_collection}/snapshots/upload?wait=true&priority=snapshot" \
   "${headers[@]}" \
   -F "snapshot=@${QDRANT_SNAPSHOT}" >/dev/null
 
-printf 'Restore complete. Run application readiness and retrieval smoke before reopening traffic.\n'
+aliases_json="$(curl -fsS "${QDRANT_URL%/}/aliases" "${headers[@]}")"
+alias_actions="$(
+  ALIASES_JSON="$aliases_json" \
+  RESTORE_ALIAS="$restore_alias" \
+  RESTORE_COLLECTION="$restore_collection" \
+  python - <<'PY'
+import json, os
+payload = json.loads(os.environ['ALIASES_JSON'])
+alias = os.environ['RESTORE_ALIAS']
+collection = os.environ['RESTORE_COLLECTION']
+exists = any(
+    item.get('alias_name') == alias
+    for item in (payload.get('result') or {}).get('aliases', []) or []
+)
+actions = []
+if exists:
+    actions.append({'delete_alias': {'alias_name': alias}})
+actions.append({'create_alias': {'collection_name': collection, 'alias_name': alias}})
+print(json.dumps({'actions': actions}, separators=(',', ':')))
+PY
+)"
+
+printf 'Restoring Qdrant alias %s -> %s...\n' "$restore_alias" "$restore_collection"
+curl -fsS -X POST \
+  "${QDRANT_URL%/}/collections/aliases" \
+  "${headers[@]}" \
+  -H 'Content-Type: application/json' \
+  --data-raw "$alias_actions" >/dev/null
+
+printf 'Restore complete. Run `python scripts/rag_index.py reconcile` and application readiness before reopening traffic.\n'
