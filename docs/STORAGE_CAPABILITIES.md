@@ -50,7 +50,7 @@ postgres_repo.PostgresRepo -> compatibility re-export only
 
 ## Integration baseline
 
-This capability split is intentionally independent of the model plane. It must remain compatible with the capability-aware LLM/router work merged through #51; CI for this change is therefore expected to validate the storage refactor against the current `main`, not only the earlier #50 registry base.
+This capability split is intentionally independent of the model and embedding planes. It must remain compatible with the capability-aware LLM/router work from #51 and the immutable async embedding contracts from #52; CI for this change is therefore expected to validate the storage refactor against the current `main`, not only the earlier #50 registry base.
 
 ## Extension rule
 
