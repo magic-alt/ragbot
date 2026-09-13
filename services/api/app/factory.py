@@ -21,6 +21,7 @@ from .runtime import is_production, validate_production_environment
 from .runtime_registry import runtime_component_registry
 from .storage.generation_support import ensure_generation_repository
 from .storage.index_support import ensure_index_repository, supports_index_lifecycle
+from .storage.publication_barrier import ensure_worker_claim_gate
 from .storage.repo import InMemoryRepo
 from .storage.upload_support import ensure_upload_repository
 
@@ -53,6 +54,7 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
     ensure_generation_repository(repo)
     ensure_upload_repository(repo)
     ensure_index_repository(repo)
+    ensure_worker_claim_gate(repo)
 
     qdrant_url = os.getenv("QDRANT_URL")
     qdrant_api_key = os.getenv("QDRANT_API_KEY")
@@ -102,10 +104,6 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
         try:
             index_lifecycle.bootstrap_current(default_embedder)
         except Exception:
-            # API and worker replicas can race on the very first post-migration
-            # startup. If another replica registered exactly the alias-visible
-            # physical collection, converge on that durable row; otherwise keep
-            # the original failure fail-closed.
             physical = qdrant.active_collection_name()
             concurrent = repo.get_index_version_by_collection(qdrant_alias, physical)
             if concurrent is None:
