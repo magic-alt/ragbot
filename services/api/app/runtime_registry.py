@@ -94,6 +94,7 @@ def _build_qdrant_vector(config: Mapping[str, Any]):
         api_key=config.get("api_key"),
         collection_name=str(config.get("collection_name") or "rag_chunks"),
         dim=int(config["dim"]),
+        alias_name=str(config.get("alias_name") or "").strip() or None,
     )
 
 
@@ -157,9 +158,9 @@ def _build_configured_reranker(_config: Mapping[str, Any]):
 def _builtin_specs() -> tuple[RuntimeFactorySpec, ...]:
     return (
         RuntimeFactorySpec("repository", "memory", _build_memory_repo, frozenset({"development"})),
-        RuntimeFactorySpec("repository", "postgres", _build_postgres_repo, frozenset({"durable", "queue", "fts", "generations"}), optional_dependency="ragbot[postgres]"),
+        RuntimeFactorySpec("repository", "postgres", _build_postgres_repo, frozenset({"durable", "queue", "fts", "generations", "index-lifecycle"}), optional_dependency="ragbot[postgres]"),
         RuntimeFactorySpec("vector", "memory", _build_memory_vector, frozenset({"development", "dense"})),
-        RuntimeFactorySpec("vector", "qdrant", _build_qdrant_vector, frozenset({"dense", "metadata-filter"}), optional_dependency="ragbot[qdrant]"),
+        RuntimeFactorySpec("vector", "qdrant", _build_qdrant_vector, frozenset({"dense", "metadata-filter", "aliases", "versioned-index"}), optional_dependency="ragbot[qdrant]"),
         RuntimeFactorySpec("embedding", "hash", _build_hash_embedding, frozenset({"development"})),
         RuntimeFactorySpec("embedding", "openai-compatible", _build_openai_compatible_embedding, frozenset({"semantic", "batch"})),
         RuntimeFactorySpec("llm", "openai", _build_openai_llm, frozenset({"structured-output", "json-schema", "streaming", "tools", "web-search"})),
