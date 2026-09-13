@@ -99,7 +99,24 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
         index_lifecycle = IndexLifecycleService(
             repo, qdrant, embedding_router, alias_name=qdrant_alias
         )
-        index_lifecycle.bootstrap_current(default_embedder)
+        try:
+            index_lifecycle.bootstrap_current(default_embedder)
+        except Exception:
+            # API and worker replicas can race on the very first post-migration
+            # startup. If another replica registered exactly the alias-visible
+            # physical collection, converge on that durable row; otherwise keep
+            # the original failure fail-closed.
+            physical = qdrant.active_collection_name()
+            concurrent = repo.get_index_version_by_collection(qdrant_alias, physical)
+            if concurrent is None:
+                raise
+            logger.info(
+                "IndexVersion bootstrap completed concurrently: alias=%s collection=%s version=%s",
+                qdrant_alias,
+                physical,
+                concurrent.index_version_id,
+            )
+            index_lifecycle.bootstrap_current(default_embedder)
         embedder = ActiveIndexEmbedder(
             repo,
             embedding_router,
