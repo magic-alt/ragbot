@@ -11,6 +11,7 @@ from .agent.graph import AgentServices
 from .agent.nodes.code import CodeSearch
 from .agent.nodes.sql import PostgresSqlEngine, SqlEngine
 from .agent.sql_disabled import DisabledSqlEngine
+from .llm.router import build_model_router
 from .retrieval.embedder import HashEmbedder, model_dimension
 from .retrieval.qdrant import InMemoryQdrant
 from .retrieval.service import Retriever
@@ -31,7 +32,6 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def resolve_runtime_profile() -> RuntimeProfile:
-    """Resolve the non-secret provider selections used by this process."""
     return RuntimeProfile.from_environment(
         connector_ids=(spec.component_id for spec in connector_registry().specs())
     )
@@ -44,11 +44,7 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
 
     postgres_dsn = os.getenv("POSTGRES_DSN")
     if repo is None:
-        repo = components.build(
-            "repository",
-            profile.repository_provider,
-            {"dsn": postgres_dsn},
-        )
+        repo = components.build("repository", profile.repository_provider, {"dsn": postgres_dsn})
         logger.info("Using repository provider: %s (%s)", profile.repository_provider, type(repo).__name__)
 
     ensure_generation_repository(repo)
@@ -70,19 +66,9 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
     qdrant = components.build(
         "vector",
         profile.vector_provider,
-        {
-            "url": qdrant_url,
-            "api_key": qdrant_api_key,
-            "collection_name": qdrant_collection,
-            "dim": qdrant_dim,
-        },
+        {"url": qdrant_url, "api_key": qdrant_api_key, "collection_name": qdrant_collection, "dim": qdrant_dim},
     )
-
-    embedder = components.build(
-        "embedding",
-        profile.embedding_provider,
-        {"dimension": qdrant_dim},
-    )
+    embedder = components.build("embedding", profile.embedding_provider, {"dimension": qdrant_dim})
     if embedder.dimension != qdrant.dim:
         raise RuntimeError(
             "Embedding dimension does not match vector store: "
@@ -99,9 +85,7 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
         if isinstance(embedder, HashEmbedder):
             unsafe.append("HashEmbedder")
         if unsafe:
-            raise RuntimeError(
-                "Production services cannot use development fallbacks: " + ", ".join(unsafe)
-            )
+            raise RuntimeError("Production services cannot use development fallbacks: " + ", ".join(unsafe))
 
     reranker = components.build("reranker", profile.reranker_provider)
     retriever = Retriever(repo, qdrant, embedder=embedder, reranker=reranker)
@@ -113,9 +97,7 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
             sql_dsn = postgres_dsn
         if sql_dsn:
             allowed_schemas_raw = os.getenv("RAGBOT_SQL_ALLOWED_SCHEMAS", "")
-            allowed_schemas = [
-                s.strip() for s in allowed_schemas_raw.split(",") if s.strip()
-            ] or None
+            allowed_schemas = [s.strip() for s in allowed_schemas_raw.split(",") if s.strip()] or None
             sql_engine = PostgresSqlEngine(
                 dsn=sql_dsn,
                 allowed_schemas=allowed_schemas,
@@ -125,18 +107,16 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
         elif isinstance(repo, InMemoryRepo):
             sql_engine = SqlEngine(repo)
         else:
-            raise RuntimeError(
-                "RAGBOT_SQL_TOOL_ENABLED=true requires RAGBOT_SQL_DSN "
-                "or an in-memory development repository"
-            )
+            raise RuntimeError("RAGBOT_SQL_TOOL_ENABLED=true requires RAGBOT_SQL_DSN or an in-memory development repository")
     else:
         sql_engine = DisabledSqlEngine()
 
     repo_root = os.getenv("CODE_REPO_ROOT", ".")
     code_search = CodeSearch(repo_roots={"default": repo_root})
-    llm = components.build("llm", profile.llm_provider)
+    llm = build_model_router()
 
     logger.info("Resolved Ragbot runtime profile: %s", profile.as_public_dict())
+    logger.info("Resolved model router: %s", llm.diagnostics())
     return AgentServices(
         repo=repo,
         qdrant=qdrant,

@@ -107,14 +107,41 @@ def _build_openai_compatible_embedding(config: Mapping[str, Any]):
     return build_embedder(dimension=int(config["dimension"]))
 
 
-def _build_openai_llm(_config: Mapping[str, Any]):
+def _endpoint(config: Mapping[str, Any]):
+    endpoint = config.get("endpoint")
+    if endpoint is None:
+        raise ValueError("LLM runtime component requires ModelEndpoint config")
+    return endpoint
+
+
+def _build_openai_llm(config: Mapping[str, Any]):
     from services.api.app.llm.client import OpenAIClient
-    return OpenAIClient()
+    return OpenAIClient(endpoint=_endpoint(config))
 
 
-def _build_ollama_llm(_config: Mapping[str, Any]):
+def _build_ollama_llm(config: Mapping[str, Any]):
     from services.api.app.llm.ollama import OllamaAdapter
-    return OllamaAdapter()
+    return OllamaAdapter(endpoint=_endpoint(config))
+
+
+def _build_anthropic_llm(config: Mapping[str, Any]):
+    from services.api.app.llm.anthropic import AnthropicAdapter
+    return AnthropicAdapter(_endpoint(config))
+
+
+def _build_gemini_llm(config: Mapping[str, Any]):
+    from services.api.app.llm.gemini import GeminiAdapter
+    return GeminiAdapter(_endpoint(config))
+
+
+def _build_azure_llm(config: Mapping[str, Any]):
+    from services.api.app.llm.azure import AzureOpenAIAdapter
+    return AzureOpenAIAdapter(_endpoint(config))
+
+
+def _build_bedrock_llm(config: Mapping[str, Any]):
+    from services.api.app.llm.bedrock import BedrockAdapter
+    return BedrockAdapter(_endpoint(config))
 
 
 def _build_noop_reranker(_config: Mapping[str, Any]):
@@ -135,8 +162,14 @@ def _builtin_specs() -> tuple[RuntimeFactorySpec, ...]:
         RuntimeFactorySpec("vector", "qdrant", _build_qdrant_vector, frozenset({"dense", "metadata-filter"}), optional_dependency="ragbot[qdrant]"),
         RuntimeFactorySpec("embedding", "hash", _build_hash_embedding, frozenset({"development"})),
         RuntimeFactorySpec("embedding", "openai-compatible", _build_openai_compatible_embedding, frozenset({"semantic", "batch"})),
-        RuntimeFactorySpec("llm", "openai", _build_openai_llm, frozenset({"structured-output", "streaming", "web-search"})),
-        RuntimeFactorySpec("llm", "ollama", _build_ollama_llm, frozenset({"structured-output", "streaming"})),
+        RuntimeFactorySpec("llm", "openai", _build_openai_llm, frozenset({"structured-output", "json-schema", "streaming", "tools", "web-search"})),
+        RuntimeFactorySpec("llm", "openai-compatible", _build_openai_llm, frozenset({"structured-output", "json-schema", "streaming"})),
+        RuntimeFactorySpec("llm", "ollama", _build_ollama_llm, frozenset({"structured-output", "json-schema", "streaming"})),
+        RuntimeFactorySpec("llm", "anthropic", _build_anthropic_llm, frozenset({"structured-output", "streaming", "tools"})),
+        RuntimeFactorySpec("llm", "gemini", _build_gemini_llm, frozenset({"structured-output", "json-schema", "streaming", "tools"})),
+        RuntimeFactorySpec("llm", "vertex", _build_gemini_llm, frozenset({"structured-output", "json-schema", "streaming", "tools"})),
+        RuntimeFactorySpec("llm", "azure-openai", _build_azure_llm, frozenset({"structured-output", "json-schema", "streaming", "tools"})),
+        RuntimeFactorySpec("llm", "bedrock", _build_bedrock_llm, frozenset({"structured-output", "tools"}), optional_dependency="ragbot[s3]"),
         RuntimeFactorySpec("reranker", "none", _build_noop_reranker),
         RuntimeFactorySpec("reranker", "cohere", _build_configured_reranker, frozenset({"rerank"})),
         RuntimeFactorySpec("reranker", "local", _build_configured_reranker, frozenset({"rerank"})),

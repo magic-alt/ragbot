@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
 
-import httpx
+from .contracts import ModelCapabilities, ModelEndpoint, ModelUsage, UsageMixin
+from .transport import HttpModelTransport
 
-logger = logging.getLogger(__name__)
 
-
-class OpenAIClient:
+class OpenAIClient(UsageMixin):
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -20,14 +18,56 @@ class OpenAIClient:
         timeout: int = 30,
         organization: Optional[str] = None,
         project: Optional[str] = None,
+        *,
+        endpoint: Optional[ModelEndpoint] = None,
+        transport: Optional[HttpModelTransport] = None,
     ) -> None:
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self.base_url = (base_url or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com").rstrip("/")
-        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        super().__init__()
+        if endpoint is None:
+            endpoint = ModelEndpoint(
+                provider_id="openai",
+                model_id=model or os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                base_url=(base_url or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com").rstrip("/"),
+                api_key=api_key or os.getenv("OPENAI_API_KEY", ""),
+                organization=organization or os.getenv("OPENAI_ORGANIZATION", ""),
+                project=project or os.getenv("OPENAI_PROJECT", ""),
+                timeout_seconds=float(timeout),
+                capabilities=ModelCapabilities(
+                    structured_output=True,
+                    json_schema=True,
+                    streaming=True,
+                    tools=True,
+                    web_search=True,
+                    vision=True,
+                    reasoning=True,
+                    batch=True,
+                ),
+            )
+        self.endpoint = endpoint
+        self.api_key = endpoint.api_key
+        self.base_url = endpoint.base_url.rstrip("/")
+        self.model = endpoint.model_id
         self.web_model = web_model or os.getenv("OPENAI_WEB_MODEL", self.model)
-        self.timeout = timeout
-        self.organization = organization or os.getenv("OPENAI_ORGANIZATION")
-        self.project = project or os.getenv("OPENAI_PROJECT")
+        self.organization = endpoint.organization
+        self.project = endpoint.project
+        self._transport = transport or HttpModelTransport(
+            timeout_seconds=endpoint.timeout_seconds,
+            max_attempts=endpoint.max_attempts,
+            concurrency=endpoint.concurrency,
+        )
+        self._owns_transport = transport is None
+
+    @property
+    def provider_id(self) -> str:
+        return self.endpoint.provider_id
+
+    @property
+    def model_id(self) -> str:
+        return self.endpoint.model_id
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        return self.endpoint.capabilities
 
     @property
     def enabled(self) -> bool:
@@ -62,6 +102,7 @@ class OpenAIClient:
         if max_output_tokens:
             payload["max_tokens"] = max_output_tokens
         data = await self._post_json("/v1/chat/completions", payload)
+        self._record_usage(_openai_usage(data.get("usage")))
         content = data["choices"][0]["message"]["content"]
         return json.loads(content)
 
@@ -82,6 +123,7 @@ class OpenAIClient:
             ],
             "temperature": temperature,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if max_output_tokens:
             payload["max_tokens"] = max_output_tokens
@@ -111,7 +153,6 @@ class OpenAIClient:
         tool: Dict[str, Any] = {"type": "web_search"}
         if allowed_domains:
             tool["filters"] = {"allowed_domains": allowed_domains}
-
         payload = {
             "model": self.web_model,
             "tools": [tool],
@@ -120,50 +161,56 @@ class OpenAIClient:
             "include": ["web_search_call.action.sources"],
         }
         data = await self._post_json("/v1/responses", payload)
+        self._record_usage(_openai_usage(data.get("usage")))
         return _extract_web_sources(data)
 
     async def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        url = f"{self.base_url}{path}"
-        headers = self._build_headers()
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    url, headers=headers, json=payload, timeout=self.timeout
-                )
-                response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"LLM API request failed: {type(exc).__name__}: {_sanitize_error(exc)}") from None
-        return response.json()
+        return await self._transport.post_json(
+            f"{self.base_url}{path}",
+            headers=self._build_headers(),
+            json=payload,
+        )
 
     async def _stream_chat(self, payload: Dict[str, Any]) -> AsyncIterator[str]:
-        url = f"{self.base_url}/v1/chat/completions"
-        headers = self._build_headers()
-        try:
-            async with httpx.AsyncClient() as client:
-                async with client.stream(
-                    "POST", url, headers=headers, json=payload, timeout=self.timeout
-                ) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        if not line:
-                            continue
-                        if not line.startswith("data: "):
-                            continue
-                        data = line[len("data: "):].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-                        if not event.get("choices"):
-                            continue
-                        delta = event["choices"][0].get("delta", {})
-                        content = delta.get("content")
-                        if content:
-                            yield content
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"LLM API stream failed: {type(exc).__name__}: {_sanitize_error(exc)}") from None
+        async for line in self._transport.stream_lines(
+            f"{self.base_url}/v1/chat/completions",
+            headers=self._build_headers(),
+            json=payload,
+        ):
+            if not line or not line.startswith("data: "):
+                continue
+            raw = line[len("data: "):].strip()
+            if raw == "[DONE]":
+                break
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if event.get("usage"):
+                self._record_usage(_openai_usage(event.get("usage")))
+            if not event.get("choices"):
+                continue
+            delta = event["choices"][0].get("delta", {})
+            content = delta.get("content")
+            if content:
+                yield content
+
+    async def aclose(self) -> None:
+        if self._owns_transport:
+            await self._transport.aclose()
+
+
+def _openai_usage(raw: Any) -> Optional[ModelUsage]:
+    if not isinstance(raw, dict):
+        return None
+    input_details = raw.get("prompt_tokens_details") or raw.get("input_tokens_details") or {}
+    output_details = raw.get("completion_tokens_details") or raw.get("output_tokens_details") or {}
+    return ModelUsage(
+        input_tokens=int(raw.get("prompt_tokens", raw.get("input_tokens", 0)) or 0),
+        output_tokens=int(raw.get("completion_tokens", raw.get("output_tokens", 0)) or 0),
+        cached_input_tokens=int(input_details.get("cached_tokens", 0) or 0),
+        reasoning_tokens=int(output_details.get("reasoning_tokens", 0) or 0),
+    )
 
 
 def _extract_web_sources(data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -179,14 +226,13 @@ def _extract_web_sources(data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 for ann in content.get("annotations", []) or []:
                     if ann.get("type") != "url_citation":
                         continue
-                    source = {
+                    sources.append(_normalize_source({
                         "url": ann.get("url", ""),
                         "title": ann.get("title", ""),
                         "snippet": text,
                         "published_at": ann.get("published_at") or ann.get("date"),
                         "score": ann.get("score"),
-                    }
-                    sources.append(_normalize_source(source))
+                    }))
     return _dedupe_sources(sources)
 
 
@@ -210,19 +256,3 @@ def _dedupe_sources(sources: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         seen.add(url)
         output.append(source)
     return output
-
-
-def _sanitize_error(exc: Exception) -> str:
-    msg = str(exc)
-    if hasattr(exc, "response") and exc.response is not None:
-        return f"HTTP {exc.response.status_code}"
-    for prefix in ("Bearer ", "sk-", "key-"):
-        while prefix in msg:
-            start = msg.index(prefix)
-            end = msg.find(" ", start + len(prefix))
-            if end == -1:
-                end = msg.find("'", start + len(prefix))
-            if end == -1:
-                end = len(msg)
-            msg = msg[:start] + "[REDACTED]" + msg[end:]
-    return msg
