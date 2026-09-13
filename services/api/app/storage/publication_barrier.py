@@ -29,8 +29,6 @@ def shared_claim_barrier(repo: Any) -> Iterator[None]:
     """Allow concurrent worker claims, but wait behind an index cutover."""
     conn = _standalone_pg_connection(repo)
     if conn is None:
-        # Index lifecycle is production-PostgreSQL only today. Keep a lightweight
-        # local lock fallback for tests/custom built-ins without widening Repo.
         lock = getattr(repo, "_publication_claim_gate", None)
         if lock is None:
             lock = threading.RLock()
@@ -109,3 +107,51 @@ def running_ingestion_count(repo: Any, barrier_connection: Optional[Any] = None)
     if not callable(list_jobs):
         return 0
     return sum(1 for job in list_jobs() if getattr(job, "status", None) == "running")
+
+
+def ensure_index_cutover_gate(service: Any) -> Any:
+    """Wrap activate/rollback so no ingestion is in flight across alias cutover.
+
+    A worker writes candidate vectors before the PostgreSQL generation becomes
+    active. Merely locking the final PG generation transaction is therefore too
+    late: an already-running job may have prepared vectors in the old physical
+    index. The cutover rule is stricter:
+
+    1. take the exclusive publication gate, which blocks *new* durable claims;
+    2. require the current running-job count to be zero;
+    3. while still holding the gate, execute fingerprint check + alias switch +
+       IndexVersion PG activation/rollback;
+    4. release the gate, after which pending jobs claim and naturally use the
+       newly alias-visible index/embedding contract.
+
+    Worker claims use the shared form of the same PostgreSQL advisory lock, so
+    multiple workers remain concurrent during normal operation.
+    """
+    if getattr(service, "_ragbot_index_cutover_gate_installed", False):
+        return service
+
+    for method_name in ("activate", "rollback"):
+        original = getattr(service, method_name, None)
+        if not callable(original):
+            continue
+
+        def make_gated(bound_method, operation_name: str):
+            def gated(*args, **kwargs):
+                with exclusive_cutover_barrier(service.repo) as connection:
+                    running = running_ingestion_count(service.repo, connection)
+                    if running:
+                        raise RuntimeError(
+                            "Index cutover requires a quiescent durable ingestion boundary: "
+                            f"running_jobs={running}. Wait for current jobs to reach a terminal state; "
+                            "new claims are gated only during the cutover attempt."
+                        )
+                    return bound_method(*args, **kwargs)
+
+            gated.__name__ = getattr(bound_method, "__name__", operation_name)
+            gated.__doc__ = getattr(bound_method, "__doc__", None)
+            return gated
+
+        setattr(service, method_name, make_gated(original, method_name))
+
+    setattr(service, "_ragbot_index_cutover_gate_installed", True)
+    return service
