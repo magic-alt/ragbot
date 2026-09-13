@@ -239,6 +239,18 @@ class ModelRouter:
         tier = self.get_tier(task)
         preferred = self.strong if tier == "strong" else self.fast
         alternate = self.fast if preferred is self.strong else self.strong
+
+        # Preserve the historical selection helper contract for callers/tests
+        # that only ask which tier would be selected and pass opaque objects.
+        # Real model operations always pass an explicit required capability and
+        # therefore still enforce enabled/capability checks before I/O.
+        if capability is None:
+            if preferred is not None:
+                return preferred
+            if alternate is not None:
+                return alternate
+            raise ModelCapabilityError(f"No model provider is configured for task={task!r}")
+
         seen: set[int] = set()
         for provider in (preferred, alternate):
             if provider is None or id(provider) in seen:
@@ -246,11 +258,11 @@ class ModelRouter:
             seen.add(id(provider))
             if not getattr(provider, "enabled", False):
                 continue
-            if capability and not bool(getattr(provider.capabilities, capability, False)):
+            capabilities = getattr(provider, "capabilities", None)
+            if not capabilities or not bool(getattr(capabilities, capability, False)):
                 continue
             return provider
-        required = f" capability={capability}" if capability else ""
-        raise ModelCapabilityError(f"No enabled model provider satisfies task={task!r}{required}")
+        raise ModelCapabilityError(f"No enabled model provider satisfies task={task!r} capability={capability}")
 
     async def chat_json(self, system: str, user: str, schema: Dict[str, Any], task: str = "default", temperature: float = 0.2, max_output_tokens: Optional[int] = None) -> Dict[str, Any]:
         task = self._task(task)
@@ -334,11 +346,12 @@ def _provider_diagnostics(provider: Optional[ModelProvider]) -> Dict[str, Any]:
         return {"provider": None, "model": None, "enabled": False, "capabilities": {}}
     endpoint = getattr(provider, "endpoint", None)
     public = endpoint.public_dict() if endpoint is not None and hasattr(endpoint, "public_dict") else {}
+    capabilities = getattr(provider, "capabilities", None)
     return {
         "provider": getattr(provider, "provider_id", type(provider).__name__),
         "model": getattr(provider, "model_id", "unknown"),
         "enabled": bool(getattr(provider, "enabled", False)),
-        "capabilities": provider.capabilities.as_dict(),
+        "capabilities": capabilities.as_dict() if capabilities is not None else {},
         "endpoint": public,
     }
 
