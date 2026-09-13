@@ -242,7 +242,7 @@ jobs:
 
       - name: Verify restored state and alias
         run: |
-          count="$(psql "$POSTGRES_DSN" -Atc "SELECT COUNT(*) FROM sources WHERE source_id='recovery-source')"
+          count="$(psql "$POSTGRES_DSN" -Atc "SELECT COUNT(*) FROM sources WHERE source_id='recovery-source'")"
           test "$count" = "1"
           python - <<'PY'
           import json, os, urllib.request
