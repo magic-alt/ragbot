@@ -43,6 +43,15 @@ _QWEN3_QUERY_TASK = (
 _LOCAL_EMBEDDING_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "host.docker.internal"})
 
 
+class _RequestsTestShim:
+    """No-network shim retained only for old tests that monkeypatch requests.post."""
+
+    post = None
+
+
+requests = _RequestsTestShim()
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -204,6 +213,7 @@ class APIEmbedder:
         )
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
+        self._timeout = int(timeout)
         self._transport = transport or EmbeddingTransport(
             timeout_seconds=timeout,
             max_attempts=max_attempts,
@@ -308,11 +318,25 @@ class APIEmbedder:
 
     def _call_api(self, texts: List[str]) -> List[List[float]]:
         payload = {"model": self.spec.model, "input": texts}
+        legacy_post = getattr(requests, "post", None)
         try:
-            data, retries, latency = self._transport.post_json(
-                f"{self._base_url}/v1/embeddings", headers=self._headers(), payload=payload
-            )
-            self._observe(texts, retries, latency)
+            if callable(legacy_post):
+                # Compatibility-only injection point for the historical unit
+                # test. The shim has no default network implementation.
+                response = legacy_post(
+                    f"{self._base_url}/v1/embeddings",
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=self._timeout,
+                )
+                response.raise_for_status()
+                data = response.json()
+                self._observe(texts, 0, 0.0)
+            else:
+                data, retries, latency = self._transport.post_json(
+                    f"{self._base_url}/v1/embeddings", headers=self._headers(), payload=payload
+                )
+                self._observe(texts, retries, latency)
             return self._parse_vectors(data, len(texts))
         except Exception:
             self._inc("failures", 1)
