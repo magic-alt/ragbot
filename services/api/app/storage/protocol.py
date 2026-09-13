@@ -66,6 +66,16 @@ class JobQueueRepo(Protocol):
 
 
 @runtime_checkable
+class IngestionRepo(KnowledgeCatalogRepo, ACLRepo, SourceRepo, JobQueueRepo, Protocol):
+    """Persistence surface required by the ingestion/worker data plane."""
+
+
+@runtime_checkable
+class ControlPlaneRepo(SourceRepo, JobQueueRepo, ACLRepo, Protocol):
+    """Persistence surface required by source/job/RBAC control-plane APIs."""
+
+
+@runtime_checkable
 class DebugStateRepo(Protocol):
     def healthcheck(self) -> bool: ...
     def export_state(self) -> Dict[str, List[dict]]: ...
@@ -81,10 +91,7 @@ class DevelopmentTableRepo(Protocol):
 
 @runtime_checkable
 class Repo(
-    KnowledgeCatalogRepo,
-    ACLRepo,
-    SourceRepo,
-    JobQueueRepo,
+    IngestionRepo,
     DebugStateRepo,
     DevelopmentTableRepo,
     Protocol,
@@ -94,7 +101,7 @@ class Repo(
 
 @runtime_checkable
 class GenerationRepo(Protocol):
-    """Optional staged-generation publication and cleanup capability."""
+    """Optional staged-generation publication capability."""
 
     def begin_knowledge_generation(self, generation: KnowledgeGeneration) -> None: ...
     def stage_knowledge_generation(
