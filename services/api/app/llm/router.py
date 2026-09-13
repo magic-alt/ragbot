@@ -5,6 +5,8 @@ import json
 import os
 import threading
 import time
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional
 
@@ -62,20 +64,10 @@ class CostTracker:
         self._max_history = max_history
         self._pricing = pricing or _pricing_from_env()
 
-    def record(
-        self,
-        *,
-        task: str,
-        tier: str,
-        provider: ModelProvider,
-        usage: ModelUsage,
-        usage_source: str = "provider",
-    ) -> CostRecord:
+    def record(self, *, task: str, tier: str, provider: ModelProvider, usage: ModelUsage, usage_source: str = "provider") -> CostRecord:
         identity = f"{getattr(provider, 'provider_id', 'unknown')}:{getattr(provider, 'model_id', 'unknown')}"
         price = self._pricing.get(identity) or self._pricing.get(getattr(provider, "model_id", "")) or ModelPrice()
-        cached_rate = price.cached_input_per_million
-        if cached_rate is None:
-            cached_rate = price.input_per_million
+        cached_rate = price.cached_input_per_million if price.cached_input_per_million is not None else price.input_per_million
         uncached_input = max(0, usage.input_tokens - usage.cached_input_tokens)
         estimated = (
             uncached_input * price.input_per_million
@@ -154,17 +146,12 @@ class _TaskBoundModel:
 class ModelRouter:
     """Task-aware provider router with capability validation and fallback."""
 
-    def __init__(
-        self,
-        fast_provider: ModelProvider,
-        strong_provider: Optional[ModelProvider] = None,
-        routing_enabled: bool = False,
-        cost_tracker: Optional[CostTracker] = None,
-    ) -> None:
+    def __init__(self, fast_provider: ModelProvider, strong_provider: Optional[ModelProvider] = None, routing_enabled: bool = False, cost_tracker: Optional[CostTracker] = None) -> None:
         self.fast = fast_provider
         self.strong = strong_provider or fast_provider
         self.routing_enabled = routing_enabled
         self.cost_tracker = cost_tracker or CostTracker()
+        self._task_context: ContextVar[str] = ContextVar(f"ragbot_model_task_{id(self)}", default="default")
 
     @property
     def provider_id(self) -> str:
@@ -176,8 +163,6 @@ class ModelRouter:
 
     @property
     def capabilities(self) -> ModelCapabilities:
-        # Router capabilities are the union for diagnostics; selection still
-        # validates the actual provider chosen for every operation.
         return ModelCapabilities(
             structured_output=self.fast.capabilities.structured_output or self.strong.capabilities.structured_output,
             json_schema=self.fast.capabilities.json_schema or self.strong.capabilities.json_schema,
@@ -194,15 +179,28 @@ class ModelRouter:
     def enabled(self) -> bool:
         return bool(getattr(self.fast, "enabled", False) or getattr(self.strong, "enabled", False))
 
+    @contextmanager
+    def task_scope(self, task: str):
+        token = self._task_context.set(task)
+        try:
+            yield
+        finally:
+            self._task_context.reset(token)
+
     def for_task(self, task: str) -> _TaskBoundModel:
         return _TaskBoundModel(self, task)
 
+    def _task(self, task: str) -> str:
+        return self._task_context.get() if task == "default" else task
+
     def get_tier(self, task: str = "default") -> ModelTier:
+        task = self._task(task)
         if not self.routing_enabled:
             return "fast"
         return TASK_TIER_MAP.get(task, "fast")
 
     def get_provider(self, task: str = "default", *, capability: Optional[str] = None) -> ModelProvider:
+        task = self._task(task)
         tier = self.get_tier(task)
         preferred = self.strong if tier == "strong" else self.fast
         alternate = self.fast if preferred is self.strong else self.strong
@@ -215,53 +213,24 @@ class ModelRouter:
         required = f" capability={capability}" if capability else ""
         raise ModelCapabilityError(f"No enabled model provider satisfies task={task!r}{required}")
 
-    async def chat_json(
-        self,
-        system: str,
-        user: str,
-        schema: Dict[str, Any],
-        task: str = "default",
-        temperature: float = 0.2,
-        max_output_tokens: Optional[int] = None,
-    ) -> Dict[str, Any]:
+    async def chat_json(self, system: str, user: str, schema: Dict[str, Any], task: str = "default", temperature: float = 0.2, max_output_tokens: Optional[int] = None) -> Dict[str, Any]:
+        task = self._task(task)
         provider = self.get_provider(task, capability="structured_output")
-        result = await provider.chat_json(
-            system=system,
-            user=user,
-            schema=schema,
-            temperature=temperature,
-            max_output_tokens=max_output_tokens,
-        )
+        result = await provider.chat_json(system=system, user=user, schema=schema, temperature=temperature, max_output_tokens=max_output_tokens)
         self._record(provider, task, system, user, result)
         return result
 
-    async def stream_text(
-        self,
-        system: str,
-        user: str,
-        task: str = "default",
-        temperature: float = 0.2,
-        max_output_tokens: Optional[int] = None,
-    ) -> AsyncIterator[str]:
+    async def stream_text(self, system: str, user: str, task: str = "default", temperature: float = 0.2, max_output_tokens: Optional[int] = None) -> AsyncIterator[str]:
+        task = self._task(task)
         provider = self.get_provider(task, capability="streaming")
         output: List[str] = []
-        async for chunk in provider.stream_text(
-            system=system,
-            user=user,
-            temperature=temperature,
-            max_output_tokens=max_output_tokens,
-        ):
+        async for chunk in provider.stream_text(system=system, user=user, temperature=temperature, max_output_tokens=max_output_tokens):
             output.append(chunk)
             yield chunk
         self._record(provider, task, system, user, "".join(output))
 
-    async def web_search(
-        self,
-        query: str,
-        allowed_domains: Optional[List[str]] = None,
-        recency_days: Optional[int] = None,
-        task: str = "web_search",
-    ) -> List[Dict[str, Any]]:
+    async def web_search(self, query: str, allowed_domains: Optional[List[str]] = None, recency_days: Optional[int] = None, task: str = "default") -> List[Dict[str, Any]]:
+        task = self._task(task if task != "default" else "web_search")
         provider = self.get_provider(task, capability="web_search")
         result = await provider.web_search(query, allowed_domains, recency_days)
         self._record(provider, task, "", query, result)
@@ -273,17 +242,8 @@ class ModelRouter:
         source = "provider"
         if usage is None:
             source = "estimated"
-            usage = ModelUsage(
-                input_tokens=(len(system) + len(user)) // 4,
-                output_tokens=len(str(result)) // 4,
-            )
-        self.cost_tracker.record(
-            task=task,
-            tier=self.get_tier(task),
-            provider=provider,
-            usage=usage,
-            usage_source=source,
-        )
+            usage = ModelUsage(input_tokens=(len(system) + len(user)) // 4, output_tokens=len(str(result)) // 4)
+        self.cost_tracker.record(task=task, tier=self.get_tier(task), provider=provider, usage=usage, usage_source=source)
 
     def diagnostics(self) -> Dict[str, Any]:
         return {
@@ -310,9 +270,13 @@ class ModelRouter:
 
 
 def model_for_task(model: Any, task: str) -> Any:
-    """Bind a task when a router is present while preserving simple test fakes."""
     binder = getattr(model, "for_task", None)
     return binder(task) if callable(binder) else model
+
+
+def model_task_scope(model: Any, task: str):
+    scope = getattr(model, "task_scope", None)
+    return scope(task) if callable(scope) else nullcontext()
 
 
 def build_model_router() -> ModelRouter:
@@ -355,10 +319,6 @@ def _pricing_from_env() -> Dict[str, ModelPrice]:
         output[str(identity)] = ModelPrice(
             input_per_million=float(value.get("input_per_million", 0.0)),
             output_per_million=float(value.get("output_per_million", 0.0)),
-            cached_input_per_million=(
-                float(value["cached_input_per_million"])
-                if value.get("cached_input_per_million") is not None
-                else None
-            ),
+            cached_input_per_million=(float(value["cached_input_per_million"]) if value.get("cached_input_per_million") is not None else None),
         )
     return output
