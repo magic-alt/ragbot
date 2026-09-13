@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, runtime
 from contracts.types import SqlResult
 
 from ..llm.provider import ModelProvider
-from ..llm.router import build_model_router
+from ..llm.router import build_model_router, model_task_scope
 from ..observability.metrics import build_request_metrics, get_metrics_collector
 from ..observability.tracing import RequestTracer
 from ..retrieval.cross_encoder import NoOpReranker, Reranker
@@ -121,7 +121,8 @@ async def run_agent(
             state.evidence.extend(initial_evidence)
 
         with tracer.span("route") as span:
-            state = await route_node(state, services)
+            with model_task_scope(services.llm, "route"):
+                state = await route_node(state, services)
             span.attributes["route"] = state.route or ""
         cb.emit(AgentEvent("route", {"route": state.route, "request_id": state.request_id}))
 
@@ -131,20 +132,21 @@ async def run_agent(
             prev_calls = len(state.tool_calls)
 
             with tracer.span(action, iteration=state.iteration) as span:
-                if action == "sql_query":
-                    state = await sql_node(state, services)
-                elif action == "code_search":
-                    state = await code_node(state, services)
-                elif action == "open_file":
-                    state = await open_file_node(state, services)
-                elif action == "apply_patch":
-                    state = await apply_patch_node(state, services)
-                elif action == "explain_error":
-                    state = await explain_error_node(state, services)
-                elif action == "retrieve":
-                    state = await retrieve_node(state, services)
-                elif action == "web_search":
-                    state = await web_node(state, services)
+                with model_task_scope(services.llm, action):
+                    if action == "sql_query":
+                        state = await sql_node(state, services)
+                    elif action == "code_search":
+                        state = await code_node(state, services)
+                    elif action == "open_file":
+                        state = await open_file_node(state, services)
+                    elif action == "apply_patch":
+                        state = await apply_patch_node(state, services)
+                    elif action == "explain_error":
+                        state = await explain_error_node(state, services)
+                    elif action == "retrieve":
+                        state = await retrieve_node(state, services)
+                    elif action == "web_search":
+                        state = await web_node(state, services)
 
                 new_calls = state.tool_calls[prev_calls:]
                 span.attributes["tool_calls"] = len(new_calls)
@@ -168,15 +170,18 @@ async def run_agent(
                 }))
 
             with tracer.span("synthesize", iteration=state.iteration):
-                state = await synthesize_node(state, services)
+                with model_task_scope(services.llm, "synthesize"):
+                    state = await synthesize_node(state, services)
             with tracer.span("verify", iteration=state.iteration):
-                state = await verify_node(state, services)
+                with model_task_scope(services.llm, "verify"):
+                    state = await verify_node(state, services)
             if not _should_continue(state):
                 break
             action = _next_step(state)
 
         with tracer.span("finalize"):
-            state = await finalize_node(state, services)
+            with model_task_scope(services.llm, "finalize"):
+                state = await finalize_node(state, services)
 
         trace_record = tracer.finish()
         metrics = build_request_metrics(state, trace_record)
