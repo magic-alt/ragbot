@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from services.api.app.storage.index_support import ensure_index_repository
-from services.api.app.storage.models import IndexVersion
+from services.api.app.storage.models import Chunk, Document, IndexVersion
 from services.api.app.storage.pg_repo import PostgresRepo
 
 pytestmark = pytest.mark.skipif(
@@ -37,13 +37,48 @@ def test_postgres_index_version_activation_rollback_and_retention() -> None:
     repo = PostgresRepo(os.environ["POSTGRES_TEST_DSN"], pool_min=1, pool_max=2)
     ensure_index_repository(repo)
     suffix = uuid.uuid4().hex[:12]
+    tenant_id = f"index-tenant-{suffix}"
+    doc_id = f"index-doc-{suffix}"
+    chunk_id = f"index-chunk-{suffix}"
+    now = datetime.now(timezone.utc).isoformat()
     try:
+        repo.add_document(
+            Document(
+                doc_id=doc_id,
+                tenant_id=tenant_id,
+                source_type="pdf",
+                title="Index lifecycle",
+                uri=f"source://index-{suffix}",
+                version="1",
+                doc_updated_at=now,
+                ingested_at=now,
+            )
+        )
+        repo.add_chunk(
+            Chunk(
+                chunk_id=chunk_id,
+                doc_id=doc_id,
+                tenant_id=tenant_id,
+                chunk_index=0,
+                text="index lifecycle integration",
+                checksum=f"checksum-{suffix}",
+                qdrant_point_id=str(uuid.uuid4()),
+                metadata={
+                    "embedding_contract_id": "emb-old",
+                    "embedding_model": "old",
+                    "embedding_dimension": 4,
+                },
+            )
+        )
+
         old = _version(suffix, "old", status="active", contract="emb-old", dim=4)
+        old.tenant_id = tenant_id
         new = _version(suffix, "new", status="ready", contract="emb-new", dim=6)
+        new.tenant_id = tenant_id
         repo.add_index_version(old)
         repo.add_index_version(new)
 
-        assert repo.get_active_index_version(old.alias_name).index_version_id == old.index_version_id
+        assert repo.get_active_index_version(old.alias_name, tenant_id=tenant_id).index_version_id == old.index_version_id
         assert repo.get_index_version_by_collection(old.alias_name, new.physical_collection).index_version_id == new.index_version_id
 
         delete_after = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
@@ -53,10 +88,15 @@ def test_postgres_index_version_activation_rollback_and_retention() -> None:
             delete_after=delete_after,
         )
         assert activated.status == "active"
-        assert repo.get_active_index_version(old.alias_name).index_version_id == new.index_version_id
+        assert repo.get_active_index_version(old.alias_name, tenant_id=tenant_id).index_version_id == new.index_version_id
         retired_old = repo.get_index_version(old.index_version_id)
         assert retired_old.status == "retired"
         assert retired_old.delete_after is not None
+        active_chunk = repo.get_chunk(chunk_id)
+        assert active_chunk is not None
+        assert active_chunk.metadata["embedding_contract_id"] == "emb-new"
+        assert active_chunk.metadata["embedding_model"] == "new"
+        assert active_chunk.metadata["embedding_dimension"] == 6
 
         rolled_back = repo.activate_index_version(
             old.index_version_id,
@@ -64,9 +104,14 @@ def test_postgres_index_version_activation_rollback_and_retention() -> None:
             delete_after=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
         )
         assert rolled_back.status == "active"
-        assert repo.get_active_index_version(old.alias_name).index_version_id == old.index_version_id
+        assert repo.get_active_index_version(old.alias_name, tenant_id=tenant_id).index_version_id == old.index_version_id
         retired_new = repo.get_index_version(new.index_version_id)
         assert retired_new.status == "retired"
+        rolled_back_chunk = repo.get_chunk(chunk_id)
+        assert rolled_back_chunk is not None
+        assert rolled_back_chunk.metadata["embedding_contract_id"] == "emb-old"
+        assert rolled_back_chunk.metadata["embedding_model"] == "old"
+        assert rolled_back_chunk.metadata["embedding_dimension"] == 4
 
         repo.update_index_version(
             new.index_version_id,
@@ -76,6 +121,8 @@ def test_postgres_index_version_activation_rollback_and_retention() -> None:
         assert new.index_version_id in {item.index_version_id for item in prunable}
     finally:
         with repo._pool.connection() as conn:
+            conn.execute("DELETE FROM chunks WHERE chunk_id = %s", (chunk_id,))
+            conn.execute("DELETE FROM documents WHERE doc_id = %s", (doc_id,))
             conn.execute(
                 "DELETE FROM vector_index_versions WHERE alias_name = %s",
                 (f"rag-index-{suffix}-active",),
