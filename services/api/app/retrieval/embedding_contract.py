@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass
-from typing import Any, Optional
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -13,7 +13,9 @@ class EmbeddingSpec:
     dimension: int
     revision: str = ""
     distance: str = "cosine"
-    normalize: bool = True
+    # Preserve the current production contract: providers own vector
+    # normalization unless this is explicitly enabled and reindexed.
+    normalize: bool = False
     query_instruction: str = ""
     document_instruction: str = ""
     max_batch_items: int = 100
