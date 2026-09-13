@@ -435,9 +435,9 @@ class _PostgresIndexRepo:
                     """
                     UPDATE chunks
                     SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
-                        'embedding_contract_id', %(contract_id)s,
-                        'embedding_model', %(model)s,
-                        'embedding_dimension', %(dimension)s
+                        'embedding_contract_id', %(contract_id)s::text,
+                        'embedding_model', %(model)s::text,
+                        'embedding_dimension', %(dimension)s::integer
                     )
                     WHERE %(tenant_id)s::text IS NULL OR tenant_id = %(tenant_id)s::text
                     """,
