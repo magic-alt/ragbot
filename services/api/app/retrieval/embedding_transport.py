@@ -36,7 +36,10 @@ class EmbeddingTransport:
         async_client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         if timeout_seconds <= 0 or max_attempts < 1 or concurrency < 1:
-            raise ValueError("embedding transport timeout/attempts/concurrency must be positive")
+            # Preserve the historical configuration error wording consumed by
+            # existing CLI/tests while extending validation to attempts and
+            # concurrency in the new pooled transport.
+            raise ValueError("embedding transport timeout/attempts/concurrency must be > 0")
         self.timeout_seconds = float(timeout_seconds)
         self.max_attempts = int(max_attempts)
         self._async_semaphore = asyncio.Semaphore(int(concurrency))
