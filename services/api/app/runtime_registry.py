@@ -76,7 +76,15 @@ def _build_postgres_repo(config: Mapping[str, Any]):
     dsn = str(config.get("dsn") or "").strip()
     if not dsn:
         raise ValueError("repository:postgres requires dsn")
-    return ManagedPostgresRepo(dsn=dsn)
+    repo = ManagedPostgresRepo(dsn=dsn)
+    # The publication barrier must open an independent PostgreSQL session so a
+    # session-level advisory lock does not consume one pooled connection while
+    # activation itself performs normal repository transactions. Keep the
+    # original DSN privately on the runtime object: Connection.info.dsn may
+    # intentionally redact password material and is therefore not sufficient to
+    # reconnect to password-protected databases.
+    setattr(repo, "_ragbot_dsn", dsn)
+    return repo
 
 
 def _build_memory_vector(config: Mapping[str, Any]):
