@@ -78,6 +78,7 @@ def _chunk(chunk_id: str, text: str) -> Chunk:
         tenant_id="tenant-a",
         chunk_index=int(chunk_id[-1]),
         text=text,
+        checksum=f"checksum-{chunk_id}",
         metadata={
             "source_type": "pdf",
             "acl_hash": "public",
@@ -96,9 +97,11 @@ def _seed_legacy(store, embedder, chunks):
     points = []
     for chunk in chunks:
         vector = embedder.embed(chunk.text)
+        point_id = point_id_for_chunk(chunk.chunk_id)
+        chunk.qdrant_point_id = point_id
         payload = _build_payload(chunk, embedder.model_name)
         payload["embedding_contract_id"] = embedder.contract_id
-        points.append((point_id_for_chunk(chunk.chunk_id), vector, payload))
+        points.append((point_id, vector, payload))
     store.upsert_to_collection(store.active_collection_name(), points)
 
 
@@ -108,11 +111,11 @@ def _fixture():
     new = HashEmbedder(dim=6)
     router = EmbeddingRouter([old, new])
     store = FakeVersionedVectorStore(dim=4)
-    service = IndexLifecycleService(repo, store, router)
-    baseline = service.bootstrap_current(old)
     chunks = [_chunk("chunk-1", "alpha motor control"), _chunk("chunk-2", "beta ethercat servo")]
     repo.add_chunks(chunks)
     _seed_legacy(store, old, chunks)
+    service = IndexLifecycleService(repo, store, router)
+    baseline = service.bootstrap_current(old)
     return repo, old, new, router, store, service, baseline, chunks
 
 
@@ -123,6 +126,8 @@ def test_index_build_activate_rollback_and_alias_bound_embedding():
     assert candidate.status == "validating"
     assert candidate.build_stats["vectors_written"] == 2
     assert candidate.parser_contracts[0]["config_hash"] == "parser-a"
+    for chunk in chunks:
+        assert chunk.qdrant_point_id in store.collections[candidate.physical_collection]
 
     evidence = service.shadow_compare(
         candidate.index_version_id,
@@ -155,12 +160,10 @@ def test_alias_is_query_authority_and_reconcile_repairs_postgres_pointer():
     service.build(candidate.index_version_id)
     service.mark_ready(candidate.index_version_id, {"manual": True}, approved=True)
 
-    # Simulate crash after Qdrant's atomic alias update and before PG commit.
     store.switch_alias(candidate.physical_collection)
     assert repo.get_active_index_version(store.alias_name).index_version_id == baseline.index_version_id
 
     active_embedder = ActiveIndexEmbedder(repo, router, store.alias_name, old, vector_store=store)
-    # Query path follows the visible alias immediately, not the stale PG pointer.
     assert active_embedder.contract_id == new.contract_id
     result = service.reconcile()
     assert result["action"] == "postgres_pointer_repaired"
@@ -209,3 +212,20 @@ def test_mark_ready_requires_explicit_evidence_and_approval():
         service.mark_ready(candidate.index_version_id, {}, approved=True)
     with pytest.raises(ValueError, match="approval"):
         service.mark_ready(candidate.index_version_id, {"ok": True}, approved=False)
+
+
+def test_activation_and_rollback_reject_stale_catalog_snapshot():
+    repo, _old, new, _router, _store, service, baseline, chunks = _fixture()
+    candidate = service.create_candidate(new.contract_id)
+    service.build(candidate.index_version_id)
+    service.mark_ready(candidate.index_version_id, {"manual": True}, approved=True)
+
+    chunks[0].checksum = "changed-after-build"
+    with pytest.raises(RuntimeError, match="Knowledge catalog changed"):
+        service.activate(candidate.index_version_id)
+
+    chunks[0].checksum = "checksum-chunk-1"
+    service.activate(candidate.index_version_id)
+    chunks[1].checksum = "changed-after-activation"
+    with pytest.raises(RuntimeError, match="Knowledge catalog changed"):
+        service.rollback(baseline.index_version_id)
