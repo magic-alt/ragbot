@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import time
 import uuid
@@ -12,7 +13,7 @@ from services.worker.jobs.embed_and_upsert import _build_payload
 
 from .embedding_contract import embedding_contract_id
 from .embedding_router import EmbeddingRouter
-from .qdrant import point_id_for_chunk
+from .qdrant import normalize_qdrant_point_id
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -72,6 +73,12 @@ class IndexLifecycleService:
                 )
             return self.repo.get_index_version(existing.index_version_id) or existing
 
+        if active is not None:
+            raise RuntimeError(
+                "Qdrant alias points to an unregistered physical collection while PostgreSQL already has an active IndexVersion: "
+                f"alias={self.alias_name}, collection={physical}. Run index reconcile after restoring the expected version record."
+            )
+
         now = _now()
         contract_id = embedding_contract_id(default_embedder)
         spec = _embedding_spec(default_embedder)
@@ -87,18 +94,17 @@ class IndexLifecycleService:
                     "distance": str(spec.get("distance") or "cosine"),
                 }
             },
-            status="active" if active is None else "ready",
+            status="active",
             created_at=now,
             ready_at=now,
-            activated_at=now if active is None else None,
+            activated_at=now,
+            build_stats={
+                "state": "bootstrap",
+                "catalog_fingerprint": _catalog_fingerprint(self.repo),
+            },
             validation_evidence={"bootstrap": "legacy-existing-collection"},
         )
         self.repo.add_index_version(version)
-        if active is not None:
-            self.repo.activate_index_version(
-                version.index_version_id,
-                previous_index_version_id=active.index_version_id,
-            )
         return self.repo.get_index_version(version.index_version_id) or version
 
     def create_candidate(
@@ -159,16 +165,30 @@ class IndexLifecycleService:
         embedder = self.embedding_router.get(version.embedding_contract_id)
         if int(embedder.dimension) != _index_dimension(version):
             raise RuntimeError("Candidate embedder dimension does not match IndexVersion schema")
+
+        if version.status == "failed":
+            self.vector_store.delete_collection(version.physical_collection)
+            self.vector_store.create_physical_collection(
+                version.physical_collection,
+                dim=_index_dimension(version),
+                distance=str((version.vector_schema.get("dense") or {}).get("distance") or "cosine"),
+            )
+
         actual_dim = self.vector_store.collection_dimension(version.physical_collection)
         if actual_dim != _index_dimension(version):
             raise RuntimeError(
                 f"Physical collection dimension mismatch: actual={actual_dim}, expected={_index_dimension(version)}"
             )
 
+        catalog_fingerprint = _catalog_fingerprint(self.repo)
         self.repo.update_index_version(
             index_version_id,
             status="building",
-            build_stats={"state": "building", "vectors_written": 0},
+            build_stats={
+                "state": "building",
+                "vectors_written": 0,
+                "catalog_fingerprint": catalog_fingerprint,
+            },
             error=None,
             failed_at=None,
         )
@@ -198,7 +218,10 @@ class IndexLifecycleService:
                 payload["embedding_contract_id"] = version.embedding_contract_id
                 payload["embedding_dimension"] = _index_dimension(version)
                 payload["index_version_id"] = version.index_version_id
-                points.append((point_id_for_chunk(chunk.chunk_id), vector, payload))
+                point_id = normalize_qdrant_point_id(
+                    chunk.qdrant_point_id, chunk.chunk_id
+                )
+                points.append((point_id, vector, payload))
                 _capture_contracts(chunk, parser_contracts, chunking_contracts)
             self.vector_store.upsert_to_collection(version.physical_collection, points)
             written += len(points)
@@ -209,6 +232,7 @@ class IndexLifecycleService:
                 "state": "building",
                 "vectors_written": written,
                 "chunks_total": total,
+                "catalog_fingerprint": catalog_fingerprint,
                 "vectors_per_second": round(rate, 3),
                 "elapsed_seconds": round(elapsed, 3),
                 "estimated_remaining_seconds": (
@@ -227,10 +251,16 @@ class IndexLifecycleService:
                     flush()
             flush()
             elapsed = max(1e-9, time.perf_counter() - started)
+            final_fingerprint = _catalog_fingerprint(self.repo)
+            if final_fingerprint != catalog_fingerprint:
+                raise RuntimeError(
+                    "Knowledge catalog changed while the IndexVersion was building; rebuild against a stable active snapshot"
+                )
             stats = {
                 "state": "built",
                 "vectors_written": written,
                 "chunks_total": total,
+                "catalog_fingerprint": catalog_fingerprint,
                 "vectors_per_second": round(written / elapsed, 3),
                 "elapsed_seconds": round(elapsed, 3),
                 "physical_count": int(
@@ -256,7 +286,11 @@ class IndexLifecycleService:
                 status="failed",
                 failed_at=_now(),
                 error=str(exc),
-                build_stats={"state": "failed", "vectors_written": written},
+                build_stats={
+                    "state": "failed",
+                    "vectors_written": written,
+                    "catalog_fingerprint": catalog_fingerprint,
+                },
             )
             raise
         return self._require(index_version_id)
@@ -376,6 +410,7 @@ class IndexLifecycleService:
             raise ValueError("Validation evidence is required before promotion")
         if not approved:
             raise ValueError("Explicit validation approval is required before marking ready")
+        self._assert_catalog_snapshot_current(version)
         self.repo.update_index_version(
             index_version_id,
             status="ready",
@@ -400,14 +435,12 @@ class IndexLifecycleService:
             raise RuntimeError(
                 f"Candidate embedding contract is not loaded: {candidate.embedding_contract_id}"
             )
+        self._assert_catalog_snapshot_current(candidate)
         baseline = self.repo.get_active_index_version(self.alias_name)
         previous_physical = self.vector_store.active_collection_name()
         if self.vector_store.collection_dimension(candidate.physical_collection) != _index_dimension(candidate):
             raise RuntimeError("Candidate physical collection schema does not match IndexVersion")
 
-        # Alias switch first: the alias is the query-visible authority. Query
-        # embedding resolution also follows alias -> IndexVersion, so the next
-        # request sees candidate vector schema and candidate embedder together.
         self.vector_store.switch_alias(candidate.physical_collection)
         delete_after = (
             datetime.now(timezone.utc) + timedelta(seconds=max(0, retention_seconds))
@@ -419,8 +452,6 @@ class IndexLifecycleService:
                 delete_after=delete_after,
             )
         except Exception:
-            # Best-effort compensation. If this fails too, reconcile() repairs
-            # PostgreSQL to the alias target on the next operator/startup pass.
             try:
                 self.vector_store.switch_alias(previous_physical)
             except Exception:
@@ -443,6 +474,7 @@ class IndexLifecycleService:
             raise RuntimeError(
                 f"Rollback embedding contract is not loaded: {target.embedding_contract_id}"
             )
+        self._assert_catalog_snapshot_current(target)
         current = self.repo.get_active_index_version(self.alias_name)
         previous_physical = self.vector_store.active_collection_name()
         self.vector_store.switch_alias(target.physical_collection)
@@ -505,6 +537,21 @@ class IndexLifecycleService:
             )
             deleted.append(version.index_version_id)
         return {"deleted": deleted, "skipped_active": skipped}
+
+    def _assert_catalog_snapshot_current(self, version: IndexVersion) -> None:
+        expected = str((version.build_stats or {}).get("catalog_fingerprint") or "")
+        if not expected:
+            if version.status == "active":
+                return
+            raise RuntimeError(
+                f"IndexVersion has no catalog snapshot fingerprint: {version.index_version_id}"
+            )
+        actual = _catalog_fingerprint(self.repo)
+        if actual != expected:
+            raise RuntimeError(
+                "Knowledge catalog changed since this IndexVersion was built; rebuild before activation/rollback: "
+                f"index={version.index_version_id}, built={expected}, current={actual}"
+            )
 
     def _require(self, index_version_id: str) -> IndexVersion:
         version = self.repo.get_index_version(index_version_id)
@@ -591,10 +638,41 @@ def _capture_contracts(
         }
 
 
+def _catalog_fingerprint(repo: Any) -> str:
+    rows: list[tuple[str, str, str]] = []
+    if hasattr(repo, "_pool"):
+        with repo._pool.connection() as conn:
+            db_rows = conn.execute(
+                "SELECT chunk_id, qdrant_point_id, checksum FROM chunks ORDER BY chunk_id"
+            ).fetchall()
+        for row in db_rows:
+            if isinstance(row, dict):
+                rows.append(
+                    (
+                        str(row.get("chunk_id") or ""),
+                        str(row.get("qdrant_point_id") or ""),
+                        str(row.get("checksum") or ""),
+                    )
+                )
+            else:
+                rows.append(tuple(str(item or "") for item in row[:3]))
+    else:
+        rows = sorted(
+            (
+                str(chunk.chunk_id),
+                str(chunk.qdrant_point_id or ""),
+                str(chunk.checksum or ""),
+            )
+            for chunk in repo.iter_chunks()
+        )
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update("\x1f".join(row).encode("utf-8"))
+        digest.update(b"\n")
+    return f"cat-{digest.hexdigest()[:24]}"
+
+
 def _count_chunks(repo: Any) -> Optional[int]:
-    # Optional progress optimization. It deliberately does not become part of
-    # the persistence SPI; builds remain correct when a custom repository cannot
-    # provide a cheap count.
     if hasattr(repo, "_pool"):
         try:
             with repo._pool.connection() as conn:
