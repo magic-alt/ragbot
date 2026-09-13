@@ -1,9 +1,8 @@
-"""Repository protocols for Ragbot persistence capabilities.
+"""Focused persistence capability protocols for Ragbot.
 
-``Repo`` is the stable baseline used by retrieval, ingestion and custom storage
-implementations. Staged knowledge publication is intentionally additive and is
-modelled by ``GenerationRepo`` so third-party repositories are not forced to
-pretend they provide PostgreSQL/Qdrant cutover semantics.
+Callers should depend on the narrowest capability they need. ``Repo`` remains a
+backward-compatible composite façade while the codebase migrates away from the
+historical all-in-one repository contract.
 """
 from __future__ import annotations
 
@@ -22,17 +21,12 @@ from .models import (
 
 
 @runtime_checkable
-class Repo(Protocol):
-    """Baseline repository interface used by retrieval and ingestion."""
-
-    # ── Documents ──────────────────────────────────────────────────────
+class KnowledgeCatalogRepo(Protocol):
     def add_document(self, doc: Document) -> None: ...
     def get_document(self, doc_id: str) -> Optional[Document]: ...
     def list_documents(self, tenant_id: Optional[str] = None) -> List[Document]: ...
     def delete_documents(self, doc_ids: Iterable[str]) -> int: ...
     def delete_documents_by_source(self, source_id: str) -> List[str]: ...
-
-    # ── Chunks ─────────────────────────────────────────────────────────
     def add_chunk(self, chunk: Chunk) -> None: ...
     def add_chunks(self, chunks: Iterable[Chunk]) -> int: ...
     def get_chunk(self, chunk_id: str) -> Optional[Chunk]: ...
@@ -41,19 +35,25 @@ class Repo(Protocol):
     def delete_chunks_by_doc(self, doc_id: str) -> int: ...
     def iter_chunks(self) -> Iterable[Chunk]: ...
 
-    # ── Policies ───────────────────────────────────────────────────────
+
+@runtime_checkable
+class ACLRepo(Protocol):
     def add_policy(self, policy: ACLPolicy) -> None: ...
     def get_policy_hash(self, acl_policy_id: Optional[str] = None) -> Optional[str]: ...
     def list_policies(self, tenant_id: Optional[str] = None) -> List[ACLPolicy]: ...
 
-    # ── Sources ────────────────────────────────────────────────────────
+
+@runtime_checkable
+class SourceRepo(Protocol):
     def add_source(self, source: Source) -> None: ...
     def get_source(self, source_id: str) -> Optional[Source]: ...
     def list_sources(self, tenant_id: Optional[str] = None) -> List[Source]: ...
     def update_source(self, source_id: str, **kwargs: Any) -> Optional[Source]: ...
     def delete_source(self, source_id: str) -> bool: ...
 
-    # ── Jobs ───────────────────────────────────────────────────────────
+
+@runtime_checkable
+class JobQueueRepo(Protocol):
     def add_job(self, job: IngestionJob) -> None: ...
     def add_job_if_absent(self, job: IngestionJob) -> bool: ...
     def get_job(self, job_id: str) -> Optional[IngestionJob]: ...
@@ -64,13 +64,32 @@ class Repo(Protocol):
     def release_job_lease(self, job_id: str, worker_id: str) -> bool: ...
     def reconcile_ingestion_jobs(self, max_attempts: int = 3) -> Dict[str, int]: ...
 
-    # ── Tables (InMemory only; PostgresRepo is no-op) ──────────────────
+
+@runtime_checkable
+class DebugStateRepo(Protocol):
+    def healthcheck(self) -> bool: ...
+    def export_state(self) -> Dict[str, List[dict]]: ...
+
+
+@runtime_checkable
+class DevelopmentTableRepo(Protocol):
+    """Test/development-only table helper; not a production storage obligation."""
+
     def register_table(self, table: TableData) -> None: ...
     def get_table(self, name: str) -> Optional[TableData]: ...
 
-    # ── Runtime / debug ────────────────────────────────────────────────
-    def healthcheck(self) -> bool: ...
-    def export_state(self) -> Dict[str, List[dict]]: ...
+
+@runtime_checkable
+class Repo(
+    KnowledgeCatalogRepo,
+    ACLRepo,
+    SourceRepo,
+    JobQueueRepo,
+    DebugStateRepo,
+    DevelopmentTableRepo,
+    Protocol,
+):
+    """Backward-compatible composite repository façade."""
 
 
 @runtime_checkable
@@ -105,6 +124,10 @@ class GenerationRepo(Protocol):
     ) -> None: ...
     def get_active_generation_id(self, source_id: str) -> Optional[str]: ...
     def active_vector_points(self, chunk_ids: Iterable[str]) -> Dict[str, str]: ...
+
+
+@runtime_checkable
+class PublicationOutboxRepo(Protocol):
     def claim_publication_outbox(
         self,
         worker_id: str,
