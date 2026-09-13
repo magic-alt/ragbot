@@ -33,6 +33,7 @@ from .observability.prometheus import render_prometheus
 from .observability.tracing import setup_tracing
 from .routes.admin_ui import create_admin_ui_router
 from .routes.control_plane import create_control_plane_router
+from .routes.indexes import create_indexes_router
 from .routes.ingest import create_ingest_router
 from .routes.openai_compat import create_openai_compat_endpoint
 from .routes.quick_import import create_quick_import_router
@@ -84,8 +85,13 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
     if _services is not None:
         closed: set[int] = set()
-        for resource in (_services.sql_engine, _services.repo, _services.qdrant):
-            if id(resource) in closed:
+        for resource in (
+            _services.sql_engine,
+            getattr(_services, "embedding_router", None),
+            _services.repo,
+            _services.qdrant,
+        ):
+            if resource is None or id(resource) in closed:
                 continue
             close = getattr(resource, "close", None)
             if callable(close):
@@ -103,6 +109,7 @@ app.include_router(create_ingest_router(_get_services, verify_api_key))
 app.include_router(create_quick_import_router(_get_services, verify_api_key))
 app.include_router(create_upload_router(_get_services, verify_api_key))
 app.include_router(create_control_plane_router(_get_services, verify_api_key))
+app.include_router(create_indexes_router(_get_services, verify_api_key))
 app.include_router(create_runtime_identity_router())
 app.include_router(create_admin_ui_router())
 
