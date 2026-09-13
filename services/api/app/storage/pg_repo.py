@@ -1,9 +1,10 @@
-"""Schema-aligned PostgreSQL repository used by the runtime factory.
+"""Authoritative PostgreSQL repository for Ragbot runtime persistence.
 
-This adapter keeps SQL types aligned with the current migrations and adds the
-production-only operations that should execute in PostgreSQL rather than in
-application memory (bulk lifecycle cleanup, durable job leasing and full-text
-search).
+This module owns the current migration-aligned PostgreSQL implementation.  It
+no longer subclasses the historical ``postgres_repo`` adapter; that module is a
+compatibility import only. Product-specific scheduling/DLQ operations remain in
+``ManagedPostgresRepo`` as a thin extension until they are moved behind focused
+stores.
 """
 from __future__ import annotations
 
@@ -13,14 +14,13 @@ from dataclasses import asdict
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..retrieval.lexical import build_or_tsquery, contains_cjk, lexicalize
-from .models import ACLPolicy, Chunk, Document, IngestionJob, Source
-from .postgres_repo import PostgresRepo as _LegacyPostgresRepo
+from .models import ACLPolicy, Chunk, Document, IngestionJob, Source, TableData
 
 logger = logging.getLogger(__name__)
 
 
-class PostgresRepo(_LegacyPostgresRepo):
-    """PostgreSQL repository with current-schema type adaptation."""
+class PostgresRepo:
+    """Migration-aligned PostgreSQL implementation with dict-row semantics."""
 
     def __init__(self, dsn: str, pool_min: int = 2, pool_max: int = 10) -> None:
         try:
@@ -45,6 +45,9 @@ class PostgresRepo(_LegacyPostgresRepo):
             pool_max,
         )
 
+    def close(self) -> None:
+        self._pool.close()
+
     @staticmethod
     def _jsonb(value: Any) -> Any:
         from psycopg.types.json import Jsonb
@@ -58,6 +61,8 @@ class PostgresRepo(_LegacyPostgresRepo):
         except Exception:
             logger.exception("PostgreSQL repository healthcheck failed")
             return False
+
+    # ── Documents / chunks ─────────────────────────────────────────────
 
     def add_document(self, doc: Document) -> None:
         sql = """
@@ -86,6 +91,20 @@ class PostgresRepo(_LegacyPostgresRepo):
         with self._pool.connection() as conn:
             conn.execute(sql, params)
 
+    def get_document(self, doc_id: str) -> Optional[Document]:
+        with self._pool.connection() as conn:
+            row = conn.execute("SELECT * FROM documents WHERE doc_id = %s", (doc_id,)).fetchone()
+        return self._row_to_document(row, None) if row else None
+
+    def list_documents(self, tenant_id: Optional[str] = None) -> List[Document]:
+        if tenant_id:
+            sql, params = "SELECT * FROM documents WHERE tenant_id = %s ORDER BY ingested_at DESC", (tenant_id,)
+        else:
+            sql, params = "SELECT * FROM documents ORDER BY ingested_at DESC", ()
+        with self._pool.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_document(row, None) for row in rows]
+
     def delete_documents(self, doc_ids: Iterable[str]) -> int:
         ids = list(dict.fromkeys(doc_ids))
         if not ids:
@@ -104,7 +123,7 @@ class PostgresRepo(_LegacyPostgresRepo):
         """
         with self._pool.connection() as conn:
             rows = conn.execute(sql, (pattern, local_fs_pattern)).fetchall()
-            return [row["doc_id"] if isinstance(row, dict) else row[0] for row in rows]
+        return [str(row["doc_id"]) for row in rows]
 
     @staticmethod
     def _chunk_upsert_sql() -> str:
@@ -153,6 +172,20 @@ class PostgresRepo(_LegacyPostgresRepo):
                 cur.executemany(self._chunk_upsert_sql(), params)
         return len(items)
 
+    def get_chunk(self, chunk_id: str) -> Optional[Chunk]:
+        with self._pool.connection() as conn:
+            row = conn.execute("SELECT * FROM chunks WHERE chunk_id = %s", (chunk_id,)).fetchone()
+        return self._row_to_chunk(row, None) if row else None
+
+    def list_chunks(self, doc_id: Optional[str] = None) -> List[Chunk]:
+        if doc_id:
+            sql, params = "SELECT * FROM chunks WHERE doc_id = %s ORDER BY chunk_index", (doc_id,)
+        else:
+            sql, params = "SELECT * FROM chunks ORDER BY created_at", ()
+        with self._pool.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_chunk(row, None) for row in rows]
+
     def delete_chunks(self, chunk_ids: Iterable[str]) -> int:
         ids = list(dict.fromkeys(chunk_ids))
         if not ids:
@@ -160,6 +193,18 @@ class PostgresRepo(_LegacyPostgresRepo):
         with self._pool.connection() as conn:
             result = conn.execute("DELETE FROM chunks WHERE chunk_id = ANY(%s)", (ids,))
             return result.rowcount or 0
+
+    def delete_chunks_by_doc(self, doc_id: str) -> int:
+        with self._pool.connection() as conn:
+            result = conn.execute("DELETE FROM chunks WHERE doc_id = %s", (doc_id,))
+            return result.rowcount or 0
+
+    def iter_chunks(self) -> Iterable[Chunk]:
+        with self._pool.connection() as conn:
+            with conn.cursor(name="iter_chunks") as cur:
+                cur.execute("SELECT * FROM chunks ORDER BY created_at")
+                for row in cur:
+                    yield self._row_to_chunk(row, None)
 
     def search_chunks_fts(
         self,
@@ -225,10 +270,9 @@ class PostgresRepo(_LegacyPostgresRepo):
         """
         with self._pool.connection() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [
-            (self._row_to_chunk(row, None), float(row.get("fts_score") or 0.0))
-            for row in rows
-        ]
+        return [(self._row_to_chunk(row, None), float(row.get("fts_score") or 0.0)) for row in rows]
+
+    # ── ACL / sources ──────────────────────────────────────────────────
 
     def add_policy(self, policy: ACLPolicy) -> None:
         sql = """
@@ -248,13 +292,17 @@ class PostgresRepo(_LegacyPostgresRepo):
         if not acl_policy_id:
             return None
         with self._pool.connection() as conn:
-            row = conn.execute(
-                "SELECT policy_hash FROM acl_policies WHERE acl_policy_id = %s",
-                (acl_policy_id,),
-            ).fetchone()
-            if not row:
-                return None
-            return row["policy_hash"] if isinstance(row, dict) else row[0]
+            row = conn.execute("SELECT policy_hash FROM acl_policies WHERE acl_policy_id = %s", (acl_policy_id,)).fetchone()
+        return str(row["policy_hash"]) if row else None
+
+    def list_policies(self, tenant_id: Optional[str] = None) -> List[ACLPolicy]:
+        if tenant_id:
+            sql, params = "SELECT * FROM acl_policies WHERE tenant_id = %s", (tenant_id,)
+        else:
+            sql, params = "SELECT * FROM acl_policies", ()
+        with self._pool.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_policy(row, None) for row in rows]
 
     def add_source(self, source: Source) -> None:
         sql = """
@@ -282,6 +330,20 @@ class PostgresRepo(_LegacyPostgresRepo):
         with self._pool.connection() as conn:
             conn.execute(sql, params)
 
+    def get_source(self, source_id: str) -> Optional[Source]:
+        with self._pool.connection() as conn:
+            row = conn.execute("SELECT * FROM sources WHERE source_id = %s", (source_id,)).fetchone()
+        return self._row_to_source(row, None) if row else None
+
+    def list_sources(self, tenant_id: Optional[str] = None) -> List[Source]:
+        if tenant_id:
+            sql, params = "SELECT * FROM sources WHERE tenant_id = %s ORDER BY created_at", (tenant_id,)
+        else:
+            sql, params = "SELECT * FROM sources ORDER BY created_at", ()
+        with self._pool.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_source(row, None) for row in rows]
+
     def update_source(self, source_id: str, **kwargs: Any) -> Optional[Source]:
         if not kwargs:
             return self.get_source(source_id)
@@ -300,11 +362,18 @@ class PostgresRepo(_LegacyPostgresRepo):
             else:
                 params[key] = value
         with self._pool.connection() as conn:
-            conn.execute(
-                f"UPDATE sources SET {', '.join(set_clauses)} WHERE source_id = %(source_id)s",
-                params,
-            )
+            conn.execute(f"UPDATE sources SET {', '.join(set_clauses)} WHERE source_id = %(source_id)s", params)
         return self.get_source(source_id)
+
+    def delete_source(self, source_id: str) -> bool:
+        with self._pool.connection() as conn:
+            result = conn.execute(
+                "UPDATE sources SET status = 'deleted' WHERE source_id = %s AND status != 'deleted'",
+                (source_id,),
+            )
+        return (result.rowcount or 0) > 0
+
+    # ── Durable jobs ───────────────────────────────────────────────────
 
     def add_job(self, job: IngestionJob) -> None:
         sql = """
@@ -341,6 +410,48 @@ class PostgresRepo(_LegacyPostgresRepo):
         with self._pool.connection() as conn:
             conn.execute(sql, params)
 
+    def add_job_if_absent(self, job: IngestionJob) -> bool:
+        sql = """
+            INSERT INTO ingestion_jobs (
+                job_id, tenant_id, source_id, source_type, source_config,
+                status, doc_count, chunk_count, error,
+                started_at, completed_at, created_at, stats,
+                attempts, available_at, lease_owner, lease_expires_at, heartbeat_at
+            ) VALUES (
+                %(job_id)s, %(tenant_id)s, %(source_id)s, %(source_type)s,
+                %(source_config)s, %(status)s, %(doc_count)s, %(chunk_count)s,
+                %(error)s, %(started_at)s, %(completed_at)s,
+                COALESCE(%(created_at)s, NOW()), %(stats)s,
+                %(attempts)s, COALESCE(%(available_at)s, NOW()), %(lease_owner)s,
+                %(lease_expires_at)s, %(heartbeat_at)s
+            ) ON CONFLICT (job_id) DO NOTHING
+        """
+        params = asdict(job)
+        params["source_config"] = self._jsonb(params["source_config"])
+        params["stats"] = self._jsonb(params["stats"])
+        with self._pool.connection() as conn:
+            result = conn.execute(sql, params)
+        return (result.rowcount or 0) > 0
+
+    def get_job(self, job_id: str) -> Optional[IngestionJob]:
+        with self._pool.connection() as conn:
+            row = conn.execute("SELECT * FROM ingestion_jobs WHERE job_id = %s", (job_id,)).fetchone()
+        return self._row_to_job(row, None) if row else None
+
+    def list_jobs(self, tenant_id: Optional[str] = None, source_id: Optional[str] = None) -> List[IngestionJob]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if tenant_id:
+            conditions.append("tenant_id = %s")
+            params.append(tenant_id)
+        if source_id:
+            conditions.append("source_id = %s")
+            params.append(source_id)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self._pool.connection() as conn:
+            rows = conn.execute(f"SELECT * FROM ingestion_jobs{where} ORDER BY created_at DESC", tuple(params)).fetchall()
+        return [self._row_to_job(row, None) for row in rows]
+
     def update_job(self, job_id: str, **kwargs: Any) -> Optional[IngestionJob]:
         if not kwargs:
             return self.get_job(job_id)
@@ -358,10 +469,7 @@ class PostgresRepo(_LegacyPostgresRepo):
             set_clauses.append(f"{key} = %({key})s")
             params[key] = self._jsonb(value) if key == "stats" else value
         with self._pool.connection() as conn:
-            conn.execute(
-                f"UPDATE ingestion_jobs SET {', '.join(set_clauses)} WHERE job_id = %(job_id)s",
-                params,
-            )
+            conn.execute(f"UPDATE ingestion_jobs SET {', '.join(set_clauses)} WHERE job_id = %(job_id)s", params)
         return self.get_job(job_id)
 
     def claim_next_job(
@@ -432,7 +540,7 @@ class PostgresRepo(_LegacyPostgresRepo):
                 """,
                 (lease_seconds, job_id, worker_id),
             )
-            return (result.rowcount or 0) > 0
+        return (result.rowcount or 0) > 0
 
     def release_job_lease(self, job_id: str, worker_id: str) -> bool:
         with self._pool.connection() as conn:
@@ -444,38 +552,25 @@ class PostgresRepo(_LegacyPostgresRepo):
                 """,
                 (job_id, worker_id),
             )
-            return (result.rowcount or 0) > 0
+        return (result.rowcount or 0) > 0
 
-    @staticmethod
-    def _row_to_job(row: Any, conn: Any) -> IngestionJob:
-        if hasattr(row, "keys"):
-            d = dict(row)
-        elif hasattr(row, "_asdict"):
-            d = row._asdict()
-        else:
-            cols = [
-                "job_id", "tenant_id", "source_id", "source_type", "source_config",
-                "status", "doc_count", "chunk_count", "error", "started_at",
-                "completed_at", "created_at", "stats", "attempts", "available_at",
-                "lease_owner", "lease_expires_at", "heartbeat_at",
-            ]
-            d = dict(zip(cols, row))
-        source_config = d.get("source_config", {})
-        if isinstance(source_config, str):
-            source_config = json.loads(source_config)
-        stats = d.get("stats", {})
-        if isinstance(stats, str):
-            stats = json.loads(stats)
-        return IngestionJob(
-            job_id=d["job_id"], tenant_id=d["tenant_id"], source_id=d["source_id"],
-            source_type=d["source_type"], source_config=source_config,
-            status=d.get("status", "pending"), doc_count=d.get("doc_count", 0),
-            chunk_count=d.get("chunk_count", 0), error=d.get("error"),
-            started_at=d.get("started_at"), completed_at=d.get("completed_at"),
-            created_at=d.get("created_at"), stats=stats, attempts=d.get("attempts", 0),
-            available_at=d.get("available_at"), lease_owner=d.get("lease_owner"),
-            lease_expires_at=d.get("lease_expires_at"), heartbeat_at=d.get("heartbeat_at"),
-        )
+    def reconcile_ingestion_jobs(self, max_attempts: int = 3) -> Dict[str, int]:
+        # ManagedPostgresRepo owns production reconciliation/DLQ semantics. The
+        # base store intentionally has no hidden control-plane side effects.
+        return {
+            "recovered_running": 0,
+            "recovered_failed": 0,
+            "dead_lettered_running": 0,
+            "dead_lettered_exhausted": 0,
+        }
+
+    # ── Development compatibility / diagnostics ────────────────────────
+
+    def register_table(self, table: TableData) -> None:
+        return None
+
+    def get_table(self, name: str) -> Optional[TableData]:
+        return None
 
     def export_state(self) -> Dict[str, List[dict]]:
         result: Dict[str, List[dict]] = {}
@@ -491,3 +586,109 @@ class PostgresRepo(_LegacyPostgresRepo):
                 rows = conn.execute(sql).fetchall()
                 result[name] = [dict(row) for row in rows]
         return result
+
+    # ── Row mapping ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _decode_json(value: Any, default: Any) -> Any:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return json.loads(value)
+        return value
+
+    @classmethod
+    def _row_to_document(cls, row: Any, _conn: Any) -> Document:
+        d = dict(row)
+        return Document(
+            doc_id=d["doc_id"],
+            tenant_id=d["tenant_id"],
+            source_type=d["source_type"],
+            title=d.get("title", ""),
+            uri=d.get("uri", ""),
+            version=d.get("version", "1.0"),
+            doc_updated_at=d.get("doc_updated_at"),
+            ingested_at=d.get("ingested_at"),
+            tags=list(cls._decode_json(d.get("tags"), []) or []),
+            acl_policy_id=d.get("acl_policy_id"),
+            status=d.get("status", "active"),
+            source_id=d.get("source_id"),
+            generation_id=d.get("generation_id"),
+        )
+
+    @classmethod
+    def _row_to_chunk(cls, row: Any, _conn: Any) -> Chunk:
+        d = dict(row)
+        return Chunk(
+            chunk_id=d["chunk_id"],
+            doc_id=d["doc_id"],
+            tenant_id=d["tenant_id"],
+            chunk_index=int(d.get("chunk_index", 0)),
+            text=d.get("text", ""),
+            path=d.get("path"),
+            url=d.get("url"),
+            page=d.get("page"),
+            section=d.get("section"),
+            checksum=d.get("checksum"),
+            qdrant_point_id=d.get("qdrant_point_id"),
+            created_at=d.get("created_at"),
+            metadata=dict(cls._decode_json(d.get("metadata"), {}) or {}),
+            source_id=d.get("source_id"),
+            generation_id=d.get("generation_id"),
+        )
+
+    @classmethod
+    def _row_to_policy(cls, row: Any, _conn: Any) -> ACLPolicy:
+        d = dict(row)
+        return ACLPolicy(
+            acl_policy_id=d["acl_policy_id"],
+            tenant_id=d["tenant_id"],
+            rules=dict(cls._decode_json(d.get("rules"), {}) or {}),
+            policy_hash=d["policy_hash"],
+        )
+
+    @classmethod
+    def _row_to_source(cls, row: Any, _conn: Any) -> Source:
+        d = dict(row)
+        return Source(
+            source_id=d["source_id"],
+            tenant_id=d["tenant_id"],
+            source_type=d["source_type"],
+            name=d.get("name", ""),
+            config=dict(cls._decode_json(d.get("config"), {}) or {}),
+            status=d.get("status", "active"),
+            acl_policy_id=d.get("acl_policy_id"),
+            tags=list(cls._decode_json(d.get("tags"), []) or []),
+            created_at=d.get("created_at"),
+            updated_at=d.get("updated_at"),
+            sync_enabled=bool(d.get("sync_enabled", False)),
+            sync_interval_seconds=d.get("sync_interval_seconds"),
+            sync_next_at=d.get("sync_next_at"),
+            sync_last_enqueued_at=d.get("sync_last_enqueued_at"),
+        )
+
+    @classmethod
+    def _row_to_job(cls, row: Any, _conn: Any) -> IngestionJob:
+        d = dict(row)
+        return IngestionJob(
+            job_id=d["job_id"],
+            tenant_id=d["tenant_id"],
+            source_id=d["source_id"],
+            source_type=d["source_type"],
+            source_config=dict(cls._decode_json(d.get("source_config"), {}) or {}),
+            status=d.get("status", "pending"),
+            doc_count=int(d.get("doc_count", 0) or 0),
+            chunk_count=int(d.get("chunk_count", 0) or 0),
+            error=d.get("error"),
+            started_at=d.get("started_at"),
+            completed_at=d.get("completed_at"),
+            created_at=d.get("created_at"),
+            stats=dict(cls._decode_json(d.get("stats"), {}) or {}),
+            attempts=int(d.get("attempts", 0) or 0),
+            available_at=d.get("available_at"),
+            lease_owner=d.get("lease_owner"),
+            lease_expires_at=d.get("lease_expires_at"),
+            heartbeat_at=d.get("heartbeat_at"),
+            failure_class=d.get("failure_class"),
+            dead_lettered_at=d.get("dead_lettered_at"),
+        )
