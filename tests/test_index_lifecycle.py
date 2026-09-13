@@ -8,7 +8,11 @@ from services.api.app.retrieval.embedder import HashEmbedder
 from services.api.app.retrieval.embedding_router import ActiveIndexEmbedder, EmbeddingRouter
 from services.api.app.retrieval.index_lifecycle import IndexLifecycleService
 from services.api.app.storage.index_support import ensure_index_repository
-from services.api.app.storage.models import Chunk
+from services.api.app.storage.models import Chunk, IngestionJob
+from services.api.app.storage.publication_barrier import (
+    ensure_index_cutover_gate,
+    ensure_worker_claim_gate,
+)
 from services.api.app.storage.repo import InMemoryRepo
 from services.worker.jobs.embed_and_upsert import _build_payload
 from services.api.app.retrieval.qdrant import point_id_for_chunk
@@ -110,6 +114,7 @@ def _seed_legacy(store, embedder, chunks):
 
 def _fixture():
     repo = ensure_index_repository(InMemoryRepo())
+    ensure_worker_claim_gate(repo)
     old = HashEmbedder(dim=4)
     new = HashEmbedder(dim=6)
     router = EmbeddingRouter([old, new])
@@ -119,6 +124,7 @@ def _fixture():
     _seed_legacy(store, old, chunks)
     service = IndexLifecycleService(repo, store, router)
     baseline = service.bootstrap_current(old)
+    ensure_index_cutover_gate(service)
     return repo, old, new, router, store, service, baseline, chunks
 
 
@@ -241,3 +247,28 @@ def test_activation_and_rollback_reject_stale_catalog_snapshot():
     chunks[1].checksum = "changed-after-activation"
     with pytest.raises(RuntimeError, match="Knowledge catalog changed"):
         service.rollback(baseline.index_version_id)
+
+
+def test_cutover_rejects_running_ingestion_job_until_quiescent():
+    repo, _old, new, _router, store, service, _baseline, _chunks = _fixture()
+    candidate = service.create_candidate(new.contract_id)
+    service.build(candidate.index_version_id)
+    service.mark_ready(candidate.index_version_id, {"manual": True}, approved=True)
+
+    repo.add_job(
+        IngestionJob(
+            job_id="running-job",
+            tenant_id="tenant-a",
+            source_id="source-a",
+            source_type="pdf",
+            source_config={"path": "x.pdf"},
+            status="running",
+        )
+    )
+    with pytest.raises(RuntimeError, match="quiescent durable ingestion"):
+        service.activate(candidate.index_version_id)
+    assert store.active_collection_name() == "rag_chunks"
+
+    repo.update_job("running-job", status="completed")
+    service.activate(candidate.index_version_id)
+    assert store.active_collection_name() == candidate.physical_collection
