@@ -48,6 +48,10 @@ postgres_repo.PostgresRepo -> compatibility re-export only
 - staged knowledge activation remains owned by the existing generation publication transaction;
 - Qdrant remains a separate derived-index boundary and is never treated as part of a PostgreSQL distributed transaction.
 
+## Integration baseline
+
+This capability split is intentionally independent of the model plane. It must remain compatible with the capability-aware LLM/router work merged through #51; CI for this change is therefore expected to validate the storage refactor against the current `main`, not only the earlier #50 registry base.
+
 ## Extension rule
 
 A new persistence adapter should implement only the capability it truthfully supports. Product code should detect optional behavior through explicit protocols/capabilities rather than concrete backend class names.
