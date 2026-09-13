@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from dataclasses import dataclass
 
 import httpx
 import pytest
@@ -128,9 +126,13 @@ def test_anthropic_adapter_normalizes_usage_and_json():
         capabilities=ModelCapabilities(structured_output=True, streaming=True),
     )
     adapter = AnthropicAdapter(endpoint, transport=transport)  # type: ignore[arg-type]
-    result = asyncio.run(adapter.chat_json("system", "user", {"type": "object"}))
+
+    async def run():
+        result = await adapter.chat_json("system", "user", {"type": "object"})
+        return result, adapter.consume_usage()
+
+    result, usage = asyncio.run(run())
     assert result["route"] == "doc_rag"
-    usage = adapter.consume_usage()
     assert usage == ModelUsage(input_tokens=12, output_tokens=3, cached_input_tokens=5)
     assert transport.calls[0][0].endswith("/v1/messages")
 
@@ -148,11 +150,16 @@ def test_gemini_adapter_uses_response_json_schema_and_usage_metadata():
         capabilities=ModelCapabilities(structured_output=True, json_schema=True, streaming=True),
     )
     adapter = GeminiAdapter(endpoint, transport=transport)  # type: ignore[arg-type]
-    result = asyncio.run(adapter.chat_json("system", "user", {"type": "object"}))
+
+    async def run():
+        result = await adapter.chat_json("system", "user", {"type": "object"})
+        return result, adapter.consume_usage()
+
+    result, usage = asyncio.run(run())
     assert result == {"ok": True}
     _url, kwargs = transport.calls[0]
     assert kwargs["json"]["generationConfig"]["responseJsonSchema"] == {"type": "object"}
-    assert adapter.consume_usage() == ModelUsage(input_tokens=8, output_tokens=2, reasoning_tokens=1)
+    assert usage == ModelUsage(input_tokens=8, output_tokens=2, reasoning_tokens=1)
 
 
 def test_bedrock_adapter_normalizes_converse_response():
@@ -170,9 +177,14 @@ def test_bedrock_adapter_normalizes_converse_response():
         capabilities=ModelCapabilities(structured_output=True, streaming=False),
     )
     adapter = BedrockAdapter(endpoint, client=Client())
-    result = asyncio.run(adapter.chat_json("system", "user", {"type": "object"}))
+
+    async def run():
+        result = await adapter.chat_json("system", "user", {"type": "object"})
+        return result, adapter.consume_usage()
+
+    result, usage = asyncio.run(run())
     assert result == {"ok": True}
-    assert adapter.consume_usage() == ModelUsage(input_tokens=5, output_tokens=2)
+    assert usage == ModelUsage(input_tokens=5, output_tokens=2)
 
 
 def test_http_transport_retries_429_using_retry_after_zero():
