@@ -124,6 +124,35 @@ class PublicationOutboxEvent:
 
 
 @dataclass
+class IndexVersion:
+    """One immutable vector-schema build behind a stable logical alias."""
+
+    index_version_id: str
+    alias_name: str
+    physical_collection: str
+    embedding_contract_id: str
+    embedding_spec: Dict[str, Any]
+    vector_schema: Dict[str, Any]
+    tenant_id: Optional[str] = None
+    scope_key: str = "global"
+    vector_backend: str = "qdrant"
+    parser_contracts: List[Dict[str, Any]] = field(default_factory=list)
+    chunking_contracts: List[Dict[str, Any]] = field(default_factory=list)
+    status: str = "building"  # building, validating, ready, active, retired, failed, deleted
+    build_stats: Dict[str, Any] = field(default_factory=dict)
+    validation_evidence: Dict[str, Any] = field(default_factory=dict)
+    created_at: Optional[str] = None
+    validating_at: Optional[str] = None
+    ready_at: Optional[str] = None
+    activated_at: Optional[str] = None
+    retired_at: Optional[str] = None
+    failed_at: Optional[str] = None
+    delete_after: Optional[str] = None
+    deleted_at: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass
 class UploadedObject:
     object_id: str
     tenant_id: str

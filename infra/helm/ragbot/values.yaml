@@ -81,6 +81,10 @@ env:
   RAGBOT_MODEL_ROUTING: "false"
   RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS: /data
   RAGBOT_ALLOW_PRIVATE_SOURCE_NETWORKS: "false"
+  # Empty alias means derive <qdrant.collection>_active at runtime.
+  QDRANT_INDEX_ALIAS: ""
+  # Non-secret JSON of standby embedding contracts used for candidate indexes.
+  RAGBOT_EMBEDDING_PROFILES_JSON: ""
   OTEL_SERVICE_NAME: ragbot-api
 
 postgres:

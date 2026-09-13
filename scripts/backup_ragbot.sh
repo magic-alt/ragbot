@@ -5,6 +5,7 @@ set -euo pipefail
 : "${QDRANT_URL:?QDRANT_URL is required}"
 : "${QDRANT_COLLECTION:?QDRANT_COLLECTION is required}"
 
+QDRANT_INDEX_ALIAS="${QDRANT_INDEX_ALIAS:-${QDRANT_COLLECTION}_active}"
 BACKUP_DIR="${1:-./backups/ragbot-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$BACKUP_DIR"
 
@@ -20,8 +21,28 @@ if [[ -n "${QDRANT_API_KEY:-}" ]]; then
   headers=(-H "api-key: ${QDRANT_API_KEY}")
 fi
 
-printf 'Creating Qdrant collection snapshot for %s...\n' "$QDRANT_COLLECTION"
-snapshot_json="$(curl -fsS -X POST "${QDRANT_URL%/}/collections/${QDRANT_COLLECTION}/snapshots?wait=true" "${headers[@]}")"
+aliases_json="$(curl -fsS "${QDRANT_URL%/}/aliases" "${headers[@]}")"
+active_collection="$(
+  ALIASES_JSON="$aliases_json" \
+  QDRANT_INDEX_ALIAS="$QDRANT_INDEX_ALIAS" \
+  QDRANT_COLLECTION="$QDRANT_COLLECTION" \
+  python - <<'PY'
+import json, os
+payload = json.loads(os.environ['ALIASES_JSON'])
+alias = os.environ['QDRANT_INDEX_ALIAS']
+fallback = os.environ['QDRANT_COLLECTION']
+for item in (payload.get('result') or {}).get('aliases', []) or []:
+    if item.get('alias_name') == alias and item.get('collection_name'):
+        print(item['collection_name'])
+        break
+else:
+    print(fallback)
+PY
+)"
+
+printf 'Creating Qdrant collection snapshot for active physical index %s (alias %s)...\n' \
+  "$active_collection" "$QDRANT_INDEX_ALIAS"
+snapshot_json="$(curl -fsS -X POST "${QDRANT_URL%/}/collections/${active_collection}/snapshots?wait=true" "${headers[@]}")"
 snapshot_name="$(SNAPSHOT_JSON="$snapshot_json" python - <<'PY'
 import json, os
 payload = json.loads(os.environ['SNAPSHOT_JSON'])
@@ -33,13 +54,14 @@ PY
 )"
 
 curl -fsS \
-  "${QDRANT_URL%/}/collections/${QDRANT_COLLECTION}/snapshots/${snapshot_name}" \
+  "${QDRANT_URL%/}/collections/${active_collection}/snapshots/${snapshot_name}" \
   "${headers[@]}" \
   --output "$BACKUP_DIR/qdrant.snapshot"
 
 POSTGRES_DUMP="$BACKUP_DIR/postgres.dump" \
 QDRANT_SNAPSHOT="$BACKUP_DIR/qdrant.snapshot" \
-QDRANT_COLLECTION="$QDRANT_COLLECTION" \
+QDRANT_COLLECTION="$active_collection" \
+QDRANT_INDEX_ALIAS="$QDRANT_INDEX_ALIAS" \
 QDRANT_SNAPSHOT_NAME="$snapshot_name" \
 python - <<'PY' > "$BACKUP_DIR/manifest.json"
 import hashlib, json, os
@@ -60,6 +82,7 @@ print(json.dumps({
     'postgres': {'file': pg.name, 'sha256': sha256(pg), 'bytes': pg.stat().st_size},
     'qdrant': {
         'collection': os.environ['QDRANT_COLLECTION'],
+        'alias': os.environ['QDRANT_INDEX_ALIAS'],
         'snapshot_name': os.environ['QDRANT_SNAPSHOT_NAME'],
         'file': qd.name,
         'sha256': sha256(qd),

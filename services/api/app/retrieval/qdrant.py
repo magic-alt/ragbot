@@ -87,12 +87,22 @@ class InMemoryQdrant:
 
 
 class QdrantClientAdapter:
+    """Qdrant adapter with optional stable alias -> physical index indirection.
+
+    `collection_name` remains the legacy physical collection for compatibility.
+    When `alias_name` is provided, startup creates the alias if necessary and
+    all steady-state reads/writes use the alias. New IndexVersion builds write
+    directly to independent physical collections and activation atomically
+    switches the alias.
+    """
+
     def __init__(
         self,
         url: str,
         api_key: Optional[str],
         collection_name: str = "rag_chunks",
         dim: int = 1536,
+        alias_name: Optional[str] = None,
     ) -> None:
         try:
             from qdrant_client import QdrantClient
@@ -101,23 +111,155 @@ class QdrantClientAdapter:
             raise RuntimeError("qdrant-client is required for QdrantClientAdapter") from exc
         self._rest = rest
         self._client = QdrantClient(url=url, api_key=api_key)
-        self._collection = collection_name
-        self._dim = dim
-        self._ensure_collection()
-        self._ensure_payload_indexes()
+        self._legacy_collection = collection_name
+        self._alias = str(alias_name or "").strip() or None
+        self._configured_dim = int(dim)
+
+        if self._alias:
+            target = self.alias_target(self._alias)
+            if target:
+                self._validate_collection_dimension(target, self._configured_dim)
+                self._physical_collection = target
+                self._ensure_payload_indexes_for(target)
+            else:
+                self._ensure_collection_named(collection_name, self._configured_dim)
+                self._ensure_payload_indexes_for(collection_name)
+                self._switch_alias_to(collection_name)
+                self._physical_collection = collection_name
+            self._collection = self._alias
+        else:
+            self._ensure_collection_named(collection_name, self._configured_dim)
+            self._ensure_payload_indexes_for(collection_name)
+            self._physical_collection = collection_name
+            self._collection = collection_name
+
+    @property
+    def alias_name(self) -> Optional[str]:
+        return self._alias
+
+    @property
+    def collection_name(self) -> str:
+        """Logical query/write name (alias when lifecycle is enabled)."""
+        return self._collection
 
     @property
     def dim(self) -> int:
-        return self._dim
+        # An alias may be switched by another API/CLI process. Resolve the
+        # query-visible physical collection so long-lived replicas immediately
+        # observe the new vector schema instead of validating against stale dim.
+        if self._alias:
+            return self.collection_dimension(self.active_collection_name())
+        return self._configured_dim
+
+    def active_collection_name(self) -> str:
+        if not self._alias:
+            return self._physical_collection
+        target = self.alias_target(self._alias)
+        if not target:
+            raise RuntimeError(f"Qdrant active alias is missing: {self._alias}")
+        self._physical_collection = target
+        return target
+
+    def alias_target(self, alias_name: Optional[str] = None) -> Optional[str]:
+        alias = str(alias_name or self._alias or "").strip()
+        if not alias:
+            return None
+        response = self._client.get_aliases()
+        for item in getattr(response, "aliases", None) or []:
+            if str(getattr(item, "alias_name", "")) == alias:
+                return str(getattr(item, "collection_name", "")) or None
+        return None
+
+    def collection_dimension(self, collection_name: str) -> int:
+        info = self._client.get_collection(collection_name)
+        vectors = getattr(getattr(getattr(info, "config", None), "params", None), "vectors", None)
+        actual = getattr(vectors, "size", None)
+        if actual is None and isinstance(vectors, dict):
+            unnamed = vectors.get("") or next(iter(vectors.values()), None)
+            actual = getattr(unnamed, "size", None)
+        if actual is None:
+            raise RuntimeError(f"Unable to resolve Qdrant vector dimension: {collection_name}")
+        return int(actual)
+
+    def create_physical_collection(
+        self,
+        collection_name: str,
+        *,
+        dim: int,
+        distance: str = "cosine",
+    ) -> None:
+        if self._client.collection_exists(collection_name):
+            self._validate_collection_dimension(collection_name, int(dim))
+        else:
+            self._client.create_collection(
+                collection_name=collection_name,
+                vectors_config=self._rest.VectorParams(
+                    size=int(dim), distance=_distance(distance, self._rest)
+                ),
+            )
+        self._ensure_payload_indexes_for(collection_name)
+
+    def switch_alias(self, collection_name: str) -> Optional[str]:
+        if not self._alias:
+            raise RuntimeError("Qdrant index activation requires alias_name configuration")
+        if not self._client.collection_exists(collection_name):
+            raise ValueError(f"Qdrant collection does not exist: {collection_name}")
+        previous = self.alias_target(self._alias)
+        if previous == collection_name:
+            self._physical_collection = collection_name
+            return previous
+        self._switch_alias_to(collection_name)
+        self._physical_collection = collection_name
+        return previous
+
+    def delete_collection(self, collection_name: str) -> bool:
+        if self._alias and self.alias_target(self._alias) == collection_name:
+            raise ValueError(f"Cannot delete active Qdrant collection: {collection_name}")
+        if not self._client.collection_exists(collection_name):
+            return False
+        self._client.delete_collection(collection_name=collection_name)
+        return True
+
+    def upsert_to_collection(
+        self,
+        collection_name: str,
+        points: Iterable[Tuple[str, List[float], Dict[str, Any]]],
+    ) -> None:
+        expected_dim = self.collection_dimension(collection_name)
+        self._upsert_named(collection_name, points, expected_dim)
+
+    def search_collection(
+        self,
+        collection_name: str,
+        query_vector: List[float],
+        filters: Dict[str, Any],
+        top_k: int,
+    ) -> List[Tuple[str, float, Dict[str, Any]]]:
+        expected_dim = self.collection_dimension(collection_name)
+        if len(query_vector) != expected_dim:
+            raise ValueError(
+                f"Query vector dimension mismatch: got {len(query_vector)}, expected {expected_dim}"
+            )
+        return self._search_named(collection_name, query_vector, filters, top_k)
 
     def upsert(self, points: Iterable[Tuple[str, List[float], Dict[str, Any]]]) -> None:
+        self._upsert_named(self._collection, points, self.dim)
+
+    def _upsert_named(
+        self,
+        collection_name: str,
+        points: Iterable[Tuple[str, List[float], Dict[str, Any]]],
+        expected_dim: int,
+    ) -> None:
         payload_points = []
         for point_id, vector, payload in points:
-            if len(vector) != self._dim:
-                raise ValueError(f"Vector dimension mismatch: got {len(vector)}, expected {self._dim}")
+            if len(vector) != expected_dim:
+                raise ValueError(
+                    f"Vector dimension mismatch: got {len(vector)}, expected {expected_dim}"
+                )
             payload_points.append(self._rest.PointStruct(id=point_id, vector=vector, payload=payload))
         if payload_points:
-            self._client.upsert(collection_name=self._collection, points=payload_points, wait=True)
+            self._client.upsert(collection_name=collection_name, points=payload_points, wait=True)
 
     def delete_points(self, point_ids: Iterable[str]) -> int:
         ids = list(dict.fromkeys(str(item) for item in point_ids))
@@ -145,8 +287,15 @@ class QdrantClientAdapter:
     def count(self) -> int:
         return int(self._client.count(collection_name=self._collection, exact=True).count)
 
+    def count_collection(self, collection_name: str) -> int:
+        return int(self._client.count(collection_name=collection_name, exact=True).count)
+
     def healthcheck(self) -> bool:
-        return bool(self._client.collection_exists(self._collection))
+        try:
+            return bool(self._client.collection_exists(self.active_collection_name()))
+        except Exception:
+            logger.exception("Qdrant healthcheck failed")
+            return False
 
     def close(self) -> None:
         close = getattr(self._client, "close", None)
@@ -154,13 +303,25 @@ class QdrantClientAdapter:
             close()
 
     def search(self, query_vector: List[float], filters: Dict[str, Any], top_k: int) -> List[Tuple[str, float, Dict[str, Any]]]:
-        if len(query_vector) != self._dim:
-            raise ValueError(f"Query vector dimension mismatch: got {len(query_vector)}, expected {self._dim}")
+        expected_dim = self.dim
+        if len(query_vector) != expected_dim:
+            raise ValueError(
+                f"Query vector dimension mismatch: got {len(query_vector)}, expected {expected_dim}"
+            )
+        return self._search_named(self._collection, query_vector, filters, top_k)
+
+    def _search_named(
+        self,
+        collection_name: str,
+        query_vector: List[float],
+        filters: Dict[str, Any],
+        top_k: int,
+    ) -> List[Tuple[str, float, Dict[str, Any]]]:
         qfilter = _build_qdrant_filter(filters, self._rest)
         search = getattr(self._client, "search", None)
         if callable(search):
             results = search(
-                collection_name=self._collection,
+                collection_name=collection_name,
                 query_vector=query_vector,
                 limit=top_k,
                 with_payload=True,
@@ -169,7 +330,7 @@ class QdrantClientAdapter:
             )
         else:
             response = self._client.query_points(
-                collection_name=self._collection,
+                collection_name=collection_name,
                 query=query_vector,
                 limit=top_k,
                 with_payload=True,
@@ -179,47 +340,84 @@ class QdrantClientAdapter:
             results = response.points
         return [(str(hit.id), float(hit.score), hit.payload or {}) for hit in results]
 
-    def _ensure_collection(self) -> None:
-        rest = self._rest
-        if self._client.collection_exists(self._collection):
-            info = self._client.get_collection(self._collection)
-            vectors = getattr(getattr(getattr(info, "config", None), "params", None), "vectors", None)
-            actual_dim = getattr(vectors, "size", None)
-            if actual_dim is not None and int(actual_dim) != self._dim:
-                raise RuntimeError(
-                    "Existing Qdrant collection dimension does not match configuration: "
-                    f"collection={self._collection}, actual={actual_dim}, configured={self._dim}. "
-                    "Use a compatible collection or reindex after changing embedding dimensions."
-                )
+    def _ensure_collection_named(self, collection_name: str, dim: int) -> None:
+        if self._client.collection_exists(collection_name):
+            self._validate_collection_dimension(collection_name, dim)
             return
         self._client.create_collection(
-            collection_name=self._collection,
-            vectors_config=rest.VectorParams(size=self._dim, distance=rest.Distance.COSINE),
+            collection_name=collection_name,
+            vectors_config=self._rest.VectorParams(size=dim, distance=self._rest.Distance.COSINE),
         )
 
-    def _ensure_payload_indexes(self) -> None:
+    def _validate_collection_dimension(self, collection_name: str, dim: int) -> None:
+        actual_dim = self.collection_dimension(collection_name)
+        if actual_dim != int(dim):
+            raise RuntimeError(
+                "Existing Qdrant collection dimension does not match configuration: "
+                f"collection={collection_name}, actual={actual_dim}, configured={dim}. "
+                "Build and activate a compatible IndexVersion after changing embedding contracts."
+            )
+
+    def _switch_alias_to(self, collection_name: str) -> None:
+        rest = self._rest
+        actions = []
+        current = self.alias_target(self._alias)
+        if current:
+            actions.append(
+                rest.DeleteAliasOperation(delete_alias=rest.DeleteAlias(alias_name=self._alias))
+            )
+        actions.append(
+            rest.CreateAliasOperation(
+                create_alias=rest.CreateAlias(
+                    collection_name=collection_name,
+                    alias_name=self._alias,
+                )
+            )
+        )
+        # Qdrant applies one update_collection_aliases request atomically.
+        self._client.update_collection_aliases(change_aliases_operations=actions)
+
+    def _ensure_payload_indexes_for(self, collection_name: str) -> None:
         rest = self._rest
         schemas = {
             "tenant_id": rest.PayloadSchemaType.KEYWORD,
             "source_type": rest.PayloadSchemaType.KEYWORD,
             "doc_id": rest.PayloadSchemaType.KEYWORD,
             "chunk_id": rest.PayloadSchemaType.KEYWORD,
+            "source_id": rest.PayloadSchemaType.KEYWORD,
+            "generation_id": rest.PayloadSchemaType.KEYWORD,
+            "index_version_id": rest.PayloadSchemaType.KEYWORD,
+            "embedding_contract_id": rest.PayloadSchemaType.KEYWORD,
             "acl_hash": rest.PayloadSchemaType.KEYWORD,
             "tags": rest.PayloadSchemaType.KEYWORD,
             "ingested_at_ts": rest.PayloadSchemaType.FLOAT,
             "doc_updated_at_ts": rest.PayloadSchemaType.FLOAT,
         }
-        info = self._client.get_collection(self._collection)
+        info = self._client.get_collection(collection_name)
         existing = set((getattr(info, "payload_schema", None) or {}).keys())
         for field_name, schema in schemas.items():
             if field_name in existing:
                 continue
             self._client.create_payload_index(
-                collection_name=self._collection,
+                collection_name=collection_name,
                 field_name=field_name,
                 field_schema=schema,
                 wait=True,
             )
+
+
+def _distance(value: str, rest: Any) -> Any:
+    normalized = str(value or "cosine").strip().lower()
+    mapping = {
+        "cosine": rest.Distance.COSINE,
+        "dot": rest.Distance.DOT,
+        "euclid": rest.Distance.EUCLID,
+        "manhattan": rest.Distance.MANHATTAN,
+    }
+    try:
+        return mapping[normalized]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported Qdrant distance: {value}") from exc
 
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:

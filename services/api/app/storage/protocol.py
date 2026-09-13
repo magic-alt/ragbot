@@ -12,6 +12,7 @@ from .models import (
     ACLPolicy,
     Chunk,
     Document,
+    IndexVersion,
     IngestionJob,
     KnowledgeGeneration,
     PublicationOutboxEvent,
@@ -151,3 +152,32 @@ class PublicationOutboxRepo(Protocol):
         max_attempts: int = 10,
     ) -> bool: ...
     def reconcile_publication_outbox(self, max_attempts: int = 10) -> Dict[str, int]: ...
+
+
+@runtime_checkable
+class IndexLifecycleRepo(Protocol):
+    """Control-plane history and active pointer for versioned vector indexes."""
+
+    def add_index_version(self, version: IndexVersion) -> None: ...
+    def get_index_version(self, index_version_id: str) -> Optional[IndexVersion]: ...
+    def get_index_version_by_collection(
+        self, alias_name: str, physical_collection: str
+    ) -> Optional[IndexVersion]: ...
+    def get_active_index_version(
+        self, alias_name: str, tenant_id: Optional[str] = None, scope_key: str = "global"
+    ) -> Optional[IndexVersion]: ...
+    def list_index_versions(
+        self,
+        alias_name: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[IndexVersion]: ...
+    def update_index_version(self, index_version_id: str, **kwargs: Any) -> Optional[IndexVersion]: ...
+    def activate_index_version(
+        self,
+        index_version_id: str,
+        *,
+        previous_index_version_id: Optional[str] = None,
+        delete_after: Optional[str] = None,
+    ) -> IndexVersion: ...
+    def list_prunable_index_versions(self, now_iso: str) -> List[IndexVersion]: ...
