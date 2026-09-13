@@ -14,13 +14,25 @@ PUBLICATION_BARRIER_KEY = 1380007233
 
 def _standalone_pg_connection(repo: Any):
     pool = getattr(repo, "_pool", None)
-    conninfo = getattr(pool, "conninfo", None)
-    if not conninfo:
+    if pool is None:
         return None
+
+    # Runtime construction preserves the exact configured DSN privately on the
+    # repository. Prefer it over connection metadata: libpq/psycopg diagnostic
+    # DSNs may intentionally omit passwords and are not a reliable reconnect
+    # credential for the independent advisory-lock session.
+    conninfo = getattr(repo, "_ragbot_dsn", None) or getattr(pool, "conninfo", None)
+    if not conninfo:
+        raise RuntimeError(
+            "PostgreSQL publication barrier requires the original runtime DSN; "
+            "construct the production repository through the Ragbot runtime registry"
+        )
     try:
         import psycopg
-    except ImportError:
-        return None
+    except ImportError as exc:
+        raise RuntimeError(
+            "PostgreSQL publication barrier requires psycopg"
+        ) from exc
     return psycopg.connect(conninfo, autocommit=True)
 
 
