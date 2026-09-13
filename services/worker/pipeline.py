@@ -23,6 +23,7 @@ from services.api.app.storage.generation_support import (
 )
 from services.api.app.storage.models import Chunk, Document, IngestionJob, KnowledgeGeneration, Source
 from services.api.app.storage.protocol import Repo
+from services.worker.connectors.registry import connector_registry
 from services.worker.dedup.versioning import next_version
 from services.worker.jobs.embed_and_upsert import (
     embed_and_stage_vectors,
@@ -39,8 +40,6 @@ from services.worker.source_fence import (
 
 logger = logging.getLogger(__name__)
 LEXICAL_VERSION = 2
-_MULTI_DOCUMENT_SOURCE_TYPES = {"local_fs", "s3", "gdrive", "notion", "confluence"}
-_REMOTE_DOCUMENT_SOURCE_TYPES = {"s3", "gdrive", "notion", "confluence"}
 
 
 def run_ingest_pipeline(
@@ -165,8 +164,6 @@ def run_ingest_pipeline(
                     source_id=source.source_id,
                     embedder=embedder,
                 )
-                # Vector preparation mutates embedding metadata on written chunks;
-                # refresh the staged rows before marking the generation prepared.
                 repo.stage_knowledge_generation(
                     publication_generation_id,
                     documents,
@@ -186,8 +183,6 @@ def run_ingest_pipeline(
                 },
             )
 
-            # This second fence minimizes the interval between lifecycle
-            # validation and the authoritative activation transaction.
             assert_source_fence(source, repo, expected_generation)
             old_publication_generation = repo.activate_knowledge_generation(
                 source.source_id,
@@ -201,8 +196,6 @@ def run_ingest_pipeline(
             vector_chunks_removed = 0
             vector_cleanup_enqueued = len(stale_point_ids)
         else:
-            # Compatibility path for third-party repositories that have not
-            # implemented the staged generation contract.
             documents = _ensure_documents_legacy(source, repo, current_chunks)
             if chunks_to_write:
                 embed_and_upsert(repo, qdrant, chunks_to_write, embedder=embedder)
@@ -316,10 +309,15 @@ def run_ingest_pipeline(
     return result
 
 
+def _connector_capability(source_type: str, capability: str) -> bool:
+    spec = connector_registry().get(source_type)
+    return bool(getattr(spec.capabilities, capability, False))
+
+
 def source_documents(source: Source, repo: Repo) -> list[Document]:
     """Return documents owned by ``source`` without unnecessary tenant scans."""
     base_doc_id = source.config.get("doc_id") or f"doc-{source.source_id}"
-    if source.source_type not in _MULTI_DOCUMENT_SOURCE_TYPES:
+    if not _connector_capability(source.source_type, "multi_document"):
         document = repo.get_document(base_doc_id)
         if document and document.tenant_id == source.tenant_id:
             return [document]
@@ -365,119 +363,8 @@ def _delete_qdrant_documents(qdrant: object, doc_ids: set[str]) -> int:
 
 
 def _run_connector(source: Source, repo: Repo, previous_chunks: Iterable[Chunk] = ()) -> Iterable[Chunk]:
-    source_type = source.source_type
-    config = source.config
-    doc_id = config.get("doc_id") or f"doc-{source.source_id}"
-    common = dict(
-        doc_id=doc_id,
-        tenant_id=source.tenant_id,
-        version=config.get("version", "1.0"),
-        tags=source.tags,
-        acl_hash=_resolve_acl_hash(source, repo),
-        chunking=config.get("chunking"),
-    )
-
-    if source_type == "pdf":
-        from services.worker.jobs.ingest_pdf import ingest_pdf
-        return ingest_pdf(
-            path=config["path"],
-            chunk_size=int(config.get("chunk_size", 800)),
-            chunk_overlap=int(config.get("chunk_overlap", 100)),
-            parsing=config.get("parsing"),
-            **common,
-        )
-    if source_type == "web":
-        from services.worker.jobs.ingest_web import ingest_web
-        return ingest_web(
-            url=config["url"],
-            chunk_size=int(config.get("chunk_size", 800)),
-            chunk_overlap=int(config.get("chunk_overlap", 100)),
-            parsing=config.get("parsing"),
-            **common,
-        )
-    if source_type == "repo":
-        from services.worker.jobs.ingest_repo import ingest_repo
-        return ingest_repo(
-            url_or_path=config["path"],
-            ref=config.get("ref"),
-            chunk_size=int(config.get("chunk_size", 600)),
-            chunk_overlap=int(config.get("chunk_overlap", 100)),
-            **common,
-        )
-    if source_type == "local_fs":
-        from services.worker.jobs.ingest_text import ingest_local_fs
-        return ingest_local_fs(
-            directory=config["path"],
-            extensions=config.get("extensions"),
-            chunk_size=int(config.get("chunk_size", 800)),
-            chunk_overlap=int(config.get("chunk_overlap", 100)),
-            parsing=config.get("parsing"),
-            **common,
-        )
-    if source_type == "s3":
-        from services.worker.jobs.ingest_s3 import ingest_s3
-        return ingest_s3(
-            bucket=config["bucket"],
-            prefix=config.get("prefix", ""),
-            endpoint_url=config.get("endpoint_url"),
-            region_name=config.get("region_name"),
-            credential_env_prefix=config.get("credential_env_prefix"),
-            extensions=config.get("extensions"),
-            max_object_bytes=int(config.get("max_object_bytes", 20 * 1024 * 1024)),
-            chunk_size=int(config.get("chunk_size", 800)),
-            chunk_overlap=int(config.get("chunk_overlap", 100)),
-            parsing=config.get("parsing"),
-            **common,
-        )
-    if source_type == "gdrive":
-        from services.worker.jobs.ingest_google_drive import ingest_google_drive
-        return ingest_google_drive(
-            folder_id=config["folder_id"],
-            credential_ref=config["credential_ref"],
-            credential_type=config.get("credential_type", "access_token"),
-            recursive=bool(config.get("recursive", True)),
-            max_file_bytes=int(config.get("max_file_bytes", 20 * 1024 * 1024)),
-            chunk_size=int(config.get("chunk_size", 800)),
-            chunk_overlap=int(config.get("chunk_overlap", 100)),
-            previous_chunks=previous_chunks,
-            parsing=config.get("parsing"),
-            **common,
-        )
-    if source_type == "notion":
-        from services.worker.jobs.ingest_notion import ingest_notion
-        return ingest_notion(
-            page_id=config["page_id"],
-            credential_ref=config["credential_ref"],
-            recursive=bool(config.get("recursive", True)),
-            notion_version=config.get("notion_version", "2022-06-28"),
-            chunk_size=int(config.get("chunk_size", 800)),
-            chunk_overlap=int(config.get("chunk_overlap", 100)),
-            previous_chunks=previous_chunks,
-            **common,
-        )
-    if source_type == "confluence":
-        from services.worker.jobs.ingest_confluence import ingest_confluence
-        return ingest_confluence(
-            base_url=config["base_url"],
-            space_key=config["space_key"],
-            credential_ref=config["credential_ref"],
-            auth_type=config.get("auth_type", "basic"),
-            email=config.get("email"),
-            root_page_id=config.get("root_page_id"),
-            chunk_size=int(config.get("chunk_size", 800)),
-            chunk_overlap=int(config.get("chunk_overlap", 100)),
-            previous_chunks=previous_chunks,
-            **common,
-        )
-    raise ValueError(f"Unsupported source_type: {source_type}")
-
-
-def _resolve_acl_hash(source: Source, repo: Repo) -> str:
-    if source.acl_policy_id:
-        policy_hash = repo.get_policy_hash(source.acl_policy_id)
-        if policy_hash:
-            return policy_hash
-    return "public"
+    """Resolve connector execution through the shared platform registry."""
+    return connector_registry().ingest(source, repo, previous_chunks)
 
 
 def _embedding_identity(embedder: Optional[Embedder], qdrant: object) -> tuple[str, int]:
@@ -631,7 +518,7 @@ def _prepare_documents(
     *,
     generation_id: str,
 ) -> list[Document]:
-    if source.source_type not in _MULTI_DOCUMENT_SOURCE_TYPES:
+    if not _connector_capability(source.source_type, "multi_document"):
         if not chunks:
             return []
         return [
@@ -648,7 +535,7 @@ def _prepare_documents(
     documents: list[Document] = []
     for doc_id, chunk in first_chunk_by_doc_id.items():
         metadata = chunk.metadata or {}
-        if source.source_type in _REMOTE_DOCUMENT_SOURCE_TYPES:
+        if _connector_capability(source.source_type, "remote"):
             title = str(
                 metadata.get("document_title")
                 or metadata.get("filename")
@@ -719,7 +606,7 @@ def _prepare_document(
 
 
 def _ensure_documents_legacy(source: Source, repo: Repo, chunks: list[Chunk]) -> list[Document]:
-    if source.source_type not in _MULTI_DOCUMENT_SOURCE_TYPES:
+    if not _connector_capability(source.source_type, "multi_document"):
         if not chunks:
             return []
         return [_ensure_document_legacy(source, repo)]
@@ -730,7 +617,7 @@ def _ensure_documents_legacy(source: Source, repo: Repo, chunks: list[Chunk]) ->
     documents: list[Document] = []
     for doc_id, chunk in first_chunk_by_doc_id.items():
         metadata = chunk.metadata or {}
-        if source.source_type in _REMOTE_DOCUMENT_SOURCE_TYPES:
+        if _connector_capability(source.source_type, "remote"):
             title = str(
                 metadata.get("document_title")
                 or metadata.get("filename")
