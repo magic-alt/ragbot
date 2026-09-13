@@ -74,15 +74,38 @@ class EmbeddingRouter:
 
 
 class ActiveIndexEmbedder:
-    """Embedder façade that follows the active IndexVersion contract."""
+    """Embedder façade that follows the query-visible Qdrant alias target.
 
-    def __init__(self, repo: Any, router: EmbeddingRouter, alias_name: str, fallback: Embedder) -> None:
+    Alias visibility is consulted before PostgreSQL's active status. This is
+    important during activation: one atomic Qdrant alias switch changes both the
+    collection used by vector search and, through this façade, the embedding
+    contract selected for the next query. PostgreSQL can then be reconciled if
+    the process crashes between alias switch and control-plane commit.
+    """
+
+    def __init__(
+        self,
+        repo: Any,
+        router: EmbeddingRouter,
+        alias_name: str,
+        fallback: Embedder,
+        vector_store: Optional[Any] = None,
+    ) -> None:
         self._repo = repo
         self._router = router
         self._alias_name = alias_name
         self._fallback = fallback
+        self._vector_store = vector_store
 
     def _active_version(self):
+        if self._vector_store is not None:
+            active_collection = getattr(self._vector_store, "active_collection_name", None)
+            by_collection = getattr(self._repo, "get_index_version_by_collection", None)
+            if callable(active_collection) and callable(by_collection):
+                physical = active_collection()
+                visible = by_collection(self._alias_name, physical)
+                if visible is not None:
+                    return visible
         getter = getattr(self._repo, "get_active_index_version", None)
         return getter(self._alias_name) if callable(getter) else None
 
@@ -123,8 +146,9 @@ class ActiveIndexEmbedder:
         return self._active_embedder().embed(text)
 
     def embed_query(self, text: str) -> list[float]:
-        embed_query = getattr(self._active_embedder(), "embed_query", None)
-        return embed_query(text) if callable(embed_query) else self._active_embedder().embed(text)
+        embedder = self._active_embedder()
+        embed_query = getattr(embedder, "embed_query", None)
+        return embed_query(text) if callable(embed_query) else embedder.embed(text)
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         return self._active_embedder().embed_batch(texts)
