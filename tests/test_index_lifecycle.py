@@ -99,6 +99,9 @@ def _seed_legacy(store, embedder, chunks):
         vector = embedder.embed(chunk.text)
         point_id = point_id_for_chunk(chunk.chunk_id)
         chunk.qdrant_point_id = point_id
+        chunk.metadata["embedding_contract_id"] = embedder.contract_id
+        chunk.metadata["embedding_model"] = embedder.model_name
+        chunk.metadata["embedding_dimension"] = embedder.dimension
         payload = _build_payload(chunk, embedder.model_name)
         payload["embedding_contract_id"] = embedder.contract_id
         points.append((point_id, vector, payload))
@@ -147,15 +150,23 @@ def test_index_build_activate_rollback_and_alias_bound_embedding():
     assert active_embedder.dimension == 6
     assert repo.get_active_index_version(store.alias_name).index_version_id == candidate.index_version_id
     assert repo.get_index_version(baseline.index_version_id).status == "retired"
+    for chunk in chunks:
+        assert chunk.metadata["embedding_contract_id"] == new.contract_id
+        assert chunk.metadata["embedding_model"] == new.model_name
+        assert chunk.metadata["embedding_dimension"] == new.dimension
 
     service.rollback(baseline.index_version_id, retention_seconds=3600)
     assert store.active_collection_name() == baseline.physical_collection
     assert active_embedder.contract_id == old.contract_id
     assert repo.get_active_index_version(store.alias_name).index_version_id == baseline.index_version_id
+    for chunk in chunks:
+        assert chunk.metadata["embedding_contract_id"] == old.contract_id
+        assert chunk.metadata["embedding_model"] == old.model_name
+        assert chunk.metadata["embedding_dimension"] == old.dimension
 
 
 def test_alias_is_query_authority_and_reconcile_repairs_postgres_pointer():
-    repo, old, new, router, store, service, baseline, _chunks = _fixture()
+    repo, old, new, router, store, service, baseline, chunks = _fixture()
     candidate = service.create_candidate(new.contract_id)
     service.build(candidate.index_version_id)
     service.mark_ready(candidate.index_version_id, {"manual": True}, approved=True)
@@ -168,6 +179,7 @@ def test_alias_is_query_authority_and_reconcile_repairs_postgres_pointer():
     result = service.reconcile()
     assert result["action"] == "postgres_pointer_repaired"
     assert repo.get_active_index_version(store.alias_name).index_version_id == candidate.index_version_id
+    assert {chunk.metadata["embedding_contract_id"] for chunk in chunks} == {new.contract_id}
 
 
 def test_failed_postgres_activation_compensates_alias_switch(monkeypatch):
