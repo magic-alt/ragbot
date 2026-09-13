@@ -100,50 +100,134 @@ async def run_agent(
     generation_temperature: float = 0.2,
     generation_max_tokens: Optional[int] = None,
 ) -> AgentState:
-    """Execute the agent state graph."""
+    """Run the agent graph and always terminate the event stream."""
+    cb = callback or NullCallback()
     state = build_initial_state(
         query=query,
         tenant_id=tenant_id,
         user_id=user_id,
-        constraints=constraints,
         session_id=session_id,
+        constraints=constraints,
         request_id=request_id,
-        initial_evidence=initial_evidence,
         conversation_messages=conversation_messages,
         system_prompt=system_prompt,
         generation_temperature=generation_temperature,
         generation_max_tokens=generation_max_tokens,
     )
-    callback = callback or NullCallback()
-    metrics = get_metrics_collector()
-    request_metrics = build_request_metrics(state.request_id)
-    tracer = RequestTracer(state.request_id)
+    tracer = RequestTracer(request_id=state.request_id)
 
     try:
-        state = await route_node(state, services)
-        callback.on_event(AgentEvent("route", state.request_id, {"route": state.route}))
+        if initial_evidence:
+            state.evidence.extend(initial_evidence)
 
-        if state.route in (ROUTE_DOC_RAG, ROUTE_MIXED):
-            state = await retrieve_node(state, services)
-        elif state.route == ROUTE_SQL:
-            state = await sql_node(state, services)
-        elif state.route == ROUTE_CODE:
-            state = await code_node(state, services)
-        elif state.route == ROUTE_WEB:
-            state = await web_node(state, services)
+        with tracer.span("route") as span:
+            state = await route_node(state, services)
+            span.attributes["route"] = state.route or ""
+        cb.emit(AgentEvent("route", {"route": state.route, "request_id": state.request_id}))
 
-        state = await synthesize_node(state, services)
-        state = await verify_node(state, services)
-        state = await finalize_node(state, services)
+        action = _initial_action(state)
+        while True:
+            state.iteration += 1
+            prev_calls = len(state.tool_calls)
+
+            with tracer.span(action, iteration=state.iteration) as span:
+                if action == "sql_query":
+                    state = await sql_node(state, services)
+                elif action == "code_search":
+                    state = await code_node(state, services)
+                elif action == "open_file":
+                    state = await open_file_node(state, services)
+                elif action == "apply_patch":
+                    state = await apply_patch_node(state, services)
+                elif action == "explain_error":
+                    state = await explain_error_node(state, services)
+                elif action == "retrieve":
+                    state = await retrieve_node(state, services)
+                elif action == "web_search":
+                    state = await web_node(state, services)
+
+                new_calls = state.tool_calls[prev_calls:]
+                span.attributes["tool_calls"] = len(new_calls)
+                span.attributes["evidence_total"] = len(state.evidence)
+                for call in new_calls:
+                    if not call.ok:
+                        span.attributes["has_failure"] = True
+
+            for call in state.tool_calls[prev_calls:]:
+                cb.emit(AgentEvent("tool_call", {
+                    "name": call.name,
+                    "args": call.args,
+                    "request_id": state.request_id,
+                }))
+                cb.emit(AgentEvent("tool_result", {
+                    "name": call.name,
+                    "ok": call.ok,
+                    "meta": call.result_preview,
+                    "error": call.error,
+                    "request_id": state.request_id,
+                }))
+
+            with tracer.span("synthesize", iteration=state.iteration):
+                state = await synthesize_node(state, services)
+            with tracer.span("verify", iteration=state.iteration):
+                state = await verify_node(state, services)
+            if not _should_continue(state):
+                break
+            action = _next_step(state)
+
+        with tracer.span("finalize"):
+            state = await finalize_node(state, services)
+
+        trace_record = tracer.finish()
+        metrics = build_request_metrics(state, trace_record)
+        get_metrics_collector().record(metrics)
+
+        if state.final:
+            cb.emit(AgentEvent("final", {
+                "request_id": state.request_id,
+                "answer": state.final.answer,
+                "citations": [asdict(citation) for citation in state.final.citations],
+                "confidence": state.final.confidence,
+                "followups": list(state.final.followups),
+            }))
         return state
+    except Exception:
+        cb.emit(AgentEvent("error", {
+            "request_id": state.request_id,
+            "error": "Agent execution failed",
+        }))
+        raise
     finally:
-        # Existing metric/tracing helpers own detailed event aggregation; keep
-        # this function's lifecycle behavior stable while model routing evolves.
-        try:
-            metrics.record_request(asdict(request_metrics))
-        except Exception:
-            pass
-        try:
-            tracer.finish()
-        except Exception:
-            pass
+        cb.close()
+
+
+def _initial_action(state: AgentState) -> str:
+    if state.route == ROUTE_SQL:
+        return "sql_query"
+    if state.route == ROUTE_CODE:
+        return "code_search"
+    if state.route == ROUTE_DOC_RAG:
+        return "retrieve"
+    if state.route == ROUTE_MIXED:
+        return "retrieve"
+    if state.route == ROUTE_WEB:
+        return "web_search"
+    return "retrieve"
+
+
+def _should_continue(state: AgentState) -> bool:
+    if state.hard_fail:
+        return False
+    if state.iteration >= state.max_iterations:
+        return False
+    if state.verification and state.verification.enough_evidence:
+        return False
+    return True
+
+
+def _next_step(state: AgentState) -> str:
+    if state.verification and state.verification.next_query:
+        state.query = state.verification.next_query
+    if state.verification and state.verification.next_action:
+        return state.verification.next_action
+    return "retrieve"
