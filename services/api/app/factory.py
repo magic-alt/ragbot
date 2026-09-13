@@ -21,7 +21,7 @@ from .runtime import is_production, validate_production_environment
 from .runtime_registry import runtime_component_registry
 from .storage.generation_support import ensure_generation_repository
 from .storage.index_support import ensure_index_repository, supports_index_lifecycle
-from .storage.publication_barrier import ensure_worker_claim_gate
+from .storage.publication_barrier import ensure_index_cutover_gate, ensure_worker_claim_gate
 from .storage.repo import InMemoryRepo
 from .storage.upload_support import ensure_upload_repository
 
@@ -115,6 +115,7 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
                 concurrent.index_version_id,
             )
             index_lifecycle.bootstrap_current(default_embedder)
+        ensure_index_cutover_gate(index_lifecycle)
         embedder = ActiveIndexEmbedder(
             repo,
             embedding_router,
