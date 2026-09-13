@@ -146,6 +146,7 @@ jobs:
       POSTGRES_DSN: postgresql://ragbot:ragbot@127.0.0.1:55432/ragbot
       QDRANT_URL: http://127.0.0.1:6333
       QDRANT_COLLECTION: ragbot_recovery_smoke
+      QDRANT_INDEX_ALIAS: ragbot_recovery_smoke_active
 
     steps:
       - name: Checkout
@@ -162,7 +163,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client
           python -m pip install --upgrade pip
-          python -m pip install -e ".[postgres]"
+          python -m pip install -e ".[postgres,qdrant]"
 
       - name: Wait for Qdrant
         run: |
@@ -198,6 +199,36 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"points":[{"id":1,"vector":[1.0,0.0,0.0,0.0],"payload":{"marker":"recovery-ok"}}]}' >/dev/null
 
+      - name: Exercise real Qdrant alias cutover and rollback
+        run: |
+          python - <<'PY'
+          import os
+          from services.api.app.retrieval.qdrant import QdrantClientAdapter
+
+          collection = os.environ['QDRANT_COLLECTION']
+          alias = os.environ['QDRANT_INDEX_ALIAS']
+          candidate = f'{collection}_candidate_6d'
+          adapter = QdrantClientAdapter(
+              url=os.environ['QDRANT_URL'], api_key=None,
+              collection_name=collection, dim=4, alias_name=alias,
+          )
+          try:
+              assert adapter.active_collection_name() == collection
+              assert adapter.dim == 4
+              adapter.create_physical_collection(candidate, dim=6)
+              previous = adapter.switch_alias(candidate)
+              assert previous == collection
+              assert adapter.active_collection_name() == candidate
+              assert adapter.dim == 6
+              adapter.switch_alias(collection)
+              assert adapter.active_collection_name() == collection
+              assert adapter.dim == 4
+              assert adapter.delete_collection(candidate)
+          finally:
+              adapter.close()
+          print('Qdrant alias cutover + rollback verified')
+          PY
+
       - name: Backup PostgreSQL and Qdrant
         run: bash scripts/backup_ragbot.sh "$RUNNER_TEMP/ragbot-backup"
 
@@ -209,18 +240,26 @@ jobs:
       - name: Restore PostgreSQL and Qdrant
         run: bash scripts/restore_ragbot.sh "$RUNNER_TEMP/ragbot-backup"
 
-      - name: Verify restored state
+      - name: Verify restored state and alias
         run: |
-          count="$(psql "$POSTGRES_DSN" -Atc "SELECT COUNT(*) FROM sources WHERE source_id='recovery-source'")"
+          count="$(psql "$POSTGRES_DSN" -Atc "SELECT COUNT(*) FROM sources WHERE source_id='recovery-source')"
           test "$count" = "1"
           python - <<'PY'
           import json, os, urllib.request
-          url = f"{os.environ['QDRANT_URL']}/collections/{os.environ['QDRANT_COLLECTION']}/points/1"
-          with urllib.request.urlopen(url, timeout=10) as response:
+          point_url = f"{os.environ['QDRANT_URL']}/collections/{os.environ['QDRANT_COLLECTION']}/points/1"
+          with urllib.request.urlopen(point_url, timeout=10) as response:
               payload = json.load(response)
           result = payload.get('result') or {}
           assert (result.get('payload') or {}).get('marker') == 'recovery-ok', payload
-          print('PostgreSQL + Qdrant backup/restore verified')
+
+          with urllib.request.urlopen(f"{os.environ['QDRANT_URL']}/aliases", timeout=10) as response:
+              aliases = json.load(response)
+          pairs = {
+              (item.get('alias_name'), item.get('collection_name'))
+              for item in (aliases.get('result') or {}).get('aliases', []) or []
+          }
+          assert (os.environ['QDRANT_INDEX_ALIAS'], os.environ['QDRANT_COLLECTION']) in pairs, pairs
+          print('PostgreSQL + Qdrant backup/restore + alias verified')
           PY
 
   node-client:
@@ -231,8 +270,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses:
-          actions/setup-node@v7
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
 
@@ -292,7 +330,11 @@ jobs:
           assert config['services']['qdrant']['image'] == 'qdrant/qdrant:v1.19.0', (
               f'{compose_file}: Qdrant runtime must be pinned to v1.19.0'
           )
-          print(f'{compose_file}: worker reliability + secret isolation OK')
+          assert 'QDRANT_INDEX_ALIAS' in worker_env, f'{compose_file}: index alias is not propagated to worker'
+          assert 'RAGBOT_EMBEDDING_PROFILES_JSON' in worker_env, f'{compose_file}: standby embedding profiles are not propagated to worker'
+          assert api_env.get('QDRANT_INDEX_ALIAS') == worker_env.get('QDRANT_INDEX_ALIAS'), f'{compose_file}: API/worker alias mismatch'
+          assert api_env.get('RAGBOT_EMBEDDING_PROFILES_JSON') == worker_env.get('RAGBOT_EMBEDDING_PROFILES_JSON'), f'{compose_file}: API/worker embedding profile mismatch'
+          print(f'{compose_file}: worker reliability + secret isolation + index lifecycle config OK')
           PY
           done
           rm -f .ci-worker.env .ci-compose.json
@@ -330,6 +372,8 @@ jobs:
           echo "$output" | grep -A1 'name: RAGBOT_PROVIDER_MAX_ATTEMPTS' | grep -q 'value: "5"'
           echo "$output" | grep -A1 'name: RAGBOT_PROVIDER_BACKOFF_BASE_SECONDS' | grep -q 'value: "0.75"'
           echo "$output" | grep -A1 'name: RAGBOT_PROVIDER_BACKOFF_MAX_SECONDS' | grep -q 'value: "35"'
+          echo "$output" | grep -A1 'name: QDRANT_INDEX_ALIAS' >/dev/null
+          echo "$output" | grep -A1 'name: RAGBOT_EMBEDDING_PROFILES_JSON' >/dev/null
 
       - name: Render KEDA queue autoscaling
         run: |
