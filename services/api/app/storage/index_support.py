@@ -75,6 +75,21 @@ def supports_index_lifecycle(repo: Any) -> bool:
     return all(callable(getattr(repo, name, None)) for name in _INDEX_METHODS)
 
 
+def _embedding_identity(version: IndexVersion) -> tuple[str, str, int]:
+    spec = dict(version.embedding_spec or {})
+    model = str(spec.get("model") or "unknown")
+    dimension = int(
+        spec.get("dimension")
+        or ((version.vector_schema.get("dense") or {}).get("dimension"))
+        or 0
+    )
+    if dimension <= 0:
+        raise ValueError(
+            f"IndexVersion has invalid embedding dimension: {version.index_version_id}"
+        )
+    return version.embedding_contract_id, model, dimension
+
+
 class _InMemoryIndexRepo:
     def _ensure_index_state(self) -> None:
         if not hasattr(self, "_index_versions"):
@@ -201,6 +216,17 @@ class _InMemoryIndexRepo:
             target.retired_at = None
             target.delete_after = None
             target.error = None
+
+            contract_id, model, dimension = _embedding_identity(target)
+            chunks = getattr(self, "_chunks", {})
+            for chunk in chunks.values():
+                if target.tenant_id is not None and chunk.tenant_id != target.tenant_id:
+                    continue
+                metadata = dict(chunk.metadata or {})
+                metadata["embedding_contract_id"] = contract_id
+                metadata["embedding_model"] = model
+                metadata["embedding_dimension"] = dimension
+                chunk.metadata = metadata
             return target
 
     def list_prunable_index_versions(self, now_iso: str) -> list[IndexVersion]:
@@ -389,6 +415,38 @@ class _PostgresIndexRepo:
                     WHERE index_version_id = %s
                     """,
                     (index_version_id,),
+                )
+
+                embedding_spec = target.get("embedding_spec") or {}
+                if isinstance(embedding_spec, str):
+                    embedding_spec = json.loads(embedding_spec)
+                contract_id = str(target["embedding_contract_id"])
+                model = str(embedding_spec.get("model") or "unknown")
+                dimension = int(
+                    embedding_spec.get("dimension")
+                    or ((target.get("vector_schema") or {}).get("dense") or {}).get("dimension")
+                    or 0
+                )
+                if dimension <= 0:
+                    raise ValueError(
+                        f"IndexVersion has invalid embedding dimension: {index_version_id}"
+                    )
+                conn.execute(
+                    """
+                    UPDATE chunks
+                    SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+                        'embedding_contract_id', %(contract_id)s,
+                        'embedding_model', %(model)s,
+                        'embedding_dimension', %(dimension)s
+                    )
+                    WHERE %(tenant_id)s::text IS NULL OR tenant_id = %(tenant_id)s::text
+                    """,
+                    {
+                        "contract_id": contract_id,
+                        "model": model,
+                        "dimension": dimension,
+                        "tenant_id": target.get("tenant_id"),
+                    },
                 )
         result = self.get_index_version(index_version_id)
         if result is None:  # pragma: no cover
