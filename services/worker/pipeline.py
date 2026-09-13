@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from services.api.app.retrieval.embedder import Embedder
+from services.api.app.retrieval.embedding_contract import EmbeddingSpec
 from services.api.app.retrieval.qdrant import normalize_qdrant_point_id
 from services.api.app.storage.generation_support import (
     ensure_generation_repository,
@@ -54,7 +55,7 @@ def run_ingest_pipeline(
     """Execute one replacement-oriented ingestion run for ``source``."""
     now = datetime.now(timezone.utc).isoformat()
     job_id = job_id or uuid.uuid4().hex
-    embedding_model, embedding_dimension = _embedding_identity(embedder, qdrant)
+    embedding_model, embedding_dimension, embedding_contract_id = _embedding_identity(embedder, qdrant)
     ensure_generation_repository(repo)
     staged_publication = supports_generation_publication(repo)
     publication_generation_id: Optional[str] = None
@@ -110,6 +111,7 @@ def run_ingest_pipeline(
             now,
             embedding_model=embedding_model,
             embedding_dimension=embedding_dimension,
+            embedding_contract_id=embedding_contract_id,
         )
         candidate_chunks = _dedup_chunks(candidate_chunks)
         current_chunks, chunks_to_write, chunks_reused = _reuse_unchanged_chunks(
@@ -219,6 +221,7 @@ def run_ingest_pipeline(
             "source_generation": expected_generation,
             "embedding_model": embedding_model,
             "embedding_dimension": embedding_dimension,
+            "embedding_contract_id": embedding_contract_id,
             "parser_contracts": _parser_contracts(current_chunks),
             "chunking_contracts": _chunking_contracts(current_chunks),
             "publication_mode": "staged-generation" if staged_publication else "legacy-direct",
@@ -246,7 +249,7 @@ def run_ingest_pipeline(
             lease_expires_at=None,
         )
         logger.info(
-            "Pipeline completed: job=%s source=%s generation=%s documents=%d chunks_total=%d written=%d reused=%d removed=%d embedding=%s/%d",
+            "Pipeline completed: job=%s source=%s generation=%s documents=%d chunks_total=%d written=%d reused=%d removed=%d embedding=%s/%d contract=%s",
             job_id,
             source.source_id,
             publication_generation_id or "legacy-direct",
@@ -257,6 +260,7 @@ def run_ingest_pipeline(
             chunks_removed,
             embedding_model,
             embedding_dimension,
+            embedding_contract_id,
         )
     except SourceFenceError as exc:
         logger.warning("Pipeline fenced: job=%s source=%s error=%s", job_id, source.source_id, exc)
@@ -367,10 +371,19 @@ def _run_connector(source: Source, repo: Repo, previous_chunks: Iterable[Chunk] 
     return connector_registry().ingest(source, repo, previous_chunks)
 
 
-def _embedding_identity(embedder: Optional[Embedder], qdrant: object) -> tuple[str, int]:
+def _embedding_identity(embedder: Optional[Embedder], qdrant: object) -> tuple[str, int, str]:
     dimension = int(getattr(embedder, "dimension", getattr(qdrant, "dim", 64)))
     model = str(getattr(embedder, "model_name", f"hash-{dimension}"))
-    return model, dimension
+    contract = str(getattr(embedder, "contract_id", "") or "")
+    if not contract:
+        provider_id = "hash" if embedder is None else type(embedder).__name__.lower()
+        contract = EmbeddingSpec(
+            provider_id=provider_id,
+            model=model,
+            dimension=dimension,
+            normalize=(embedder is None),
+        ).contract_id
+    return model, dimension, contract
 
 
 def _normalize_chunk_metadata(
@@ -379,6 +392,7 @@ def _normalize_chunk_metadata(
     now: str,
     embedding_model: Optional[str] = None,
     embedding_dimension: Optional[int] = None,
+    embedding_contract_id: Optional[str] = None,
 ) -> None:
     for chunk in chunks:
         metadata = dict(chunk.metadata or {})
@@ -391,6 +405,8 @@ def _normalize_chunk_metadata(
             metadata["embedding_model"] = embedding_model
         if embedding_dimension is not None:
             metadata["embedding_dimension"] = int(embedding_dimension)
+        if embedding_contract_id:
+            metadata["embedding_contract_id"] = embedding_contract_id
         metadata["ingested_at"] = now
         metadata["doc_updated_at"] = now
         chunk.source_id = source.source_id
@@ -471,6 +487,7 @@ def _reuse_key(chunk: Chunk) -> tuple:
         metadata.get("chunker_strategy"),
         metadata.get("chunker_version"),
         metadata.get("chunker_config_hash"),
+        metadata.get("embedding_contract_id"),
         metadata.get("embedding_model"),
         metadata.get("embedding_dimension"),
     )
