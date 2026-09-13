@@ -5,6 +5,7 @@ import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from services.api.app.retrieval.embedder import Embedder, HashEmbedder
+from services.api.app.retrieval.embedding_contract import embedding_contract_id
 from services.api.app.retrieval.qdrant import point_id_for_chunk, to_epoch
 from services.api.app.storage.models import Chunk
 from services.api.app.storage.protocol import Repo
@@ -29,13 +30,9 @@ def embed_and_stage_vectors(
     batch_size: int = DEFAULT_BATCH_SIZE,
     embedder: Optional[Embedder] = None,
 ) -> list[str]:
-    """Embed changed chunks into generation-specific Qdrant points only.
-
-    PostgreSQL staging/activation is handled separately. This function never
-    mutates the active repository tables, so a crash during vector preparation
-    cannot expose the candidate generation through lexical retrieval.
-    """
+    """Embed changed chunks into generation-specific Qdrant points only."""
     emb = embedder or HashEmbedder(dim=qdrant.dim)
+    contract_id = embedding_contract_id(emb)
     chunk_list: List[Chunk] = []
     written_point_ids: list[str] = []
 
@@ -60,6 +57,7 @@ def embed_and_stage_vectors(
                 {
                     "embedding_model": emb.model_name,
                     "embedding_dimension": emb.dimension,
+                    "embedding_contract_id": contract_id,
                     "source_id": source_id,
                     "generation_id": generation_id,
                 }
@@ -73,8 +71,9 @@ def embed_and_stage_vectors(
             written_point_ids.append(point_id)
         qdrant.upsert(points)
         logger.debug(
-            "Staged vector batch: generation=%s points=%d",
+            "Staged vector batch: generation=%s contract=%s points=%d",
             generation_id,
+            contract_id,
             len(points),
         )
         chunk_list = []
@@ -96,6 +95,7 @@ def embed_and_upsert(
 ) -> None:
     """Legacy direct publication path retained for custom repositories/callers."""
     emb = embedder or HashEmbedder(dim=qdrant.dim)
+    contract_id = embedding_contract_id(emb)
     vector_batch: List[Tuple[str, List[float], Dict[str, Any]]] = []
     chunk_list: List[Chunk] = []
     total = 0
@@ -118,6 +118,7 @@ def embed_and_upsert(
             metadata = dict(chunk.metadata or {})
             metadata["embedding_model"] = emb.model_name
             metadata["embedding_dimension"] = emb.dimension
+            metadata["embedding_contract_id"] = contract_id
             chunk.metadata = metadata
             point_id = point_id_for_chunk(chunk.chunk_id)
             chunk.qdrant_point_id = point_id
@@ -131,7 +132,7 @@ def embed_and_upsert(
                 repo.add_chunk(chunk)
         qdrant.upsert(vector_batch)
         total += len(vector_batch)
-        logger.debug("Upserted batch of %d points (total: %d)", len(vector_batch), total)
+        logger.debug("Upserted batch of %d points (total: %d, contract=%s)", len(vector_batch), total, contract_id)
         vector_batch = []
         chunk_list = []
 
@@ -183,5 +184,6 @@ def _build_payload(chunk: Chunk, embedding_model: str = "hash-64") -> Dict[str, 
         "chunk_overlap": metadata.get("chunk_overlap"),
         "embedding_model": embedding_model,
         "embedding_dimension": metadata.get("embedding_dimension"),
+        "embedding_contract_id": metadata.get("embedding_contract_id"),
         "text": chunk.text,
     }
