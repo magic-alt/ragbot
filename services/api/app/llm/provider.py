@@ -48,23 +48,14 @@ class ModelProvider(Protocol):
 
 
 def endpoint_from_env(tier: Optional[str] = None) -> ModelEndpoint:
-    """Resolve one immutable model endpoint without mutating process environment.
-
-    Existing OPENAI_*/OLLAMA_* variables remain compatible. Tier-specific
-    RAGBOT_MODEL_FAST_* / RAGBOT_MODEL_STRONG_* settings override them.
-    """
+    """Resolve one immutable model endpoint without mutating process environment."""
     normalized_tier = str(tier or "").strip().upper()
     prefix = f"RAGBOT_MODEL_{normalized_tier}_" if normalized_tier else ""
-
     default_provider = os.getenv("RAGBOT_LLM_PROVIDER", "openai").strip().lower() or "openai"
     provider = os.getenv(f"{prefix}PROVIDER", default_provider).strip().lower() or default_provider
 
-    if normalized_tier:
-        model_override = os.getenv(f"RAGBOT_MODEL_{normalized_tier}", "").strip()
-    else:
-        model_override = ""
+    model_override = os.getenv(f"RAGBOT_MODEL_{normalized_tier}", "").strip() if normalized_tier else ""
     model = os.getenv(f"{prefix}MODEL", "").strip() or model_override
-
     timeout = float(os.getenv(f"{prefix}TIMEOUT_SECONDS", os.getenv("RAGBOT_MODEL_TIMEOUT_SECONDS", "60")))
     max_attempts = int(os.getenv(f"{prefix}MAX_ATTEMPTS", os.getenv("RAGBOT_MODEL_MAX_ATTEMPTS", "3")))
     concurrency = int(os.getenv(f"{prefix}CONCURRENCY", os.getenv("RAGBOT_MODEL_CONCURRENCY", "16")))
@@ -80,16 +71,7 @@ def endpoint_from_env(tier: Optional[str] = None) -> ModelEndpoint:
             timeout_seconds=timeout,
             max_attempts=max_attempts,
             concurrency=concurrency,
-            capabilities=ModelCapabilities(
-                structured_output=True,
-                json_schema=True,
-                streaming=True,
-                tools=True,
-                web_search=True,
-                vision=True,
-                reasoning=True,
-                batch=True,
-            ),
+            capabilities=ModelCapabilities(structured_output=True, json_schema=True, streaming=True, tools=True, web_search=provider == "openai", vision=True, reasoning=True, batch=True),
         )
     if provider == "ollama":
         reasoning_effort = os.getenv(f"{prefix}REASONING_EFFORT", "").strip() or os.getenv("OLLAMA_REASONING_EFFORT", "").strip() or None
@@ -113,18 +95,16 @@ def endpoint_from_env(tier: Optional[str] = None) -> ModelEndpoint:
             timeout_seconds=timeout,
             max_attempts=max_attempts,
             concurrency=concurrency,
-            capabilities=ModelCapabilities(structured_output=True, json_schema=False, streaming=True, tools=True, vision=True, reasoning=True),
+            capabilities=ModelCapabilities(structured_output=True, streaming=True, tools=True, vision=True, reasoning=True),
         )
     if provider in {"gemini", "google", "vertex"}:
         vertex = provider == "vertex"
-        base_url = os.getenv(f"{prefix}BASE_URL", "").strip()
-        if not base_url:
-            base_url = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com").rstrip("/")
+        base_url = os.getenv(f"{prefix}BASE_URL", "").strip() or os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com").rstrip("/")
         return ModelEndpoint(
             provider_id="vertex" if vertex else "gemini",
             model_id=model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
             base_url=base_url,
-            api_key=os.getenv(f"{prefix}API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", ""),
+            api_key=os.getenv(f"{prefix}API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "") or os.getenv("GOOGLE_OAUTH_ACCESS_TOKEN", ""),
             project=os.getenv("GOOGLE_CLOUD_PROJECT", ""),
             region=os.getenv("GOOGLE_CLOUD_LOCATION", "global"),
             timeout_seconds=timeout,
@@ -152,30 +132,16 @@ def endpoint_from_env(tier: Optional[str] = None) -> ModelEndpoint:
             timeout_seconds=timeout,
             max_attempts=max_attempts,
             concurrency=concurrency,
-            capabilities=ModelCapabilities(structured_output=True, json_schema=False, streaming=False, tools=True, vision=True, reasoning=True),
+            capabilities=ModelCapabilities(structured_output=True, tools=True, vision=True, reasoning=True, streaming=False),
         )
     raise ValueError(f"Unsupported RAGBOT model provider: {provider}")
 
 
 def build_model_provider(endpoint: Optional[ModelEndpoint] = None) -> ModelProvider:
     endpoint = endpoint or endpoint_from_env()
-    provider = endpoint.provider_id
-    if provider in {"openai", "openai-compatible"}:
-        from .client import OpenAIClient
-        return OpenAIClient(endpoint=endpoint)
-    if provider == "ollama":
-        from .ollama import OllamaAdapter
-        return OllamaAdapter(endpoint=endpoint)
-    if provider == "anthropic":
-        from .anthropic import AnthropicAdapter
-        return AnthropicAdapter(endpoint)
-    if provider in {"gemini", "vertex"}:
-        from .gemini import GeminiAdapter
-        return GeminiAdapter(endpoint)
-    if provider == "azure-openai":
-        from .azure import AzureOpenAIAdapter
-        return AzureOpenAIAdapter(endpoint)
-    if provider == "bedrock":
-        from .bedrock import BedrockAdapter
-        return BedrockAdapter(endpoint)
-    raise ValueError(f"Unsupported model provider: {provider}")
+    from ..runtime_registry import runtime_component_registry
+    return runtime_component_registry().build(
+        "llm",
+        endpoint.provider_id,
+        {"endpoint": endpoint},
+    )
