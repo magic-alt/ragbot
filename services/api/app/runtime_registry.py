@@ -84,17 +84,65 @@ def _build_memory_vector(config: Mapping[str, Any]):
     return InMemoryQdrant(dim=int(config["dim"]))
 
 
+def _qdrant_alias_dimension(
+    url: str,
+    api_key: Any,
+    alias_name: str,
+) -> Optional[int]:
+    """Resolve the query-visible schema before constructing the adapter.
+
+    Activation deliberately switches the Qdrant alias before the PostgreSQL
+    control-plane transaction. If the process crashes in that interval, the
+    next process must accept the alias target's dimension (not stale QDRANT_DIM
+    or stale PostgreSQL state) so reconciliation can run.
+    """
+    if not alias_name:
+        return None
+    try:
+        from qdrant_client import QdrantClient
+    except ImportError:
+        return None
+    client = QdrantClient(url=url, api_key=api_key)
+    try:
+        aliases = client.get_aliases()
+        target = None
+        for item in getattr(aliases, "aliases", None) or []:
+            if str(getattr(item, "alias_name", "")) == alias_name:
+                target = str(getattr(item, "collection_name", "")) or None
+                break
+        if not target:
+            return None
+        info = client.get_collection(target)
+        vectors = getattr(getattr(getattr(info, "config", None), "params", None), "vectors", None)
+        actual = getattr(vectors, "size", None)
+        if actual is None and isinstance(vectors, dict):
+            unnamed = vectors.get("") or next(iter(vectors.values()), None)
+            actual = getattr(unnamed, "size", None)
+        return int(actual) if actual is not None else None
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+
 def _build_qdrant_vector(config: Mapping[str, Any]):
     from services.api.app.retrieval.qdrant import QdrantClientAdapter
     url = str(config.get("url") or "").strip()
     if not url:
         raise ValueError("vector:qdrant requires url")
+    alias_name = str(config.get("alias_name") or "").strip() or None
+    configured_dim = int(config["dim"])
+    visible_dim = (
+        _qdrant_alias_dimension(url, config.get("api_key"), alias_name)
+        if alias_name
+        else None
+    )
     return QdrantClientAdapter(
         url=url,
         api_key=config.get("api_key"),
         collection_name=str(config.get("collection_name") or "rag_chunks"),
-        dim=int(config["dim"]),
-        alias_name=str(config.get("alias_name") or "").strip() or None,
+        dim=visible_dim or configured_dim,
+        alias_name=alias_name,
     )
 
 
