@@ -92,4 +92,4 @@ print(json.dumps({
 PY
 
 printf 'Backup complete: %s\n' "$BACKUP_DIR"
-printf 'Manifest: %s/manifest.json\n' "$BACKUP_DIR/manifest.json"
+printf 'Manifest: %s/manifest.json\n' "$BACKUP_DIR"
