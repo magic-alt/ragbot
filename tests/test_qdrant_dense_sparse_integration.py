@@ -91,6 +91,40 @@ def test_real_qdrant_named_dense_sparse_prefetch_rrf_and_active_incremental_upse
     assert schema["dense"]["dense"]["dimension"] == dense.dimension
     assert "sparse" in schema["sparse"]
 
+    # Verify tenant eligibility is applied inside each prefetch candidate branch,
+    # before RRF spends its candidate budget. The tenant-b point is an exact
+    # match for this query and would otherwise consume a prefetch_limit=1 slot.
+    foreign = _chunk("foreign", "foreign secret exact candidate")
+    foreign.tenant_id = "tenant-b"
+    foreign_payload = _build_payload(foreign, dense.model_name)
+    foreign_payload["embedding_contract_id"] = dense.contract_id
+    foreign_payload["sparse_contract_id"] = sparse.contract_id
+    qdrant.upsert_hybrid_to_collection(
+        candidate.physical_collection,
+        [
+            (
+                point_id_for_chunk(foreign.chunk_id),
+                dense.embed(foreign.text),
+                sparse.embed_query(foreign.text),
+                foreign_payload,
+            )
+        ],
+        dense_name="dense",
+        sparse_name="sparse",
+    )
+    prefiltered = qdrant.native_hybrid_search(
+        dense.embed(foreign.text),
+        sparse.embed_query(foreign.text),
+        {"tenant_id": "tenant-a"},
+        1,
+        collection_name=candidate.physical_collection,
+        dense_name="dense",
+        sparse_name="sparse",
+        prefetch_limit=1,
+    )
+    assert prefiltered
+    assert all((payload or {}).get("tenant_id") == "tenant-a" for _pid, _score, payload in prefiltered)
+
     retriever = Retriever(
         repo,
         qdrant,
