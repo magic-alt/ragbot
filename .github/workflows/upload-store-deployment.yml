@@ -1,0 +1,108 @@
+name: UploadStore Deployment Gate
+
+on:
+  pull_request:
+    paths:
+      - "services/worker/uploads/**"
+      - "services/worker/connectors/security.py"
+      - "docker-compose.upload-s3.yml"
+      - "infra/docker/docker-compose.upload-s3.yml"
+      - ".env.upload-s3.example"
+      - "docs/UPLOAD_OBJECT_STORAGE.md"
+      - ".github/workflows/upload-store-deployment.yml"
+  push:
+    branches: [main]
+    paths:
+      - "services/worker/uploads/**"
+      - "services/worker/connectors/security.py"
+      - "docker-compose.upload-s3.yml"
+      - "infra/docker/docker-compose.upload-s3.yml"
+      - ".github/workflows/upload-store-deployment.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  object-upload-deployment:
+    runs-on: ubuntu-latest
+    env:
+      RAGBOT_UPLOAD_S3_BUCKET: ragbot-ci-uploads
+      RAGBOT_UPLOAD_S3_PREFIX: ragbot/ci/uploads
+      RAGBOT_UPLOAD_S3_ENDPOINT_URL: http://minio.example.invalid:9000
+      RAGBOT_UPLOAD_S3_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ci-access-key
+      AWS_SECRET_ACCESS_KEY: ci-secret-key
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate root S3 Compose override
+        run: >-
+          docker compose
+          -f docker-compose.yml
+          -f docker-compose.upload-s3.yml
+          config -q
+
+      - name: Validate infra S3 Compose override
+        run: >-
+          docker compose
+          -f infra/docker/docker-compose.yml
+          -f infra/docker/docker-compose.upload-s3.yml
+          config -q
+
+      - name: Verify API and worker receive identical object-store contract
+        run: |
+          for pair in \
+            "docker-compose.yml docker-compose.upload-s3.yml" \
+            "infra/docker/docker-compose.yml infra/docker/docker-compose.upload-s3.yml"; do
+            set -- $pair
+            docker compose -f "$1" -f "$2" config --format json > .ci-upload-compose.json
+            python - "$1" <<'PY'
+          import json
+          import sys
+
+          compose_file = sys.argv[1]
+          with open('.ci-upload-compose.json', encoding='utf-8') as handle:
+              config = json.load(handle)
+          api = config['services']['api'].get('environment', {})
+          worker = config['services']['worker'].get('environment', {})
+          keys = (
+              'RAGBOT_UPLOAD_STORE',
+              'RAGBOT_UPLOAD_S3_BUCKET',
+              'RAGBOT_UPLOAD_S3_PREFIX',
+              'RAGBOT_UPLOAD_S3_ENDPOINT_URL',
+              'RAGBOT_UPLOAD_S3_REGION',
+              'RAGBOT_UPLOAD_MATERIALIZE_DIR',
+              'RAGBOT_UPLOAD_MAX_OBJECT_BYTES',
+              'RAGBOT_UPLOAD_MULTIPART_THRESHOLD_BYTES',
+              'RAGBOT_UPLOAD_MULTIPART_CHUNK_BYTES',
+              'RAGBOT_UPLOAD_MAX_CONCURRENCY',
+          )
+          for key in keys:
+              assert api.get(key) == worker.get(key), f'{compose_file}: API/worker mismatch for {key}'
+          assert api['RAGBOT_UPLOAD_STORE'] == 's3'
+          assert api['RAGBOT_UPLOAD_S3_BUCKET'] == 'ragbot-ci-uploads'
+          assert api['RAGBOT_UPLOAD_S3_PREFIX'] == 'ragbot/ci/uploads'
+          assert api['RAGBOT_UPLOAD_MATERIALIZE_DIR'].startswith('/tmp/')
+          print(f'{compose_file}: S3 UploadStore contract OK')
+          PY
+          done
+          rm -f .ci-upload-compose.json
+
+      - name: Verify Helm can render object-store configuration without shared upload PVC
+        run: |
+          output="$(helm template ragbot infra/helm/ragbot \
+            --set worker.enabled=true \
+            --set postgres.dsn=postgresql://ragbot:ragbot@postgres/ragbot \
+            --set qdrant.url=http://qdrant:6333 \
+            --set uploadStorage.enabled=false \
+            --set env.RAGBOT_UPLOAD_STORE=s3 \
+            --set env.RAGBOT_UPLOAD_S3_BUCKET=ragbot-ci-uploads \
+            --set env.RAGBOT_UPLOAD_S3_PREFIX=ragbot/ci/uploads)"
+          echo "$output" | grep -A1 'name: RAGBOT_UPLOAD_STORE' | grep -q 'value: "s3"'
+          echo "$output" | grep -A1 'name: RAGBOT_UPLOAD_S3_BUCKET' | grep -q 'value: "ragbot-ci-uploads"'
+          if echo "$output" | grep -q 'name: upload-storage'; then
+            echo 'object-store deployment unexpectedly rendered shared upload PVC mount' >&2
+            exit 1
+          fi

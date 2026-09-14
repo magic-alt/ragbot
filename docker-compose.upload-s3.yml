@@ -1,0 +1,30 @@
+# Optional object-storage override:
+#   docker compose --env-file .env --env-file .env.upload-s3.example \
+#     -f docker-compose.yml -f docker-compose.upload-s3.yml up -d
+#
+# The base ingestion_uploads volume may remain mounted but is not authoritative
+# when RAGBOT_UPLOAD_STORE=s3/minio. Materialized parser copies are disposable.
+
+x-upload-s3-env: &upload-s3-env
+  RAGBOT_UPLOAD_STORE: ${RAGBOT_UPLOAD_STORE:-s3}
+  RAGBOT_UPLOAD_S3_BUCKET: ${RAGBOT_UPLOAD_S3_BUCKET:?RAGBOT_UPLOAD_S3_BUCKET is required}
+  RAGBOT_UPLOAD_S3_PREFIX: ${RAGBOT_UPLOAD_S3_PREFIX:-ragbot/uploads}
+  RAGBOT_UPLOAD_S3_ENDPOINT_URL: ${RAGBOT_UPLOAD_S3_ENDPOINT_URL:-}
+  RAGBOT_UPLOAD_S3_REGION: ${RAGBOT_UPLOAD_S3_REGION:-}
+  RAGBOT_UPLOAD_MATERIALIZE_DIR: ${RAGBOT_UPLOAD_MATERIALIZE_DIR:-/tmp/ragbot-upload-cache}
+  RAGBOT_UPLOAD_MAX_OBJECT_BYTES: ${RAGBOT_UPLOAD_MAX_OBJECT_BYTES:-104857600}
+  RAGBOT_UPLOAD_MULTIPART_THRESHOLD_BYTES: ${RAGBOT_UPLOAD_MULTIPART_THRESHOLD_BYTES:-8388608}
+  RAGBOT_UPLOAD_MULTIPART_CHUNK_BYTES: ${RAGBOT_UPLOAD_MULTIPART_CHUNK_BYTES:-8388608}
+  RAGBOT_UPLOAD_MAX_CONCURRENCY: ${RAGBOT_UPLOAD_MAX_CONCURRENCY:-4}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+  AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+  AWS_REGION: ${AWS_REGION:-${RAGBOT_UPLOAD_S3_REGION:-}}
+
+services:
+  api:
+    environment:
+      <<: *upload-s3-env
+  worker:
+    environment:
+      <<: *upload-s3-env
