@@ -265,12 +265,17 @@ class QdrantHybridAdapter:
         target = collection_name or self.collection_name
         qfilter = _build_qdrant_filter(filters, rest)
         prefetch = max(int(top_k), int(prefetch_limit or max(top_k, top_k * 4)))
+        # Put the eligibility filter on each prefetch branch. This guarantees
+        # the dense and sparse candidate budgets are spent only on tenant/ACL-
+        # eligible points before RRF fusion, rather than retrieving ineligible
+        # points and discarding them after they have consumed the prefetch top-k.
         response = self._delegate._client.query_points(
             collection_name=target,
             prefetch=[
                 rest.Prefetch(
                     query=list(dense_vector),
                     using=dense_name,
+                    filter=qfilter,
                     limit=prefetch,
                 ),
                 rest.Prefetch(
@@ -279,6 +284,7 @@ class QdrantHybridAdapter:
                         values=list(sparse_vector.values),
                     ),
                     using=sparse_name,
+                    filter=qfilter,
                     limit=prefetch,
                 ),
             ],
@@ -286,7 +292,6 @@ class QdrantHybridAdapter:
             limit=int(top_k),
             with_payload=True,
             with_vectors=False,
-            query_filter=qfilter,
         )
         return [
             (str(hit.id), float(hit.score), hit.payload or {})
