@@ -42,6 +42,16 @@ def ensure_database_performance(repo: Any) -> Any:
         },
     )
 
+    # Migration 010 made source/generation ownership first-class on documents,
+    # but the historical pg_repo adapter predates those columns. Keep the
+    # production path schema-aligned here until the compatibility façade can be
+    # narrowed further.
+    _replace(repo, "add_document", _PostgresPerformanceMixin.add_document)
+    _replace(
+        repo,
+        "delete_documents_by_source",
+        _PostgresPerformanceMixin.delete_documents_by_source,
+    )
     _replace(repo, "claim_next_job", _PostgresPerformanceMixin.claim_next_job)
     _replace(repo, "add_chunks", _PostgresPerformanceMixin.add_chunks)
     if callable(getattr(repo, "stage_knowledge_generation", None)):
@@ -67,6 +77,51 @@ def _replace(repo: Any, name: str, method: Any) -> None:
 
 
 class _PostgresPerformanceMixin:
+    def add_document(self, doc: Document) -> None:
+        sql = """
+            INSERT INTO documents (
+                doc_id, tenant_id, source_type, title, uri, version,
+                doc_updated_at, ingested_at, tags, acl_policy_id, status,
+                source_id, generation_id
+            ) VALUES (
+                %(doc_id)s, %(tenant_id)s, %(source_type)s, %(title)s, %(uri)s,
+                %(version)s, %(doc_updated_at)s, %(ingested_at)s,
+                %(tags)s, %(acl_policy_id)s, %(status)s,
+                %(source_id)s, %(generation_id)s
+            )
+            ON CONFLICT (doc_id) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
+                source_type = EXCLUDED.source_type,
+                title = EXCLUDED.title,
+                uri = EXCLUDED.uri,
+                version = EXCLUDED.version,
+                doc_updated_at = EXCLUDED.doc_updated_at,
+                ingested_at = EXCLUDED.ingested_at,
+                tags = EXCLUDED.tags,
+                acl_policy_id = EXCLUDED.acl_policy_id,
+                status = EXCLUDED.status,
+                source_id = EXCLUDED.source_id,
+                generation_id = EXCLUDED.generation_id
+        """
+        params = asdict(doc)
+        params["tags"] = list(params["tags"])
+        with self._pool.connection() as conn:
+            conn.execute(sql, params)
+
+    def delete_documents_by_source(self, source_id: str) -> list[str]:
+        pattern = f"source://{source_id}%"
+        local_fs_pattern = f"doc-{source_id}:%"
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                """
+                DELETE FROM documents
+                WHERE source_id = %s OR (source_id IS NULL AND (uri LIKE %s OR doc_id LIKE %s))
+                RETURNING doc_id
+                """,
+                (source_id, pattern, local_fs_pattern),
+            ).fetchall()
+        return [str(row["doc_id"]) for row in rows]
+
     def claim_next_job(
         self,
         worker_id: str,
