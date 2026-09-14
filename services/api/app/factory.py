@@ -14,9 +14,11 @@ from .agent.sql_disabled import DisabledSqlEngine
 from .llm.router import build_model_router
 from .retrieval.embedder import HashEmbedder, model_dimension
 from .retrieval.embedding_router import ActiveIndexEmbedder, build_embedding_router
-from .retrieval.index_lifecycle import IndexLifecycleService
 from .retrieval.qdrant import InMemoryQdrant
+from .retrieval.qdrant_hybrid import wrap_qdrant_hybrid
 from .retrieval.service import Retriever
+from .retrieval.sparse import build_sparse_encoder_from_env, sparse_contract_from_index
+from .retrieval.sparse_index_lifecycle import SparseIndexLifecycleService
 from .runtime import is_production, validate_production_environment
 from .runtime_registry import runtime_component_registry
 from .storage.generation_support import ensure_generation_repository
@@ -95,6 +97,9 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
             "dim": qdrant_dim,
         },
     )
+    sparse_encoder = build_sparse_encoder_from_env()
+    qdrant = wrap_qdrant_hybrid(qdrant, sparse_encoder)
+
     default_embedder = components.build(
         "embedding", profile.embedding_provider, {"dimension": qdrant_dim}
     )
@@ -103,8 +108,12 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
     embedder = default_embedder
 
     if qdrant_alias and supports_index_lifecycle(repo) and not isinstance(qdrant, InMemoryQdrant):
-        index_lifecycle = IndexLifecycleService(
-            repo, qdrant, embedding_router, alias_name=qdrant_alias
+        index_lifecycle = SparseIndexLifecycleService(
+            repo,
+            qdrant,
+            embedding_router,
+            alias_name=qdrant_alias,
+            sparse_encoder=sparse_encoder,
         )
         try:
             index_lifecycle.bootstrap_current(default_embedder)
@@ -129,6 +138,24 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
             vector_store=qdrant,
         )
 
+        # A sparse-active IndexVersion is a representation contract, not an
+        # optional query hint. Every API/worker replica must have the exact same
+        # encoder before it can safely serve reads or write new generation data.
+        active_index = repo.get_active_index_version(qdrant_alias)
+        active_sparse = sparse_contract_from_index(active_index)
+        if active_sparse:
+            expected_sparse = str(active_sparse.get("contract_id") or "").strip()
+            if sparse_encoder is None:
+                raise RuntimeError(
+                    "Active IndexVersion requires a sparse encoder but "
+                    "RAGBOT_SPARSE_ENABLED is false"
+                )
+            if expected_sparse != sparse_encoder.contract_id:
+                raise RuntimeError(
+                    "Active sparse embedding contract does not match runtime: "
+                    f"index={expected_sparse} runtime={sparse_encoder.contract_id}"
+                )
+
     if embedder.dimension != qdrant.dim:
         raise RuntimeError(
             "Active embedding contract does not match vector index: "
@@ -152,7 +179,13 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
             raise RuntimeError("Production services cannot use development fallbacks: " + ", ".join(unsafe))
 
     reranker = components.build("reranker", profile.reranker_provider)
-    retriever = Retriever(repo, qdrant, embedder=embedder, reranker=reranker)
+    retriever = Retriever(
+        repo,
+        qdrant,
+        embedder=embedder,
+        reranker=reranker,
+        sparse_encoder=sparse_encoder,
+    )
 
     sql_enabled = _env_flag("RAGBOT_SQL_TOOL_ENABLED", False)
     if sql_enabled:
@@ -182,6 +215,12 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
     logger.info("Resolved Ragbot runtime profile: %s", profile.as_public_dict())
     logger.info("Resolved model router: %s", llm.diagnostics())
     logger.info("Resolved embedding contracts: %s", embedding_router.public_metadata())
+    if sparse_encoder is not None:
+        logger.info(
+            "Resolved sparse contract: %s %s",
+            sparse_encoder.contract_id,
+            sparse_encoder.spec.as_public_dict(),
+        )
     services = AgentServices(
         repo=repo,
         qdrant=qdrant,
@@ -193,5 +232,6 @@ def build_services_from_env(repo: Optional[Any] = None) -> AgentServices:
         reranker=reranker,
     )
     setattr(services, "embedding_router", embedding_router)
+    setattr(services, "sparse_encoder", sparse_encoder)
     setattr(services, "index_lifecycle", index_lifecycle)
     return services
