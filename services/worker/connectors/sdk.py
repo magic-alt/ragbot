@@ -109,26 +109,34 @@ class PreparedConnectorRun:
     chunks: Iterable[Chunk]
     source_id: str
     tenant_id: str
+    repo: Repo
     checkpoint: Optional[ConnectorCheckpoint] = None
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    _consumed: bool = field(default=False, init=False, repr=False)
 
     def __iter__(self) -> Iterator[Chunk]:
-        return iter(self.chunks)
-
-    def commit_checkpoint(self, repo: Repo) -> bool:
-        if self.checkpoint is None:
-            return False
-        setter = getattr(repo, "set_connector_checkpoint", None)
-        if not callable(setter):
-            raise RuntimeError(
-                "Connector produced a checkpoint but repository does not implement connector checkpoint state"
-            )
-        setter(
-            self.source_id,
-            self.tenant_id,
-            self.checkpoint.as_dict(),
-        )
-        return True
+        if self._consumed:
+            raise RuntimeError("PreparedConnectorRun change stream can only be consumed once")
+        self._consumed = True
+        completed = False
+        try:
+            for chunk in self.chunks:
+                yield chunk
+            completed = True
+        finally:
+            # A partial/failed enumeration must never advance even the candidate
+            # checkpoint: the provider stream may not have exposed every delete.
+            if completed and self.checkpoint is not None:
+                stage = getattr(self.repo, "stage_connector_checkpoint", None)
+                if not callable(stage):
+                    raise RuntimeError(
+                        "Connector produced a checkpoint but repository does not implement staged checkpoint state"
+                    )
+                stage(
+                    self.source_id,
+                    self.tenant_id,
+                    self.checkpoint.as_dict(),
+                )
 
 
 def make_sdk_runner(
@@ -173,6 +181,7 @@ def make_sdk_runner(
             chunks=chunks,
             source_id=source.source_id,
             tenant_id=source.tenant_id,
+            repo=repo,
             checkpoint=sync.checkpoint,
             diagnostics=dict(sync.diagnostics or {}),
         )
@@ -189,13 +198,7 @@ def apply_changes_to_previous_chunks(
     transform_record: RecordTransformer,
     full_resync: bool,
 ) -> Iterable[Chunk]:
-    """Adapt SDK deltas into the pipeline's complete candidate snapshot.
-
-    The generation publisher still consumes one complete candidate snapshot.
-    Until the ingestion core itself becomes streaming/delta-native, this adapter
-    preserves unchanged external records and replaces/deletes only IDs named by
-    the connector. Provider enumeration remains lazy and checkpoint-safe.
-    """
+    """Adapt SDK deltas into the pipeline's complete candidate snapshot."""
 
     grouped: dict[str, list[Chunk]] = {}
     if not full_resync:
