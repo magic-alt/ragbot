@@ -169,28 +169,50 @@ def _runtime_contracts(services: Any, request: Any) -> dict[str, Optional[str]]:
     plan = getattr(getattr(request, "plan", None), "value", None) or str(
         getattr(request, "plan", "") or ""
     )
+    index_id = None
+    representations: dict[str, Any] = {}
+    repo = getattr(services, "repo", None)
+    qdrant = getattr(services, "qdrant", None)
+    alias = getattr(qdrant, "alias_name", None)
+    selected_index = str(getattr(request, "index_version_id", "") or "").strip() or None
+    version = None
+    if selected_index:
+        get_version = getattr(repo, "get_index_version", None)
+        if callable(get_version):
+            try:
+                version = get_version(selected_index)
+            except Exception:
+                version = None
+    elif alias:
+        getter = getattr(repo, "get_active_index_version", None)
+        if callable(getter):
+            try:
+                version = getter(alias)
+            except Exception:
+                version = None
+    if version is not None:
+        index_id = str(getattr(version, "index_version_id", "") or "") or None
+        embedding_id = (
+            str(getattr(version, "embedding_contract_id", "") or "") or embedding_id
+        )
+        if embedding_id:
+            representations["dense"] = embedding_id
+        vector_schema = dict(getattr(version, "vector_schema", None) or {})
+        sparse = vector_schema.get("sparse")
+        if isinstance(sparse, dict) and sparse.get("contract_id"):
+            representations["sparse"] = str(sparse["contract_id"])
+    elif embedding_id:
+        representations["dense"] = embedding_id
+
     retrieval_id = retrieval_contract_id(
         plan=plan,
         top_k=int(getattr(request, "top_k", 20)),
         candidate_pool=getattr(request, "candidate_pool", None),
         rerank=bool(getattr(request, "rerank", True)),
         diversity=bool(getattr(request, "diversity", False)),
+        representation_contracts=representations,
+        index_version_id=selected_index,
     )
-    index_id = None
-    repo = getattr(services, "repo", None)
-    qdrant = getattr(services, "qdrant", None)
-    alias = getattr(qdrant, "alias_name", None)
-    getter = getattr(repo, "get_active_index_version", None)
-    if alias and callable(getter):
-        try:
-            active = getter(alias)
-        except Exception:
-            active = None
-        if active is not None:
-            index_id = str(getattr(active, "index_version_id", "") or "") or None
-            embedding_id = (
-                str(getattr(active, "embedding_contract_id", "") or "") or embedding_id
-            )
     return {
         "retrieval_contract_id": retrieval_id,
         "embedding_contract_id": embedding_id,
@@ -215,7 +237,7 @@ def _retrieved_summary(chunk: Any, *, sampled: bool) -> dict[str, Any]:
         if sampled:
             summary["candidate_trace"] = {
                 key: trace.get(key)
-                for key in ("dense", "vector", "lexical")
+                for key in ("dense", "vector", "lexical", "qdrant_dense_sparse")
                 if trace.get(key) is not None
             }
     return summary

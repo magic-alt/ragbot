@@ -11,6 +11,7 @@ from ..auth.principal import require_admin
 
 class CreateIndexRequest(BaseModel):
     embedding_contract_id: str = Field(min_length=1)
+    sparse_contract_id: Optional[str] = Field(default=None, min_length=1)
     index_version_id: Optional[str] = None
     physical_collection: Optional[str] = None
 
@@ -62,7 +63,12 @@ def create_indexes_router(
         _key: Optional[str] = Depends(verify_api_key),
     ) -> dict[str, Any]:
         service = lifecycle(_key)
-        return {"items": service.embedding_router.public_metadata()}
+        sparse_metadata = getattr(service, "sparse_contract_metadata", None)
+        return {
+            # `items` is preserved for callers built before sparse contracts.
+            "items": service.embedding_router.public_metadata(),
+            "sparse_items": sparse_metadata() if callable(sparse_metadata) else [],
+        }
 
     @router.post("")
     def create_index(
@@ -71,10 +77,15 @@ def create_indexes_router(
     ) -> dict[str, Any]:
         service = lifecycle(_key)
         try:
+            kwargs = {
+                "index_version_id": payload.index_version_id,
+                "physical_collection": payload.physical_collection,
+            }
+            if payload.sparse_contract_id is not None:
+                kwargs["sparse_contract_id"] = payload.sparse_contract_id
             version = service.create_candidate(
                 payload.embedding_contract_id,
-                index_version_id=payload.index_version_id,
-                physical_collection=payload.physical_collection,
+                **kwargs,
             )
             return asdict(version)
         except (KeyError, ValueError, RuntimeError, TypeError) as exc:

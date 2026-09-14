@@ -8,7 +8,6 @@ from contracts.types import RetrievalChunk
 
 from ..storage.models import Chunk
 from ..storage.protocol import Repo
-from .async_engine import AsyncRetrievalEngine
 from .contracts import (
     RetrievalPlan,
     RetrievalRequest,
@@ -17,6 +16,8 @@ from .contracts import (
 )
 from .embedder import Embedder, HashEmbedder
 from .lexical import contains_cjk
+from .sparse import SparseEncoder
+from .sparse_engine import SparseAwareRetrievalEngine
 
 
 def build_citation(chunk: Chunk) -> str:
@@ -47,22 +48,25 @@ class Retriever:
         embedder: Optional[Embedder] = None,
         reranker: Any = None,
         *,
+        sparse_encoder: Optional[SparseEncoder] = None,
         blocking_workers: int = 8,
     ) -> None:
         self._repo = repo
         self._qdrant = qdrant
         self._embedder = embedder or HashEmbedder(dim=qdrant.dim)
         self._reranker = reranker
+        self._sparse_encoder = sparse_encoder
         self._executor = ThreadPoolExecutor(
             max_workers=max(2, int(blocking_workers)),
             thread_name_prefix="ragbot-retrieval",
         )
-        self._engine = AsyncRetrievalEngine(
+        self._engine = SparseAwareRetrievalEngine(
             repo,
             qdrant,
             self._embedder,
             reranker,
             self._executor,
+            sparse_encoder=sparse_encoder,
         )
 
     def diagnostics(
@@ -89,11 +93,20 @@ class Retriever:
                     "the invalid hash-vector branch is disabled for this query. Cross-lingual "
                     "retrieval requires a multilingual semantic embedding model."
                 )
+        sparse = None
+        if self._sparse_encoder is not None:
+            sparse = {
+                "backend": type(self._sparse_encoder).__name__,
+                "model": self._sparse_encoder.model_name,
+                "contract_id": self._sparse_encoder.contract_id,
+                "spec": self._sparse_encoder.spec.as_public_dict(),
+            }
         result: Dict[str, Any] = {
             "embedding_backend": type(self._embedder).__name__,
             "embedding_model": self._embedder.model_name,
             "embedding_dimension": self._embedder.dimension,
             "semantic_embedding": semantic,
+            "sparse_embedding": sparse,
             "vector_store": type(self._qdrant).__name__,
             "repository": type(self._repo).__name__,
             "reranker": type(self._reranker).__name__ if self._reranker is not None else None,
@@ -142,6 +155,7 @@ class Retriever:
         rerank: bool = True,
         deadline_ms: Optional[int] = None,
         diversity: bool = False,
+        index_version_id: Optional[str] = None,
     ) -> List[RetrievalChunk]:
         request = RetrievalRequest(
             query=query,
@@ -152,6 +166,7 @@ class Retriever:
             rerank=rerank,
             deadline_ms=deadline_ms,
             diversity=diversity,
+            index_version_id=index_version_id,
         )
         return (await self.query(request)).chunks
 
@@ -167,6 +182,7 @@ class Retriever:
         rerank: bool = True,
         deadline_ms: Optional[int] = None,
         diversity: bool = False,
+        index_version_id: Optional[str] = None,
     ) -> List[RetrievalChunk]:
         try:
             asyncio.get_running_loop()
@@ -182,6 +198,7 @@ class Retriever:
                     rerank=rerank,
                     deadline_ms=deadline_ms,
                     diversity=diversity,
+                    index_version_id=index_version_id,
                 )
             )
         raise RuntimeError(
