@@ -5,7 +5,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from services.worker.connectors.registry import connector_registry
@@ -28,6 +28,7 @@ from ..auth.principal import (
     require_capability,
 )
 from ..storage.models import Source
+from ..storage.query_support import ensure_query_repository
 
 
 SOURCE_TYPE_VALUES = connector_registry().source_types()
@@ -112,19 +113,32 @@ def create_sources_router(get_services: Callable, auth_dep: Any) -> APIRouter:
     @router.get("")
     async def list_sources(
         tenant_id: Optional[str] = None,
+        limit: int = Query(default=100, ge=1, le=500),
+        cursor: Optional[str] = Query(default=None),
         _key: Optional[str] = Depends(auth_dep),
     ):
         require_capability(_key, CAP_CATALOG_READ)
         services = get_services()
+        repo = ensure_query_repository(services.repo)
         if tenant_id:
             authorize_tenant(_key, tenant_id)
-            sources = services.repo.list_sources(tenant_id=tenant_id)
+            tenant_scope = {tenant_id}
         else:
-            tenant_scope = allowed_tenants(_key)
-            sources = services.repo.list_sources()
-            if tenant_scope is not None:
-                sources = [source for source in sources if source.tenant_id in tenant_scope]
-        return {"sources": [asdict(source) for source in sources if source.status != "deleted"]}
+            allowed = allowed_tenants(_key)
+            tenant_scope = set(allowed) if allowed is not None else None
+        try:
+            page = repo.page_sources(
+                tenant_ids=tenant_scope,
+                cursor=cursor,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "total": page.total,
+            "next_cursor": page.next_cursor,
+            "sources": [asdict(source) for source in page.items],
+        }
 
     @router.get("/{source_id}")
     async def get_source(source_id: str, _key: Optional[str] = Depends(auth_dep)):
