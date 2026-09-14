@@ -14,7 +14,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from services.worker.source_fence import job_stats_for_source
@@ -28,6 +28,7 @@ from ..auth.principal import (
     require_capability,
 )
 from ..storage.models import IngestionJob
+from ..storage.query_support import ensure_query_repository
 
 
 class TriggerJobRequest(BaseModel):
@@ -56,6 +57,10 @@ def assert_source_ingestible(source) -> None:
 
 def latest_active_ingestion_job(repo, *, tenant_id: str, source_id: str) -> Optional[IngestionJob]:
     """Return the newest pending/running job for a source, if one exists."""
+    bounded = ensure_query_repository(repo)
+    optimized = getattr(bounded, "latest_active_job", None)
+    if callable(optimized):
+        return optimized(tenant_id, source_id)
     active = [
         job
         for job in repo.list_jobs(tenant_id=tenant_id, source_id=source_id)
@@ -137,17 +142,35 @@ def create_ingest_router(get_services: Callable, auth_dep: Any) -> APIRouter:
     async def list_jobs(
         tenant_id: Optional[str] = None,
         source_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = Query(default=100, ge=1, le=500),
+        cursor: Optional[str] = Query(default=None),
         _key: Optional[str] = Depends(auth_dep),
     ):
         require_capability(_key, CAP_CATALOG_READ)
         services = get_services()
+        repo = ensure_query_repository(services.repo)
         if tenant_id:
             authorize_tenant(_key, tenant_id)
-        jobs = services.repo.list_jobs(tenant_id=tenant_id, source_id=source_id)
-        tenant_scope = allowed_tenants(_key)
-        if tenant_scope is not None:
-            jobs = [job for job in jobs if job.tenant_id in tenant_scope]
-        return {"jobs": [asdict(job) for job in jobs]}
+            tenant_scope = {tenant_id}
+        else:
+            allowed = allowed_tenants(_key)
+            tenant_scope = set(allowed) if allowed is not None else None
+        try:
+            page = repo.page_jobs(
+                tenant_ids=tenant_scope,
+                source_id=source_id,
+                status=status,
+                cursor=cursor,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "total": page.total,
+            "next_cursor": page.next_cursor,
+            "jobs": [asdict(job) for job in page.items],
+        }
 
     @router.get("/jobs/{job_id}")
     async def get_job(job_id: str, _key: Optional[str] = Depends(auth_dep)):
