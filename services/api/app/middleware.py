@@ -54,6 +54,8 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         )
 
         response.headers["X-Request-ID"] = request_id
+        if request.url.path.startswith("/v1"):
+            response.headers["X-Ragbot-API-Version"] = "v1"
         return response
 
 
