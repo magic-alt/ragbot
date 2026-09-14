@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, runtime_checkable
 
 from contracts.types import SqlResult
@@ -9,6 +11,7 @@ from ..llm.provider import ModelProvider
 from ..llm.router import build_model_router, model_task_scope
 from ..observability.metrics import build_request_metrics, get_metrics_collector
 from ..observability.tracing import RequestTracer
+from ..quality.recorder import QualityRecorder
 from ..retrieval.cross_encoder import NoOpReranker, Reranker
 from ..retrieval.embedder import Embedder, HashEmbedder
 from ..retrieval.qdrant import InMemoryQdrant
@@ -34,6 +37,8 @@ from .state import (
     ROUTE_WEB,
     build_initial_state,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -102,6 +107,8 @@ async def run_agent(
 ) -> AgentState:
     """Run the agent graph and always terminate the event stream."""
     cb = callback or NullCallback()
+    original_query = query
+    started_at = datetime.now(timezone.utc).isoformat()
     state = build_initial_state(
         query=query,
         tenant_id=tenant_id,
@@ -115,6 +122,8 @@ async def run_agent(
         generation_max_tokens=generation_max_tokens,
     )
     tracer = RequestTracer(request_id=state.request_id)
+    trace_record = None
+    recorder = QualityRecorder(services.repo)
 
     try:
         if initial_evidence:
@@ -186,6 +195,15 @@ async def run_agent(
         trace_record = tracer.finish()
         metrics = build_request_metrics(state, trace_record)
         get_metrics_collector().record(metrics)
+        _record_agent_quality_safe(
+            recorder,
+            services=services,
+            state=state,
+            original_query=original_query,
+            trace_record=trace_record,
+            status="completed",
+            started_at=started_at,
+        )
 
         if state.final:
             cb.emit(AgentEvent("final", {
@@ -196,7 +214,19 @@ async def run_agent(
                 "followups": list(state.final.followups),
             }))
         return state
-    except Exception:
+    except Exception as exc:
+        if trace_record is None:
+            trace_record = tracer.finish()
+        _record_agent_quality_safe(
+            recorder,
+            services=services,
+            state=state,
+            original_query=original_query,
+            trace_record=trace_record,
+            status="failed",
+            started_at=started_at,
+            error=exc,
+        )
         cb.emit(AgentEvent("error", {
             "request_id": state.request_id,
             "error": "Agent execution failed",
@@ -204,6 +234,13 @@ async def run_agent(
         raise
     finally:
         cb.close()
+
+
+def _record_agent_quality_safe(recorder: QualityRecorder, **kwargs: Any) -> None:
+    try:
+        recorder.record_agent(**kwargs)
+    except Exception:
+        logger.exception("Failed to persist durable agent quality record")
 
 
 def _initial_action(state: AgentState) -> str:
