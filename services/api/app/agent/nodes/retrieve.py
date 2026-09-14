@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from ...quality.contracts import reranker_contract_id, retrieval_contract_id
 from ..state import AgentState, Citation, EvidenceItem, ToolCallRecord, now_ms
 from ..reliability import safe_tool_call
 
@@ -38,7 +39,10 @@ async def retrieve_node(state: AgentState, services: Any) -> AgentState:
             ok=True,
             started_at_ms=start_ms,
             ended_at_ms=now_ms(),
-            result_preview={"count": len(chunks)},
+            result_preview={
+                "count": len(chunks),
+                "quality": _quality_summary(services, chunks),
+            },
         )
     except Exception as exc:
         record = ToolCallRecord(
@@ -51,6 +55,58 @@ async def retrieve_node(state: AgentState, services: Any) -> AgentState:
         )
     state.tool_calls.append(record)
     return state
+
+
+def _quality_summary(services: Any, chunks: List[Any]) -> Dict[str, Any]:
+    context: Dict[str, Any] = {}
+    retrieved = []
+    for chunk in chunks:
+        metadata = dict(getattr(chunk, "metadata", None) or {})
+        trace = metadata.get("_retrieval") if isinstance(metadata, dict) else None
+        if isinstance(trace, dict) and not context:
+            raw_context = trace.get("context")
+            if isinstance(raw_context, dict):
+                context = dict(raw_context)
+        retrieved.append(
+            {
+                "chunk_id": getattr(chunk, "chunk_id", None),
+                "doc_id": getattr(chunk, "doc_id", None),
+                "score": float(getattr(chunk, "score", 0.0) or 0.0),
+                "final_rank": trace.get("final_rank") if isinstance(trace, dict) else None,
+            }
+        )
+
+    embedder = getattr(services, "embedder", None)
+    embedding_id = str(getattr(embedder, "contract_id", "") or "") or None
+    repo = getattr(services, "repo", None)
+    qdrant = getattr(services, "qdrant", None)
+    index_id = None
+    alias = getattr(qdrant, "alias_name", None)
+    getter = getattr(repo, "get_active_index_version", None)
+    if alias and callable(getter):
+        try:
+            active = getter(alias)
+        except Exception:
+            active = None
+        if active is not None:
+            index_id = str(getattr(active, "index_version_id", "") or "") or None
+            embedding_id = str(getattr(active, "embedding_contract_id", "") or "") or embedding_id
+
+    return {
+        "retrieval_plan": "hybrid_rrf",
+        "retrieval_contract_id": retrieval_contract_id(
+            plan="hybrid_rrf",
+            top_k=30,
+            candidate_pool=None,
+            rerank=True,
+            diversity=False,
+        ),
+        "embedding_contract_id": embedding_id,
+        "index_version_id": index_id,
+        "reranker_contract_id": reranker_contract_id(getattr(services, "reranker", None)),
+        "retrieved": retrieved,
+        "context": context,
+    }
 
 
 def _build_filters(state: AgentState) -> Dict[str, Any]:
