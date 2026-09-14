@@ -50,6 +50,10 @@ class RetrievalRequest:
     rerank: bool = True
     deadline_ms: Optional[int] = None
     diversity: bool = False
+    # Internal evaluation selector. The public /v1/search contract does not
+    # expose this field; it exists so a validating IndexVersion can be measured
+    # before its Qdrant alias is activated.
+    index_version_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not str(self.query).strip():
@@ -60,6 +64,8 @@ class RetrievalRequest:
             raise ValueError("RetrievalRequest.candidate_pool must be > 0 when set")
         if self.deadline_ms is not None and int(self.deadline_ms) <= 0:
             raise ValueError("RetrievalRequest.deadline_ms must be > 0 when set")
+        if self.index_version_id is not None and not str(self.index_version_id).strip():
+            raise ValueError("RetrievalRequest.index_version_id must not be empty when set")
 
 
 @dataclass
@@ -82,6 +88,8 @@ class RetrievalTrace:
     candidate_counts: Dict[str, int] = field(default_factory=dict)
     fusion_method: Optional[str] = None
     fusion_policy: Dict[str, Any] = field(default_factory=dict)
+    representation_contracts: Dict[str, Any] = field(default_factory=dict)
+    index_version_id: Optional[str] = None
     reranker_configured: bool = False
     reranker_requested: bool = False
     reranker_enabled: bool = False
@@ -112,6 +120,8 @@ class RetrievalTrace:
             "candidate_counts": dict(self.candidate_counts),
             "fusion_method": self.fusion_method,
             "fusion_policy": dict(self.fusion_policy),
+            "representation_contracts": dict(self.representation_contracts),
+            "index_version_id": self.index_version_id,
             "reranker_configured": self.reranker_configured,
             "reranker_requested": self.reranker_requested,
             "reranker_enabled": self.reranker_enabled,
