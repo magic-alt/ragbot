@@ -9,6 +9,7 @@ on:
       - "services/api/app/routes/indexes.py"
       - "benchmarks/retrieval_plan_promotion.py"
       - "tests/test_dense_sparse_phase2.py"
+      - "tests/test_fastembed_sparse_smoke.py"
       - "tests/test_qdrant_dense_sparse_integration.py"
       - "pyproject.toml"
       - ".github/workflows/dense-sparse.yml"
@@ -19,6 +20,7 @@ on:
       - "services/api/app/quality/**"
       - "services/api/app/factory.py"
       - "benchmarks/retrieval_plan_promotion.py"
+      - "tests/test_fastembed_sparse_smoke.py"
       - "pyproject.toml"
 
 permissions:
@@ -63,5 +65,7 @@ jobs:
           PY
       - name: Run dense/sparse unit contracts
         run: python -m pytest -q tests/test_dense_sparse_phase2.py
+      - name: Run real FastEmbed BM25 sparse encoder smoke
+        run: python -m pytest -q tests/test_fastembed_sparse_smoke.py
       - name: Run real Qdrant named-vector Prefetch/RRF integration
         run: python -m pytest -q tests/test_qdrant_dense_sparse_integration.py
