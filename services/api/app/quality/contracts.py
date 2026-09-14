@@ -33,6 +33,8 @@ def retrieval_contract_id(
     candidate_pool: Optional[int],
     rerank: bool,
     diversity: bool,
+    representation_contracts: Optional[Mapping[str, Any]] = None,
+    index_version_id: Optional[str] = None,
 ) -> str:
     return stable_contract_id(
         "retrieval",
@@ -42,6 +44,11 @@ def retrieval_contract_id(
             "candidate_pool": int(candidate_pool) if candidate_pool is not None else None,
             "rerank": bool(rerank),
             "diversity": bool(diversity),
+            "representation_contracts": dict(representation_contracts or {}),
+            # The physical experiment target is part of a retrieval contract
+            # only when the caller explicitly pins one. Normal online traffic
+            # remains stable across repeated runs of the same active alias.
+            "index_version_id": str(index_version_id) if index_version_id else None,
         },
     )
 
