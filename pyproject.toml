@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.1", "psycopg_pool>=3.1"]
 qdrant = ["qdrant-client>=1.7"]
+sparse = ["fastembed>=0.7"]
 worker = ["PyPDF2>=3.0", "beautifulsoup4>=4.12", "gitpython>=3.1"]
 s3 = ["boto3>=1.34"]
 saas = ["google-auth>=2.35"]
