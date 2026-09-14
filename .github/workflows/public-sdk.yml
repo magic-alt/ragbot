@@ -5,14 +5,23 @@ on:
     paths:
       - "packages/node-client/**"
       - "packages/python-client/**"
+      - "services/api/app/api.py"
+      - "services/api/app/middleware.py"
       - "services/api/app/public_contract.py"
+      - "contracts/public_api_v1_contract.json"
+      - "scripts/check_public_api_contract.py"
+      - "tests/test_public_api_v1.py"
       - ".github/workflows/public-sdk.yml"
   push:
     branches: [main]
     paths:
       - "packages/node-client/**"
       - "packages/python-client/**"
+      - "services/api/app/api.py"
+      - "services/api/app/middleware.py"
       - "services/api/app/public_contract.py"
+      - "contracts/public_api_v1_contract.json"
+      - "scripts/check_public_api_contract.py"
 
 permissions:
   contents: read
@@ -58,3 +67,22 @@ jobs:
       - name: Dry-run npm package
         working-directory: packages/node-client
         run: npm run pack:dry-run
+
+  api-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install API contract dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,postgres,qdrant,worker,s3,saas]"
+      - name: Run v1 API behavior tests
+        run: python -m pytest -q tests/test_public_api_v1.py
+      - name: Check frozen OpenAPI compatibility manifest
+        run: python scripts/check_public_api_contract.py
