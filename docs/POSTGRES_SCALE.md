@@ -78,10 +78,11 @@ Default PR gate:
 
 ```bash
 python -m benchmarks.postgres_hotpaths \
-  --chunks 3000 \
-  --plan-jobs 3000 \
-  --claim-jobs 64 \
-  --workers 1,8
+  --chunks 10000 \
+  --plan-jobs 10000 \
+  --claim-jobs 128 \
+  --workers 1,8,32 \
+  --min-copy-speedup 1.25
 ```
 
 The gate records:
@@ -94,14 +95,16 @@ The gate records:
 
 The plan assertions disable sequential scans only for the EXPLAIN session. If a query has no usable index, PostgreSQL still emits a `Seq Scan` with prohibitive cost and the gate fails. This removes small-CI-dataset planner variance without hiding a missing index.
 
+The COPY speedup floor is deliberately conservative. The first hosted-runner baseline measured ~2.01x at 3,000 rows; CI enforces only 1.25x so ordinary runner variance does not convert a useful regression gate into a flaky microbenchmark.
+
 ### Full promotion matrix
 
 Before changing bulk-write, queue or pagination architecture, run the manual workflow at:
 
 | Scale | Chunks per legacy/COPY run | Worker matrix | Purpose |
 | --- | ---: | --- | --- |
-| CI | 3,000 | 1,8 | Fast regression signal |
-| Medium | 10,000 / 100,000 | 1,8,32 | Throughput/claim-contention trend |
+| CI | 10,000 | 1,8,32 | Regression + contention signal |
+| Medium | 100,000 | 1,8,32 | Sustained throughput trend |
 | Promotion | 1,000,000 | 1,8,32 | Bulk-ingest production evidence |
 
 Manual workflow inputs for the full gate:
