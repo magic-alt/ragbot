@@ -1,0 +1,67 @@
+name: Dense Sparse Retrieval Gate
+
+on:
+  pull_request:
+    paths:
+      - "services/api/app/retrieval/**"
+      - "services/api/app/quality/**"
+      - "services/api/app/factory.py"
+      - "services/api/app/routes/indexes.py"
+      - "benchmarks/retrieval_plan_promotion.py"
+      - "tests/test_dense_sparse_phase2.py"
+      - "tests/test_qdrant_dense_sparse_integration.py"
+      - "pyproject.toml"
+      - ".github/workflows/dense-sparse.yml"
+  push:
+    branches: [main]
+    paths:
+      - "services/api/app/retrieval/**"
+      - "services/api/app/quality/**"
+      - "services/api/app/factory.py"
+      - "benchmarks/retrieval_plan_promotion.py"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  dense-sparse-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.19.0
+        ports:
+          - 6333:6333
+    env:
+      QDRANT_TEST_URL: http://127.0.0.1:6333
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dense/sparse test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,qdrant,sparse]"
+      - name: Wait for Qdrant
+        run: |
+          python - <<'PY'
+          import time
+          import urllib.request
+          for attempt in range(60):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:6333/readyz", timeout=2) as response:
+                      if response.status == 200:
+                          raise SystemExit(0)
+              except Exception:
+                  time.sleep(1)
+          raise SystemExit("Qdrant did not become ready")
+          PY
+      - name: Run dense/sparse unit contracts
+        run: python -m pytest -q tests/test_dense_sparse_phase2.py
+      - name: Run real Qdrant named-vector Prefetch/RRF integration
+        run: python -m pytest -q tests/test_qdrant_dense_sparse_integration.py
