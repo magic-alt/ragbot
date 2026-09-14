@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, TypedDict
+
+try:  # Python 3.11+
+    from typing import NotRequired
+except ImportError:  # pragma: no cover - exercised on Python 3.10 CI
+    from typing_extensions import NotRequired
 
 
 RetrievalPlan = Literal["dense", "lexical", "hybrid_rrf", "qdrant_dense_sparse"]
