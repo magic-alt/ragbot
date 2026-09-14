@@ -52,17 +52,19 @@ def validate_remote_url(
 
 
 def validate_local_source_path(path: str) -> str:
-    """Validate local sources without conflating user paths and managed uploads.
+    """Validate user-local paths or materialize trusted Ragbot upload objects.
 
-    ``ragbot-data:///`` and legacy ``/data`` references remain constrained by
-    ``RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS``. ``ragbot-upload:///`` objects are
-    trusted server-managed references and are resolved exclusively through the
-    Ragbot-owned UploadStore port; expanding the generic local allowlist is not
-    required and would weaken the boundary between user paths and managed data.
+    For ``ragbot-upload:///`` references the UploadStore, not the Source config,
+    owns storage credentials and durable location. Object-store adapters may
+    download a bounded verified parser copy on the current API/worker node.
     """
     requested = str(path)
     if is_upload_uri(requested):
-        return str(build_upload_store_from_env().local_path(requested))
+        store = build_upload_store_from_env()
+        materialize = getattr(store, "materialize_path", None)
+        if callable(materialize):
+            return str(materialize(requested))
+        return str(store.local_path(requested))
 
     resolved = Path(resolve_local_source_reference(requested))
     roots_raw = os.getenv("RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS", "")
