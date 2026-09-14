@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from services.api.app.storage.models import IngestionJob, Source
+from services.api.app.storage.query_support import ensure_query_repository
 from services.worker.source_fence import job_stats_for_source
 
 MIN_SYNC_INTERVAL_SECONDS = 60
@@ -125,6 +126,10 @@ def _due_sources(repo, now: datetime, limit: int) -> list[Source]:
 
 
 def _latest_active_job(repo, source: Source):
+    bounded = ensure_query_repository(repo)
+    lookup = getattr(bounded, "latest_active_job", None)
+    if callable(lookup):
+        return lookup(source.tenant_id, source.source_id)
     active = [
         job for job in repo.list_jobs(tenant_id=source.tenant_id, source_id=source.source_id)
         if job.status in {"pending", "running"}
