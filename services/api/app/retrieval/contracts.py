@@ -92,10 +92,22 @@ class RetrievalTrace:
     error_stage: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
+        legacy_mode = {
+            RetrievalPlan.DENSE.value: "vector",
+            RetrievalPlan.LEXICAL.value: "lexical",
+            RetrievalPlan.HYBRID_RRF.value: "hybrid",
+            RetrievalPlan.QDRANT_DENSE_SPARSE.value: "qdrant_dense_sparse",
+        }.get(self.plan, self.plan)
+        dense_count = int(self.candidate_counts.get("dense", 0))
+        lexical_count = int(self.candidate_counts.get("lexical", 0))
         return {
             "retrieval_plan": self.plan,
+            "retrieval_mode": legacy_mode,
             "deadline_ms": self.deadline_ms,
             "candidate_pool": self.candidate_pool,
+            "parallel_fanout": self.plan == RetrievalPlan.HYBRID_RRF.value,
+            "vector_candidates": dense_count,
+            "lexical_candidates": lexical_count,
             "stage_ms": {key: round(float(value), 3) for key, value in self.stage_ms.items()},
             "candidate_counts": dict(self.candidate_counts),
             "fusion_method": self.fusion_method,
