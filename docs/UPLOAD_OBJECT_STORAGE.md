@@ -150,6 +150,10 @@ For a horizontally scaled deployment verify:
 6. deleting one logical object leaves the other ingestible;
 7. orphan/retention cleanup follows PostgreSQL reference-count state.
 
+`UploadStore Deployment Gate` parses both Compose override stacks and a Helm object-store render, checking that API and worker receive the same non-secret storage contract and that Helm does not render the shared upload PVC when object storage is selected.
+
+Phase-1 integration is intentionally validated on the common mainline that already contains the checkpoint-safe Connector SDK (#54) and asynchronous retrieval plane (#57). Upload storage remains orthogonal to both: connector checkpoints own provider enumeration progress, IndexVersion/generation semantics own knowledge visibility, and UploadedObject metadata owns file reference counts.
+
 ## Phase-2 boundary
 
 The S3/MinIO adapter establishes the horizontally-scaled port. Remaining Issue #59 work can include:
