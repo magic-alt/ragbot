@@ -1,5 +1,5 @@
-export * from "./client";
-export * from "./tools";
+export * from "./client.js";
+export * from "./tools.js";
 
 // Re-export contract types for convenience
 export type {
@@ -18,4 +18,4 @@ export type {
   RouteType,
   Confidence,
   ToolName,
-} from "./types";
+} from "./types.js";
