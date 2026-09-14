@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable, Mapping, Optional
@@ -71,19 +72,60 @@ def _build_memory_repo(_config: Mapping[str, Any]):
     return InMemoryRepo()
 
 
+def _positive_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    value = int(raw) if raw is not None and raw.strip() else int(default)
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return value
+
+
 def _build_postgres_repo(config: Mapping[str, Any]):
+    from psycopg.conninfo import make_conninfo
+
     from services.api.app.storage.managed_pg_repo import ManagedPostgresRepo
+
     dsn = str(config.get("dsn") or "").strip()
     if not dsn:
         raise ValueError("repository:postgres requires dsn")
-    repo = ManagedPostgresRepo(dsn=dsn)
+
+    pool_min = _positive_env_int("RAGBOT_PG_POOL_MIN", 2)
+    pool_max = _positive_env_int("RAGBOT_PG_POOL_MAX", 10)
+    if pool_max < pool_min:
+        raise ValueError("RAGBOT_PG_POOL_MAX must be >= RAGBOT_PG_POOL_MIN")
+    connect_timeout = _positive_env_int("RAGBOT_PG_CONNECT_TIMEOUT_SECONDS", 5)
+    statement_timeout = _positive_env_int("RAGBOT_PG_STATEMENT_TIMEOUT_MS", 30000)
+    lock_timeout = _positive_env_int("RAGBOT_PG_LOCK_TIMEOUT_MS", 5000)
+    idle_timeout = _positive_env_int("RAGBOT_PG_IDLE_TRANSACTION_TIMEOUT_MS", 30000)
+    copy_min_rows = _positive_env_int("RAGBOT_PG_COPY_MIN_ROWS", 256)
+
+    # libpq applies these settings to every pooled connection and to the
+    # independent advisory-lock connection used by IndexVersion cutover.
+    option_tokens = [
+        f"-c statement_timeout={statement_timeout}",
+        f"-c lock_timeout={lock_timeout}",
+        f"-c idle_in_transaction_session_timeout={idle_timeout}",
+    ]
+    tuned_dsn = make_conninfo(
+        dsn,
+        connect_timeout=connect_timeout,
+        options=" ".join(option_tokens),
+    )
+    repo = ManagedPostgresRepo(dsn=tuned_dsn, pool_min=pool_min, pool_max=pool_max)
+
     # The publication barrier must open an independent PostgreSQL session so a
     # session-level advisory lock does not consume one pooled connection while
-    # activation itself performs normal repository transactions. Keep the
-    # original DSN privately on the runtime object: Connection.info.dsn may
-    # intentionally redact password material and is therefore not sufficient to
-    # reconnect to password-protected databases.
-    setattr(repo, "_ragbot_dsn", dsn)
+    # activation itself performs normal repository transactions. Keep the exact
+    # tuned DSN privately on the runtime object: Connection.info.dsn may redact
+    # password material and is not sufficient for reconnecting.
+    setattr(repo, "_ragbot_dsn", tuned_dsn)
+    setattr(repo, "_ragbot_pg_pool_min", pool_min)
+    setattr(repo, "_ragbot_pg_pool_max", pool_max)
+    setattr(repo, "_ragbot_pg_connect_timeout_seconds", connect_timeout)
+    setattr(repo, "_ragbot_pg_statement_timeout_ms", statement_timeout)
+    setattr(repo, "_ragbot_pg_lock_timeout_ms", lock_timeout)
+    setattr(repo, "_ragbot_pg_idle_transaction_timeout_ms", idle_timeout)
+    setattr(repo, "_ragbot_pg_copy_min_rows", copy_min_rows)
     return repo
 
 
@@ -151,8 +193,6 @@ def _ensure_qdrant_alias(
     target = _qdrant_alias_target(url, api_key, alias_name)
     if target:
         if target != collection_name:
-            # A pre-existing alias target is authoritative. Do not overwrite it
-            # during startup; activation/reconcile owns later transitions.
             return
         return
 
@@ -173,9 +213,6 @@ def _ensure_qdrant_alias(
                 ]
             )
         except Exception:
-            # API and worker commonly start at the same time after migrations.
-            # If the other replica created the same alias first, converge rather
-            # than failing this process startup.
             current = _qdrant_alias_target(url, api_key, alias_name)
             if current != collection_name:
                 raise
@@ -197,8 +234,6 @@ def _build_qdrant_vector(config: Mapping[str, Any]):
     configured_dim = int(config["dim"])
 
     if alias_name and _qdrant_alias_target(url, api_key, alias_name) is None:
-        # Ensure the legacy physical collection/payload indexes first. This
-        # direct adapter has no alias side effects.
         bootstrap = QdrantClientAdapter(
             url=url,
             api_key=api_key,
@@ -283,7 +318,7 @@ def _build_configured_reranker(_config: Mapping[str, Any]):
 def _builtin_specs() -> tuple[RuntimeFactorySpec, ...]:
     return (
         RuntimeFactorySpec("repository", "memory", _build_memory_repo, frozenset({"development"})),
-        RuntimeFactorySpec("repository", "postgres", _build_postgres_repo, frozenset({"durable", "queue", "fts", "generations", "index-lifecycle"}), optional_dependency="ragbot[postgres]"),
+        RuntimeFactorySpec("repository", "postgres", _build_postgres_repo, frozenset({"durable", "queue", "fts", "generations", "index-lifecycle", "bounded-pagination", "copy-bulk"}), optional_dependency="ragbot[postgres]"),
         RuntimeFactorySpec("vector", "memory", _build_memory_vector, frozenset({"development", "dense"})),
         RuntimeFactorySpec("vector", "qdrant", _build_qdrant_vector, frozenset({"dense", "metadata-filter", "aliases", "versioned-index"}), optional_dependency="ragbot[qdrant]"),
         RuntimeFactorySpec("embedding", "hash", _build_hash_embedding, frozenset({"development"})),

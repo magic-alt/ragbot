@@ -81,6 +81,14 @@ env:
   RAGBOT_MODEL_ROUTING: "false"
   RAGBOT_ALLOWED_LOCAL_SOURCE_ROOTS: /data
   RAGBOT_ALLOW_PRIVATE_SOURCE_NETWORKS: "false"
+  # PostgreSQL pool/session policy shared by API and worker replicas.
+  RAGBOT_PG_POOL_MIN: "2"
+  RAGBOT_PG_POOL_MAX: "10"
+  RAGBOT_PG_CONNECT_TIMEOUT_SECONDS: "5"
+  RAGBOT_PG_STATEMENT_TIMEOUT_MS: "30000"
+  RAGBOT_PG_LOCK_TIMEOUT_MS: "5000"
+  RAGBOT_PG_IDLE_TRANSACTION_TIMEOUT_MS: "30000"
+  RAGBOT_PG_COPY_MIN_ROWS: "256"
   # Empty alias means derive <qdrant.collection>_active at runtime.
   QDRANT_INDEX_ALIAS: ""
   # Non-secret JSON of standby embedding contracts used for candidate indexes.
