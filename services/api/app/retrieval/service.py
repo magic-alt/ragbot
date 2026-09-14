@@ -114,7 +114,10 @@ class Retriever:
         response = await self._engine.execute(request)
         # Backward-compatible trace keys used by the existing workbench/eval
         # surface. `dense` is the new plan vocabulary; `vector` remains an alias
-        # until downstream consumers migrate.
+        # until downstream consumers migrate. Historical vector ablation traces
+        # also used the string `vector-only` for the fusion method.
+        if response.trace.fusion_method == "dense-only":
+            response.trace.fusion_method = "vector-only"
         for chunk in response.chunks:
             metadata = chunk.metadata or {}
             trace = metadata.get("_retrieval")
@@ -122,6 +125,9 @@ class Retriever:
                 continue
             trace.setdefault("vector", trace.get("dense"))
             trace.setdefault("lexical", None)
+            context = trace.get("context")
+            if isinstance(context, dict) and context.get("fusion_method") == "dense-only":
+                context["fusion_method"] = "vector-only"
         return response
 
     async def aretrieve(
