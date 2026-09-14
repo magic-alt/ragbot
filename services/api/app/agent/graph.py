@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, runtime_checkable
 
 from contracts.types import SqlResult
@@ -9,6 +12,7 @@ from ..llm.provider import ModelProvider
 from ..llm.router import build_model_router, model_task_scope
 from ..observability.metrics import build_request_metrics, get_metrics_collector
 from ..observability.tracing import RequestTracer
+from ..quality.recorder import QualityRecorder
 from ..retrieval.cross_encoder import NoOpReranker, Reranker
 from ..retrieval.embedder import Embedder, HashEmbedder
 from ..retrieval.qdrant import InMemoryQdrant
@@ -34,6 +38,8 @@ from .state import (
     ROUTE_WEB,
     build_initial_state,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -102,6 +108,8 @@ async def run_agent(
 ) -> AgentState:
     """Run the agent graph and always terminate the event stream."""
     cb = callback or NullCallback()
+    original_query = query
+    started_at = datetime.now(timezone.utc).isoformat()
     state = build_initial_state(
         query=query,
         tenant_id=tenant_id,
@@ -115,13 +123,15 @@ async def run_agent(
         generation_max_tokens=generation_max_tokens,
     )
     tracer = RequestTracer(request_id=state.request_id)
+    trace_record = None
+    recorder = QualityRecorder(services.repo)
 
     try:
         if initial_evidence:
             state.evidence.extend(initial_evidence)
 
         with tracer.span("route") as span:
-            with model_task_scope(services.llm, "route"):
+            with model_task_scope(services.llm, "route", request_id=state.request_id):
                 state = await route_node(state, services)
             span.attributes["route"] = state.route or ""
         cb.emit(AgentEvent("route", {"route": state.route, "request_id": state.request_id}))
@@ -132,7 +142,7 @@ async def run_agent(
             prev_calls = len(state.tool_calls)
 
             with tracer.span(action, iteration=state.iteration) as span:
-                with model_task_scope(services.llm, action):
+                with model_task_scope(services.llm, action, request_id=state.request_id):
                     if action == "sql_query":
                         state = await sql_node(state, services)
                     elif action == "code_search":
@@ -170,22 +180,31 @@ async def run_agent(
                 }))
 
             with tracer.span("synthesize", iteration=state.iteration):
-                with model_task_scope(services.llm, "synthesize"):
+                with model_task_scope(services.llm, "synthesize", request_id=state.request_id):
                     state = await synthesize_node(state, services)
             with tracer.span("verify", iteration=state.iteration):
-                with model_task_scope(services.llm, "verify"):
+                with model_task_scope(services.llm, "verify", request_id=state.request_id):
                     state = await verify_node(state, services)
             if not _should_continue(state):
                 break
             action = _next_step(state)
 
         with tracer.span("finalize"):
-            with model_task_scope(services.llm, "finalize"):
+            with model_task_scope(services.llm, "finalize", request_id=state.request_id):
                 state = await finalize_node(state, services)
 
         trace_record = tracer.finish()
         metrics = build_request_metrics(state, trace_record)
         get_metrics_collector().record(metrics)
+        _record_agent_quality_safe(
+            recorder,
+            services=services,
+            state=state,
+            original_query=original_query,
+            trace_record=trace_record,
+            status="completed",
+            started_at=started_at,
+        )
 
         if state.final:
             cb.emit(AgentEvent("final", {
@@ -196,7 +215,33 @@ async def run_agent(
                 "followups": list(state.final.followups),
             }))
         return state
-    except Exception:
+    except asyncio.CancelledError as exc:
+        if trace_record is None:
+            trace_record = tracer.finish()
+        _record_agent_quality_safe(
+            recorder,
+            services=services,
+            state=state,
+            original_query=original_query,
+            trace_record=trace_record,
+            status="cancelled",
+            started_at=started_at,
+            error=exc,
+        )
+        raise
+    except Exception as exc:
+        if trace_record is None:
+            trace_record = tracer.finish()
+        _record_agent_quality_safe(
+            recorder,
+            services=services,
+            state=state,
+            original_query=original_query,
+            trace_record=trace_record,
+            status="failed",
+            started_at=started_at,
+            error=exc,
+        )
         cb.emit(AgentEvent("error", {
             "request_id": state.request_id,
             "error": "Agent execution failed",
@@ -204,6 +249,13 @@ async def run_agent(
         raise
     finally:
         cb.close()
+
+
+def _record_agent_quality_safe(recorder: QualityRecorder, **kwargs: Any) -> None:
+    try:
+        recorder.record_agent(**kwargs)
+    except Exception:
+        logger.exception("Failed to persist durable agent quality record")
 
 
 def _initial_action(state: AgentState) -> str:

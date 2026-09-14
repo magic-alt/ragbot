@@ -1,0 +1,100 @@
+name: Quality Observability Gate
+
+on:
+  pull_request:
+    paths:
+      - "services/api/app/quality/**"
+      - "services/api/app/storage/quality_support.py"
+      - "services/api/app/routes/quality.py"
+      - "services/api/app/routes/search.py"
+      - "services/api/app/agent/graph.py"
+      - "services/api/app/agent/nodes/retrieve.py"
+      - "services/api/app/llm/router.py"
+      - "infra/migrations/015_quality_observability.sql"
+      - "tests/test_quality_observability.py"
+      - "tests/test_postgres_quality_observability.py"
+      - ".github/workflows/quality-observability.yml"
+  push:
+    branches: [main]
+    paths:
+      - "services/api/app/quality/**"
+      - "services/api/app/storage/quality_support.py"
+      - "services/api/app/routes/quality.py"
+      - "services/api/app/routes/search.py"
+      - "services/api/app/agent/graph.py"
+      - "services/api/app/agent/nodes/retrieve.py"
+      - "services/api/app/llm/router.py"
+      - "infra/migrations/015_quality_observability.sql"
+
+permissions:
+  contents: read
+
+jobs:
+  durable-quality:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ragbot
+          POSTGRES_PASSWORD: ragbot
+          POSTGRES_DB: ragbot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ragbot -d ragbot"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      POSTGRES_DSN: postgresql://ragbot:ragbot@127.0.0.1:5432/ragbot
+      POSTGRES_TEST_DSN: postgresql://ragbot:ragbot@127.0.0.1:5432/ragbot
+      RAGBOT_TRACE_STORE_CONTENT: "false"
+      RAGBOT_TRACE_DETAIL_SAMPLE_RATE: "0.25"
+      RAGBOT_TRACE_RETENTION_DAYS: "30"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install quality test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,postgres,qdrant,worker]"
+
+      - name: Apply migrations
+        run: python -m services.api.app.storage.migrations
+
+      - name: Run quality contract tests
+        run: >-
+          python -m pytest -q
+          tests/test_quality_observability.py
+          tests/test_postgres_quality_observability.py
+
+      - name: Verify schema and content-redaction defaults
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+          dsn = os.environ['POSTGRES_DSN']
+          with psycopg.connect(dsn) as conn:
+              tables = {
+                  row[0]
+                  for row in conn.execute(
+                      "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
+                  ).fetchall()
+              }
+              for required in ('rag_runs', 'evaluation_runs', 'promotion_decisions', 'feedback'):
+                  assert required in tables, required
+              stored = conn.execute(
+                  "SELECT COUNT(*) FROM rag_runs WHERE query_text IS NOT NULL"
+              ).fetchone()[0]
+              assert stored == 0, 'quality gate persisted raw query content with content storage disabled'
+          print('durable quality schema + redaction defaults verified')
+          PY
