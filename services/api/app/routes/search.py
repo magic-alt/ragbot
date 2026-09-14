@@ -3,11 +3,18 @@ from __future__ import annotations
 import uuid
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from ..auth.acl import compute_security_scope
 from ..auth.principal import CAP_KNOWLEDGE_QUERY, authorize_identity, require_capability
+from ..retrieval.contracts import (
+    RetrievalDeadlineExceeded,
+    RetrievalPlan,
+    RetrievalRequest,
+    UnsupportedRetrievalPlan,
+    resolve_retrieval_plan,
+)
 
 router = APIRouter(tags=["search"])
 
@@ -28,9 +35,13 @@ class SearchRequest(BaseModel):
     tenant_id: str = Field(min_length=1)
     user_id: str = Field(min_length=1)
     top_k: int = Field(default=20, ge=1, le=100)
+    # Backward-compatible ablation name. `plan` is the stable #57 contract.
     mode: Literal["vector", "lexical", "hybrid"] = "hybrid"
+    plan: Optional[Literal["dense", "lexical", "hybrid_rrf", "qdrant_dense_sparse"]] = None
     candidate_pool: Optional[int] = Field(default=None, ge=1, le=200)
     rerank: bool = True
+    diversity: bool = False
+    deadline_ms: Optional[int] = Field(default=None, ge=1, le=120000)
     explain: bool = False
     filters: Optional[SearchFilters] = None
 
@@ -86,15 +97,6 @@ def _build_retrieval_filters(
     return result
 
 
-def _retrieval_context(chunks: List[Any]) -> Dict[str, Any]:
-    if not chunks:
-        return {}
-    metadata = chunks[0].metadata if getattr(chunks[0], "metadata", None) else {}
-    trace = metadata.get("_retrieval") if isinstance(metadata, dict) else None
-    context = trace.get("context") if isinstance(trace, dict) else None
-    return dict(context) if isinstance(context, dict) else {}
-
-
 def create_search_endpoint(get_services, verify_api_key):
     @router.post("/search", response_model=SearchResponse)
     async def search_endpoint(
@@ -114,14 +116,27 @@ def create_search_endpoint(get_services, verify_api_key):
             payload.filters,
             services,
         )
-        chunks = services.retriever.retrieve(
-            payload.query,
-            retrieval_filters,
+        plan = resolve_retrieval_plan(payload.plan, legacy_mode=payload.mode)
+        request = RetrievalRequest(
+            query=payload.query,
+            filters=retrieval_filters,
             top_k=payload.top_k,
-            mode=payload.mode,
+            plan=plan,
             candidate_pool=payload.candidate_pool,
             rerank=payload.rerank,
+            deadline_ms=payload.deadline_ms,
+            diversity=payload.diversity,
         )
+        try:
+            retrieval = await services.retriever.query(request)
+        except RetrievalDeadlineExceeded as exc:
+            raise HTTPException(
+                status_code=504,
+                detail={"message": str(exc), "retrieval": exc.trace.as_dict()},
+            ) from exc
+        except UnsupportedRetrievalPlan as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
         chunk_results = [
             ChunkResult(
                 chunk_id=c.chunk_id,
@@ -131,15 +146,18 @@ def create_search_endpoint(get_services, verify_api_key):
                 citations=c.citations if c.citations else [],
                 metadata=c.metadata if c.metadata else {},
             )
-            for c in chunks
+            for c in retrieval.chunks
         ]
         diagnostics: Dict[str, Any] = {
             "retrieval_mode": payload.mode,
+            "retrieval_plan": plan.value,
             "requested_candidate_pool": payload.candidate_pool,
             "reranker_requested": payload.rerank,
+            "diversity_requested": payload.diversity,
+            "deadline_ms": payload.deadline_ms,
             "explain": payload.explain,
+            **retrieval.trace.as_dict(),
         }
-        diagnostics.update(_retrieval_context(chunks))
         describe = getattr(services.retriever, "diagnostics", None)
         if callable(describe):
             diagnostics = describe(payload.query, diagnostics)
