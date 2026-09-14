@@ -60,7 +60,7 @@ def test_openapi_contains_frozen_v1_core_surface() -> None:
         ("/v1/sources", "get"),
         ("/v1/sources/{source_id}", "get"),
         ("/v1/catalog/jobs", "get"),
-        ("/v1/ingest", "post"),
+        ("/v1/ingest/jobs", "post"),
     ):
         assert path in schema["paths"], path
         assert method in schema["paths"][path], f"{method.upper()} {path}"
