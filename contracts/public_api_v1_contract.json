@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "api_version": "v1",
+  "operations": [
+    {
+      "path": "/v1/search",
+      "method": "post",
+      "request_required": ["query", "tenant_id", "user_id"],
+      "response_required": ["request_id", "chunks", "total", "diagnostics"]
+    },
+    {
+      "path": "/v1/chat",
+      "method": "post",
+      "request_required": ["query", "tenant_id", "user_id"]
+    },
+    {
+      "path": "/v1/sources",
+      "method": "get",
+      "query_parameters": ["tenant_id", "limit", "cursor"]
+    },
+    {
+      "path": "/v1/sources/{source_id}",
+      "method": "get",
+      "path_parameters": ["source_id"]
+    },
+    {
+      "path": "/v1/catalog/jobs",
+      "method": "get",
+      "query_parameters": ["tenant_id", "source_id", "status", "limit", "cursor"]
+    },
+    {
+      "path": "/v1/ingest/jobs",
+      "method": "post",
+      "request_required": ["source_id", "tenant_id"],
+      "response_required": ["status", "job_id", "source_id"]
+    }
+  ]
+}
