@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Iterator, List, Optional
 
@@ -31,17 +32,20 @@ from .observability.metrics import get_metrics_collector
 from .observability.otel_metrics import setup_otel_metrics
 from .observability.prometheus import render_prometheus
 from .observability.tracing import setup_tracing
+from .public_contract import install_public_api_contract
 from .routes.admin_ui import create_admin_ui_router
 from .routes.control_plane import create_control_plane_router
 from .routes.indexes import create_indexes_router
 from .routes.ingest import create_ingest_router
 from .routes.openai_compat import create_openai_compat_endpoint
+from .routes.quality import create_quality_router
 from .routes.quick_import import create_quick_import_router
 from .routes.runtime_identity import create_runtime_identity_router
 from .routes.search import create_search_endpoint
 from .routes.sources import create_sources_router
 from .routes.uploads import create_upload_router
 from .runtime import validate_production_environment
+from .storage.quality_support import ensure_quality_repository
 
 logger = logging.getLogger(__name__)
 
@@ -101,15 +105,33 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="ragbot API", version="0.5.0", lifespan=lifespan)
 setup_middleware(app)
+install_public_api_contract(app)
 
-app.include_router(create_search_endpoint(_get_services, verify_api_key))
+# Build each semantic router exactly once, then mount the same implementation at
+# the legacy path and the stable `/v1` public façade. This keeps RBAC,
+# pagination, ingestion and retrieval semantics single-sourced rather than
+# cloning endpoint business logic for every API version.
+_search_router = create_search_endpoint(_get_services, verify_api_key)
+_sources_router = create_sources_router(_get_services, verify_api_key)
+_ingest_router = create_ingest_router(_get_services, verify_api_key)
+_quick_import_router = create_quick_import_router(_get_services, verify_api_key)
+_upload_router = create_upload_router(_get_services, verify_api_key)
+_control_plane_router = create_control_plane_router(_get_services, verify_api_key)
+
+for _public_router in (
+    _search_router,
+    _sources_router,
+    _ingest_router,
+    _quick_import_router,
+    _upload_router,
+    _control_plane_router,
+):
+    app.include_router(_public_router)
+    app.include_router(_public_router, prefix="/v1")
+
 app.include_router(create_openai_compat_endpoint(_get_services, verify_api_key))
-app.include_router(create_sources_router(_get_services, verify_api_key))
-app.include_router(create_ingest_router(_get_services, verify_api_key))
-app.include_router(create_quick_import_router(_get_services, verify_api_key))
-app.include_router(create_upload_router(_get_services, verify_api_key))
-app.include_router(create_control_plane_router(_get_services, verify_api_key))
 app.include_router(create_indexes_router(_get_services, verify_api_key))
+app.include_router(create_quality_router(_get_services, verify_api_key))
 app.include_router(create_runtime_identity_router())
 app.include_router(create_admin_ui_router())
 
@@ -137,6 +159,7 @@ class ChatRequest(BaseModel):
     client_context: Optional[dict] = None
 
 
+@app.post("/v1/chat")
 @app.post("/chat")
 async def chat_endpoint(payload: ChatRequest, _key: Optional[str] = Depends(verify_api_key)):
     require_capability(_key, CAP_KNOWLEDGE_QUERY)
@@ -235,23 +258,46 @@ async def metrics_history_endpoint(last_n: int = 100, _key: Optional[str] = Depe
 class FeedbackRequest(BaseModel):
     request_id: str = Field(min_length=1)
     feedback: str = Field(pattern="^(positive|negative)$")
+    comment: Optional[str] = Field(default=None, max_length=2000)
+    citation_id: Optional[str] = Field(default=None, max_length=1000)
+    rating: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    metadata: dict = {}
 
 
 @app.post("/admin/feedback")
 async def feedback_endpoint(payload: FeedbackRequest, _key: Optional[str] = Depends(verify_api_key)):
     require_capability(_key, CAP_FEEDBACK_WRITE)
-    collector = get_metrics_collector()
-    found = collector.record_feedback(payload.request_id, payload.feedback)
-    if not found:
-        raise HTTPException(status_code=404, detail="Request not found in this API replica's diagnostic history")
-    return {"status": "ok"}
+    services = _get_services()
+    repo = ensure_quality_repository(services.repo)
+    run = repo.get_rag_run(payload.request_id)
+    local_found = get_metrics_collector().record_feedback(payload.request_id, payload.feedback)
+    if run is None and not local_found:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if run is not None:
+        try:
+            repo.add_quality_feedback(
+                feedback_id=f"feedback-{uuid.uuid4().hex}",
+                request_id=payload.request_id,
+                tenant_id=run.tenant_id,
+                user_id=run.user_id,
+                feedback_type=payload.feedback,
+                comment=payload.comment,
+                citation_id=payload.citation_id,
+                rating=payload.rating,
+                metadata=payload.metadata,
+            )
+        except Exception:
+            logger.exception("Failed to persist durable feedback")
+            raise HTTPException(status_code=503, detail="Unable to persist feedback")
+    return {"status": "ok", "durable": run is not None}
 
 
 @app.get("/admin/cost")
 async def cost_endpoint(_key: Optional[str] = Depends(verify_api_key)) -> dict:
     require_admin(_key)
-    from .llm.router import CostTracker
-    return CostTracker().summary()
+    tracker = getattr(_get_services().llm, "cost_tracker", None)
+    summary = getattr(tracker, "summary", None)
+    return summary() if callable(summary) else {"total_calls": 0, "total_tokens": 0, "total_cost_usd": 0.0}
 
 
 def _constraints_from_model(model: Optional[ConstraintsModel]) -> Optional[Constraints]:
