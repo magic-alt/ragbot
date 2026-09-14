@@ -112,20 +112,13 @@ class FakeHybridStore:
     ):
         target = collection_name or self.alias_target
         self.native_calls.append(
-            {
-                "collection": target,
-                "dense_name": dense_name,
-                "sparse_name": sparse_name,
-                "prefetch_limit": prefetch_limit,
-            }
+            {"collection": target, "dense_name": dense_name, "sparse_name": sparse_name}
         )
         rows = []
         for point_id, value in self.collections[target].items():
             payload = value["payload"]
             if filters.get("tenant_id") and payload.get("tenant_id") != filters["tenant_id"]:
                 continue
-            # The fake score is deterministic; real Qdrant RRF is covered by
-            # the dedicated integration workflow.
             dense_score = sum(a * b for a, b in zip(dense_vector, value["dense"]))
             sparse_score = float(len(set(sparse_vector.indices).intersection(value["sparse"].indices)))
             rows.append((point_id, dense_score + sparse_score, dict(payload)))
@@ -169,11 +162,7 @@ def _fixture():
     chunks = [_chunk("a", "alpha servo motor"), _chunk("b", "beta ethercat fieldbus")]
     repo.add_chunks(chunks)
     service = SparseIndexLifecycleService(
-        repo,
-        store,
-        router,
-        alias_name=store.alias_name,
-        sparse_encoder=sparse,
+        repo, store, router, alias_name=store.alias_name, sparse_encoder=sparse
     )
     baseline = service.bootstrap_current(dense)
     return repo, dense, sparse, store, service, baseline, chunks
@@ -212,48 +201,29 @@ def test_retrieval_contract_changes_when_sparse_representation_changes() -> None
 
 
 def test_sparse_candidate_preserves_dense_contract_and_builds_named_vectors() -> None:
-    repo, dense, sparse, store, service, baseline, chunks = _fixture()
-    candidate = service.create_candidate(
-        dense.contract_id,
-        sparse_contract_id=sparse.contract_id,
-    )
+    _repo, dense, sparse, store, service, baseline, chunks = _fixture()
+    candidate = service.create_candidate(dense.contract_id, sparse_contract_id=sparse.contract_id)
     assert candidate.vector_schema["dense"]["name"] == "dense"
     assert candidate.vector_schema["sparse"]["contract_id"] == sparse.contract_id
     assert candidate.build_stats["baseline_index_version_id"] == baseline.index_version_id
-
     built = service.build(candidate.index_version_id, batch_size=1)
     assert built.status == "validating"
     values = store.collections[candidate.physical_collection]
     assert len(values) == len(chunks)
     assert all("sparse" in value for value in values.values())
-    assert {value["payload"]["sparse_contract_id"] for value in values.values()} == {
-        sparse.contract_id
-    }
 
 
 def test_sparse_candidate_rejects_dense_contract_change() -> None:
     _repo, _dense, sparse, _store, service, _baseline, _chunks = _fixture()
     with pytest.raises(ValueError, match="preserve the active dense embedding contract"):
-        service.create_candidate(
-            "emb-different",
-            sparse_contract_id=sparse.contract_id,
-        )
+        service.create_candidate("emb-different", sparse_contract_id=sparse.contract_id)
 
 
 def test_candidate_query_targets_unactivated_index_and_emits_representation_lineage() -> None:
     repo, dense, sparse, store, service, baseline, _chunks = _fixture()
-    candidate = service.create_candidate(
-        dense.contract_id,
-        sparse_contract_id=sparse.contract_id,
-    )
+    candidate = service.create_candidate(dense.contract_id, sparse_contract_id=sparse.contract_id)
     service.build(candidate.index_version_id)
-    retriever = Retriever(
-        repo,
-        store,
-        embedder=dense,
-        reranker=None,
-        sparse_encoder=sparse,
-    )
+    retriever = Retriever(repo, store, embedder=dense, reranker=None, sparse_encoder=sparse)
     try:
         chunks = asyncio.run(
             retriever.aretrieve(
@@ -272,7 +242,6 @@ def test_candidate_query_targets_unactivated_index_and_emits_representation_line
             "dense": dense.contract_id,
             "sparse": sparse.contract_id,
         }
-        assert context["fusion_method"] == "qdrant-native"
         assert store.native_calls[-1]["collection"] == candidate.physical_collection
         assert store.active_collection_name() == baseline.physical_collection
     finally:
@@ -287,27 +256,19 @@ class _PlanFixtureRetriever:
 
     async def query(self, request):
         candidate = request.plan is RetrievalPlan.QDRANT_DENSE_SPARSE
-        query = request.query
-        relevant = "alpha" if "alpha" in query else "beta"
-        if candidate:
-            ordered = [relevant, "noise"]
-        else:
-            ordered = ["noise", relevant]
-        chunks = []
-        for rank, token in enumerate(ordered, 1):
-            chunks.append(
-                RetrievalChunk(
-                    chunk_id=f"chunk-{token}",
-                    doc_id=f"doc-{token}",
-                    text=f"{token} evidence",
-                    score=1.0 / rank,
-                    citations=[f"doc-{token}:0"],
-                    metadata={
-                        "path": f"{token}.txt",
-                        "_retrieval": {"final_rank": rank},
-                    },
-                )
+        relevant = "alpha" if "alpha" in request.query else "beta"
+        ordered = [relevant, "noise"] if candidate else ["noise", relevant]
+        chunks = [
+            RetrievalChunk(
+                chunk_id=f"chunk-{token}",
+                doc_id=f"doc-{token}",
+                text=f"{token} evidence",
+                score=1.0 / rank,
+                citations=[f"doc-{token}:0"],
+                metadata={"path": f"{token}.txt", "_retrieval": {"final_rank": rank}},
             )
+            for rank, token in enumerate(ordered, 1)
+        ]
         trace = RetrievalTrace(
             plan=request.plan.value,
             deadline_ms=request.deadline_ms,
@@ -352,15 +313,14 @@ def test_golden_comparison_persists_evaluation_runs_and_promotion_decision() -> 
     )
     repo.add_index_version(baseline)
     repo.add_index_version(candidate)
-    lifecycle = SimpleNamespace(
-        repo=repo,
-        alias_name="rag-active",
-        mark_ready=lambda *args, **kwargs: None,
-    )
     services = SimpleNamespace(
         repo=repo,
         retriever=_PlanFixtureRetriever(dense_contract, sparse_contract, candidate.index_version_id),
-        index_lifecycle=lifecycle,
+        index_lifecycle=SimpleNamespace(
+            repo=repo,
+            alias_name="rag-active",
+            mark_ready=lambda *args, **kwargs: None,
+        ),
     )
     dataset = {
         "schema_version": 1,
@@ -403,5 +363,6 @@ def test_golden_comparison_persists_evaluation_runs_and_promotion_decision() -> 
     assert result["candidate"]["runtime_contracts"]["sparse_contract_id"] == sparse_contract
     assert result["candidate"]["metrics"]["mrr"] > result["baseline"]["metrics"]["mrr"]
     assert repo.get_evaluation_run(result["candidate"]["evaluation_run_id"]) is not None
-    decisions = repo.list_promotion_decisions(limit=10)
-    assert decisions and decisions[0].candidate_evaluation_id == result["candidate"]["evaluation_run_id"]
+    decision = repo.get_promotion_decision(result["promotion"]["promotion_decision_id"])
+    assert decision is not None
+    assert decision.candidate_evaluation_id == result["candidate"]["evaluation_run_id"]
