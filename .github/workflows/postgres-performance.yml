@@ -31,9 +31,9 @@ on:
         required: false
         default: "1,8"
       min_copy_speedup:
-        description: "Optional COPY/legacy promotion threshold"
+        description: "COPY/legacy promotion threshold (CI baseline: 1.25x)"
         required: false
-        default: "0"
+        default: "1.25"
 
 permissions:
   contents: read
@@ -67,7 +67,7 @@ jobs:
       RAGBOT_PG_BENCH_PLAN_JOBS: ${{ inputs.plan_jobs || '3000' }}
       RAGBOT_PG_BENCH_CLAIM_JOBS: ${{ inputs.claim_jobs || '64' }}
       RAGBOT_PG_BENCH_WORKERS: ${{ inputs.workers || '1,8' }}
-      RAGBOT_PG_BENCH_MIN_COPY_SPEEDUP: ${{ inputs.min_copy_speedup || '0' }}
+      RAGBOT_PG_BENCH_MIN_COPY_SPEEDUP: ${{ inputs.min_copy_speedup || '1.25' }}
       RAGBOT_PG_BENCH_MAX_CLAIM_P95_MS: "1000"
 
     steps:
