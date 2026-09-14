@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Literal, Mapping, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Optional, Protocol, runtime_checkable
 
+from services.api.app.storage.connector_state_support import ensure_connector_state_repository
 from services.api.app.storage.models import Chunk, Source
 from services.api.app.storage.protocol import Repo
 
@@ -99,7 +100,8 @@ class Connector(Protocol):
     def sync(self, context: ConnectorContext) -> ConnectorSync: ...
 
 
-RecordTransformer = Any
+RecordTransformer = Callable[[SourceRecord, Source, Repo], Iterable[Chunk]]
+ConnectorFactory = Callable[[], Connector]
 
 
 @dataclass
@@ -109,6 +111,9 @@ class PreparedConnectorRun:
     tenant_id: str
     checkpoint: Optional[ConnectorCheckpoint] = None
     diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def __iter__(self) -> Iterator[Chunk]:
+        return iter(self.chunks)
 
     def commit_checkpoint(self, repo: Repo) -> bool:
         if self.checkpoint is None:
@@ -126,13 +131,62 @@ class PreparedConnectorRun:
         return True
 
 
+def make_sdk_runner(
+    connector_factory: ConnectorFactory,
+    transform_record: RecordTransformer,
+    *,
+    max_concurrency: int = 4,
+) -> Callable[[Source, Repo, Iterable[Chunk]], Iterable[Chunk]]:
+    """Adapt a Connector SDK implementation to the stable ConnectorSpec runner.
+
+    This keeps the platform registry/entry-point boundary from #50 unchanged: a
+    third-party package registers a normal ``ConnectorSpec`` whose runner is
+    produced here. No Ragbot core dispatch switch needs editing.
+    """
+
+    bounded = max(1, int(max_concurrency))
+
+    def runner(source: Source, repo: Repo, previous_chunks: Iterable[Chunk]) -> Iterable[Chunk]:
+        ensure_connector_state_repository(repo)
+        getter = getattr(repo, "get_connector_checkpoint", None)
+        checkpoint = ConnectorCheckpoint.from_dict(
+            getter(source.source_id) if callable(getter) else None
+        )
+        connector = connector_factory()
+        connector.validate_config(source.config or {})
+        sync = connector.sync(
+            ConnectorContext(
+                source=source,
+                checkpoint=checkpoint,
+                max_concurrency=bounded,
+            )
+        )
+        chunks = apply_changes_to_previous_chunks(
+            previous_chunks,
+            sync.changes,
+            source=source,
+            repo=repo,
+            transform_record=transform_record,
+            full_resync=bool(sync.full_resync),
+        )
+        return PreparedConnectorRun(
+            chunks=chunks,
+            source_id=source.source_id,
+            tenant_id=source.tenant_id,
+            checkpoint=sync.checkpoint,
+            diagnostics=dict(sync.diagnostics or {}),
+        )
+
+    return runner
+
+
 def apply_changes_to_previous_chunks(
     previous_chunks: Iterable[Chunk],
     changes: Iterable[SourceChange],
     *,
     source: Source,
     repo: Repo,
-    transform_record: Any,
+    transform_record: RecordTransformer,
     full_resync: bool,
 ) -> Iterable[Chunk]:
     """Adapt SDK deltas into the pipeline's complete candidate snapshot.
@@ -160,9 +214,12 @@ def apply_changes_to_previous_chunks(
             metadata = dict(chunk.metadata or {})
             metadata["external_id"] = change.record.external_id
             metadata["remote_version"] = change.record.remote_version
-            metadata.setdefault("document_title", change.record.title)
-            metadata.setdefault("document_uri", change.record.uri)
+            if change.record.title:
+                metadata.setdefault("document_title", change.record.title)
+            if change.record.uri:
+                metadata.setdefault("document_uri", change.record.uri)
             metadata.setdefault("media_type", change.record.media_type)
+            metadata.update(dict(change.record.metadata or {}))
             if change.record.acl:
                 metadata.setdefault("source_acl", dict(change.record.acl))
             chunk.metadata = metadata
