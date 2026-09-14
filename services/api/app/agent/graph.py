@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -130,7 +131,7 @@ async def run_agent(
             state.evidence.extend(initial_evidence)
 
         with tracer.span("route") as span:
-            with model_task_scope(services.llm, "route"):
+            with model_task_scope(services.llm, "route", request_id=state.request_id):
                 state = await route_node(state, services)
             span.attributes["route"] = state.route or ""
         cb.emit(AgentEvent("route", {"route": state.route, "request_id": state.request_id}))
@@ -141,7 +142,7 @@ async def run_agent(
             prev_calls = len(state.tool_calls)
 
             with tracer.span(action, iteration=state.iteration) as span:
-                with model_task_scope(services.llm, action):
+                with model_task_scope(services.llm, action, request_id=state.request_id):
                     if action == "sql_query":
                         state = await sql_node(state, services)
                     elif action == "code_search":
@@ -179,17 +180,17 @@ async def run_agent(
                 }))
 
             with tracer.span("synthesize", iteration=state.iteration):
-                with model_task_scope(services.llm, "synthesize"):
+                with model_task_scope(services.llm, "synthesize", request_id=state.request_id):
                     state = await synthesize_node(state, services)
             with tracer.span("verify", iteration=state.iteration):
-                with model_task_scope(services.llm, "verify"):
+                with model_task_scope(services.llm, "verify", request_id=state.request_id):
                     state = await verify_node(state, services)
             if not _should_continue(state):
                 break
             action = _next_step(state)
 
         with tracer.span("finalize"):
-            with model_task_scope(services.llm, "finalize"):
+            with model_task_scope(services.llm, "finalize", request_id=state.request_id):
                 state = await finalize_node(state, services)
 
         trace_record = tracer.finish()
@@ -214,6 +215,20 @@ async def run_agent(
                 "followups": list(state.final.followups),
             }))
         return state
+    except asyncio.CancelledError as exc:
+        if trace_record is None:
+            trace_record = tracer.finish()
+        _record_agent_quality_safe(
+            recorder,
+            services=services,
+            state=state,
+            original_query=original_query,
+            trace_record=trace_record,
+            status="cancelled",
+            started_at=started_at,
+            error=exc,
+        )
+        raise
     except Exception as exc:
         if trace_record is None:
             trace_record = tracer.finish()
