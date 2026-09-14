@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+import time
 import uuid
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from ..auth.acl import compute_security_scope
 from ..auth.principal import CAP_KNOWLEDGE_QUERY, authorize_identity, require_capability
+from ..quality.recorder import QualityRecorder
 from ..retrieval.contracts import (
     RetrievalDeadlineExceeded,
     RetrievalPlan,
@@ -16,6 +22,7 @@ from ..retrieval.contracts import (
     resolve_retrieval_plan,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["search"])
 
 
@@ -127,16 +134,99 @@ def create_search_endpoint(get_services, verify_api_key):
             deadline_ms=payload.deadline_ms,
             diversity=payload.diversity,
         )
+        # The request ID exists before any retrieval work starts, so production
+        # errors/timeouts can still be correlated with one durable lineage row.
+        request_id = uuid.uuid4().hex
+        started_monotonic = time.monotonic()
+        started_at = datetime.now(timezone.utc).isoformat()
+        recorder = QualityRecorder(services.repo)
         try:
             retrieval = await services.retriever.query(request)
         except RetrievalDeadlineExceeded as exc:
+            _record_quality_safe(
+                recorder,
+                services=services,
+                request_id=request_id,
+                tenant_id=payload.tenant_id,
+                user_id=trusted_user_id,
+                query=payload.query,
+                request=request,
+                response=SimpleNamespace(trace=exc.trace, chunks=[]),
+                status="deadline_exceeded",
+                started_monotonic=started_monotonic,
+                started_at=started_at,
+                error=exc,
+            )
             raise HTTPException(
                 status_code=504,
-                detail={"message": str(exc), "retrieval": exc.trace.as_dict()},
+                detail={
+                    "request_id": request_id,
+                    "message": str(exc),
+                    "retrieval": exc.trace.as_dict(),
+                },
             ) from exc
         except UnsupportedRetrievalPlan as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            _record_quality_safe(
+                recorder,
+                services=services,
+                request_id=request_id,
+                tenant_id=payload.tenant_id,
+                user_id=trusted_user_id,
+                query=payload.query,
+                request=request,
+                status="failed",
+                started_monotonic=started_monotonic,
+                started_at=started_at,
+                error=exc,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={"request_id": request_id, "message": str(exc)},
+            ) from exc
+        except asyncio.CancelledError as exc:
+            _record_quality_safe(
+                recorder,
+                services=services,
+                request_id=request_id,
+                tenant_id=payload.tenant_id,
+                user_id=trusted_user_id,
+                query=payload.query,
+                request=request,
+                status="cancelled",
+                started_monotonic=started_monotonic,
+                started_at=started_at,
+                error=exc,
+            )
+            raise
+        except Exception as exc:
+            _record_quality_safe(
+                recorder,
+                services=services,
+                request_id=request_id,
+                tenant_id=payload.tenant_id,
+                user_id=trusted_user_id,
+                query=payload.query,
+                request=request,
+                status="failed",
+                started_monotonic=started_monotonic,
+                started_at=started_at,
+                error=exc,
+            )
+            raise
 
+        _record_quality_safe(
+            recorder,
+            services=services,
+            request_id=request_id,
+            tenant_id=payload.tenant_id,
+            user_id=trusted_user_id,
+            query=payload.query,
+            request=request,
+            response=retrieval,
+            status="completed",
+            started_monotonic=started_monotonic,
+            started_at=started_at,
+        )
         chunk_results = [
             ChunkResult(
                 chunk_id=c.chunk_id,
@@ -162,10 +252,20 @@ def create_search_endpoint(get_services, verify_api_key):
         if callable(describe):
             diagnostics = describe(payload.query, diagnostics)
         return SearchResponse(
-            request_id=uuid.uuid4().hex,
+            request_id=request_id,
             chunks=chunk_results,
             total=len(chunk_results),
             diagnostics=diagnostics,
         )
 
     return router
+
+
+def _record_quality_safe(recorder: QualityRecorder, **kwargs: Any) -> None:
+    try:
+        recorder.record_search(**kwargs)
+    except Exception:
+        # Observability is fail-open for serving traffic. The request ID still
+        # remains available to logs/HTTP responses so storage outages are
+        # diagnosable without converting a successful search into an outage.
+        logger.exception("Failed to persist durable search quality record")
