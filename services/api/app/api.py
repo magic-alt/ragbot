@@ -32,6 +32,7 @@ from .observability.metrics import get_metrics_collector
 from .observability.otel_metrics import setup_otel_metrics
 from .observability.prometheus import render_prometheus
 from .observability.tracing import setup_tracing
+from .public_contract import install_public_api_contract
 from .routes.admin_ui import create_admin_ui_router
 from .routes.control_plane import create_control_plane_router
 from .routes.indexes import create_indexes_router
@@ -104,14 +105,31 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="ragbot API", version="0.5.0", lifespan=lifespan)
 setup_middleware(app)
+install_public_api_contract(app)
 
-app.include_router(create_search_endpoint(_get_services, verify_api_key))
+# Build each semantic router exactly once, then mount the same implementation at
+# the legacy path and the stable `/v1` public façade. This keeps RBAC,
+# pagination, ingestion and retrieval semantics single-sourced rather than
+# cloning endpoint business logic for every API version.
+_search_router = create_search_endpoint(_get_services, verify_api_key)
+_sources_router = create_sources_router(_get_services, verify_api_key)
+_ingest_router = create_ingest_router(_get_services, verify_api_key)
+_quick_import_router = create_quick_import_router(_get_services, verify_api_key)
+_upload_router = create_upload_router(_get_services, verify_api_key)
+_control_plane_router = create_control_plane_router(_get_services, verify_api_key)
+
+for _public_router in (
+    _search_router,
+    _sources_router,
+    _ingest_router,
+    _quick_import_router,
+    _upload_router,
+    _control_plane_router,
+):
+    app.include_router(_public_router)
+    app.include_router(_public_router, prefix="/v1")
+
 app.include_router(create_openai_compat_endpoint(_get_services, verify_api_key))
-app.include_router(create_sources_router(_get_services, verify_api_key))
-app.include_router(create_ingest_router(_get_services, verify_api_key))
-app.include_router(create_quick_import_router(_get_services, verify_api_key))
-app.include_router(create_upload_router(_get_services, verify_api_key))
-app.include_router(create_control_plane_router(_get_services, verify_api_key))
 app.include_router(create_indexes_router(_get_services, verify_api_key))
 app.include_router(create_quality_router(_get_services, verify_api_key))
 app.include_router(create_runtime_identity_router())
@@ -141,6 +159,7 @@ class ChatRequest(BaseModel):
     client_context: Optional[dict] = None
 
 
+@app.post("/v1/chat")
 @app.post("/chat")
 async def chat_endpoint(payload: ChatRequest, _key: Optional[str] = Depends(verify_api_key)):
     require_capability(_key, CAP_KNOWLEDGE_QUERY)

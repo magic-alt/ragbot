@@ -1,10 +1,28 @@
 {
-  "name": "@ragbot/node-client",
+  "name": "@ragbot/client",
   "version": "0.5.0",
-  "private": true,
+  "description": "Typed Node.js client for the Ragbot v1 public API",
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "pack:dry-run": "npm run build && npm pack --dry-run"
   },
   "devDependencies": {
     "typescript": "^5.9.0"

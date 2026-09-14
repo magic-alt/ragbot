@@ -66,7 +66,7 @@ class SearchResponse(BaseModel):
     request_id: str
     chunks: List[ChunkResult]
     total: int
-    diagnostics: Dict[str, Any] = {}
+    diagnostics: Dict[str, Any]
 
 
 def _build_retrieval_filters(
