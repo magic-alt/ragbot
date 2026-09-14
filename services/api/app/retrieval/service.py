@@ -111,7 +111,18 @@ class Retriever:
         return result
 
     async def query(self, request: RetrievalRequest) -> RetrievalResponse:
-        return await self._engine.execute(request)
+        response = await self._engine.execute(request)
+        # Backward-compatible trace keys used by the existing workbench/eval
+        # surface. `dense` is the new plan vocabulary; `vector` remains an alias
+        # until downstream consumers migrate.
+        for chunk in response.chunks:
+            metadata = chunk.metadata or {}
+            trace = metadata.get("_retrieval")
+            if not isinstance(trace, dict):
+                continue
+            trace.setdefault("vector", trace.get("dense"))
+            trace.setdefault("lexical", None)
+        return response
 
     async def aretrieve(
         self,
