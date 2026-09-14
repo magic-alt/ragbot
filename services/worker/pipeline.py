@@ -321,6 +321,18 @@ def _connector_capability(source_type: str, capability: str) -> bool:
 def source_documents(source: Source, repo: Repo) -> list[Document]:
     """Return documents owned by ``source`` without unnecessary tenant scans."""
     base_doc_id = source.config.get("doc_id") or f"doc-{source.source_id}"
+    optimized = getattr(repo, "documents_for_source", None)
+    if callable(optimized):
+        return list(
+            optimized(
+                source.source_id,
+                source.tenant_id,
+                base_doc_id=base_doc_id,
+            )
+        )
+
+    # Compatibility fallback for third-party repositories that have not yet
+    # adopted the bounded Source ownership query capability.
     if not _connector_capability(source.source_type, "multi_document"):
         document = repo.get_document(base_doc_id)
         if document and document.tenant_id == source.tenant_id:
