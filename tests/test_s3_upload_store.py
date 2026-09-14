@@ -10,6 +10,11 @@ from services.worker.uploads.s3_store import S3UploadStore
 from services.worker.uploads.uri import upload_uri
 
 
+_OBJECT_A = "a" * 32
+_OBJECT_B = "b" * 32
+_OBJECT_CORRUPT = "c" * 32
+
+
 class _NotFound(Exception):
     def __init__(self) -> None:
         self.response = {
@@ -80,14 +85,14 @@ def test_s3_store_deduplicates_blob_and_materializes_on_independent_node(tmp_pat
         materialize_dir=tmp_path / "api-cache",
     )
 
-    first = _commit(writer, tmp_path, "object-a", payload)
-    second = _commit(writer, tmp_path, "object-b", payload)
+    first = _commit(writer, tmp_path, _OBJECT_A, payload)
+    second = _commit(writer, tmp_path, _OBJECT_B, payload)
 
     assert first.storage_backend == "s3"
     assert second.storage_backend == "s3"
     assert len([key for key in client.uploads if "/blobs/" in key]) == 1
-    assert ("uploads", "ragbot/objects/object-a.json") in client.objects
-    assert ("uploads", "ragbot/objects/object-b.json") in client.objects
+    assert ("uploads", f"ragbot/objects/{_OBJECT_A}.json") in client.objects
+    assert ("uploads", f"ragbot/objects/{_OBJECT_B}.json") in client.objects
 
     worker = S3UploadStore(
         bucket="uploads",
@@ -95,15 +100,15 @@ def test_s3_store_deduplicates_blob_and_materializes_on_independent_node(tmp_pat
         client=client,
         materialize_dir=tmp_path / "worker-cache",
     )
-    materialized = worker.materialize_path(upload_uri("object-b"))
+    materialized = worker.materialize_path(upload_uri(_OBJECT_B))
     assert materialized.read_bytes() == payload
     assert str(materialized).startswith(str((tmp_path / "worker-cache").resolve()))
 
-    # Logical deletion must not delete the content-addressed blob: object-b still
+    # Logical deletion must not delete the content-addressed blob: object B still
     # references it and a worker on another node must remain able to materialize.
-    assert writer.delete_object("object-a", sha256=first.sha256) is True
-    assert ("uploads", "ragbot/objects/object-a.json") not in client.objects
-    assert worker.materialize_path(upload_uri("object-b")).read_bytes() == payload
+    assert writer.delete_object(_OBJECT_A, sha256=first.sha256) is True
+    assert ("uploads", f"ragbot/objects/{_OBJECT_A}.json") not in client.objects
+    assert worker.materialize_path(upload_uri(_OBJECT_B)).read_bytes() == payload
     assert any("/blobs/" in key for _bucket, key in client.objects)
 
 
@@ -114,7 +119,7 @@ def test_s3_store_rejects_commit_metadata_mismatch(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="checksum/size"):
         store.commit_pdf(
             temporary,
-            object_id="bad",
+            object_id="d" * 32,
             sha256="0" * 64,
             size_bytes=temporary.stat().st_size,
         )
@@ -124,10 +129,10 @@ def test_s3_store_rejects_corrupt_download(tmp_path: Path) -> None:
     client = _FakeS3()
     payload = b"%PDF-1.7\ntrusted\n"
     store = S3UploadStore(bucket="uploads", prefix="x", client=client, materialize_dir=tmp_path)
-    stored = _commit(store, tmp_path, "object-corrupt", payload)
+    stored = _commit(store, tmp_path, _OBJECT_CORRUPT, payload)
     blob_key = f"x/blobs/{stored.sha256}.pdf"
     client.objects[("uploads", blob_key)] = b"corrupted bytes"
-    (tmp_path / "object-corrupt.pdf").unlink(missing_ok=True)
+    (tmp_path / f"{_OBJECT_CORRUPT}.pdf").unlink(missing_ok=True)
 
     with pytest.raises(ValueError, match="checksum/size|expected size"):
-        store.materialize_path(upload_uri("object-corrupt"))
+        store.materialize_path(upload_uri(_OBJECT_CORRUPT))
