@@ -1,0 +1,112 @@
+name: PostgreSQL Performance Gate
+
+on:
+  pull_request:
+    paths:
+      - "services/api/app/storage/**"
+      - "services/api/app/routes/**"
+      - "services/worker/**"
+      - "infra/migrations/**"
+      - "benchmarks/postgres_hotpaths.py"
+      - "tests/test_postgres_performance.py"
+      - ".github/workflows/postgres-performance.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      chunks:
+        description: "Rows per legacy/COPY bulk run (use 1000000 for the full gate)"
+        required: false
+        default: "10000"
+      plan_jobs:
+        description: "Queue rows used for EXPLAIN plan gates"
+        required: false
+        default: "10000"
+      claim_jobs:
+        description: "Jobs claimed per worker-concurrency run"
+        required: false
+        default: "128"
+      workers:
+        description: "Comma-separated worker counts (full matrix: 1,8,32)"
+        required: false
+        default: "1,8"
+      min_copy_speedup:
+        description: "Optional COPY/legacy promotion threshold"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: postgres-performance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgres-performance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ragbot
+          POSTGRES_PASSWORD: ragbot
+          POSTGRES_DB: ragbot
+        ports:
+          - 55433:5432
+        options: >-
+          --health-cmd "pg_isready -U ragbot -d ragbot"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      POSTGRES_TEST_DSN: postgresql://ragbot:ragbot@127.0.0.1:55433/ragbot
+      RAGBOT_PG_BENCH_CHUNKS: ${{ inputs.chunks || '3000' }}
+      RAGBOT_PG_BENCH_PLAN_JOBS: ${{ inputs.plan_jobs || '3000' }}
+      RAGBOT_PG_BENCH_CLAIM_JOBS: ${{ inputs.claim_jobs || '64' }}
+      RAGBOT_PG_BENCH_WORKERS: ${{ inputs.workers || '1,8' }}
+      RAGBOT_PG_BENCH_MIN_COPY_SPEEDUP: ${{ inputs.min_copy_speedup || '0' }}
+      RAGBOT_PG_BENCH_MAX_CLAIM_P95_MS: "1000"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install PostgreSQL test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,postgres,qdrant,worker]"
+
+      - name: Apply migrations
+        env:
+          POSTGRES_DSN: ${{ env.POSTGRES_TEST_DSN }}
+        run: python -m services.api.app.storage.migrations
+
+      - name: Run PostgreSQL hot-path integration tests
+        run: python -m pytest -q tests/test_postgres_performance.py
+
+      - name: Run plan, COPY and claim benchmark gate
+        run: python -m benchmarks.postgres_hotpaths | tee postgres-hotpaths.json
+
+      - name: Publish benchmark summary
+        if: always()
+        run: |
+          if [ -f postgres-hotpaths.json ]; then
+            cat postgres-hotpaths.json >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload benchmark result
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: postgres-hotpaths-${{ github.run_id }}
+          path: postgres-hotpaths.json
+          if-no-files-found: ignore
