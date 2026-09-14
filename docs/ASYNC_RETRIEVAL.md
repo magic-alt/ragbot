@@ -11,17 +11,17 @@ The stable plan identifiers are:
 | `dense` | embedding -> active vector index | control/ablation |
 | `lexical` | PostgreSQL FTS/CJK | control/ablation |
 | `hybrid_rrf` | dense + lexical concurrently -> adaptive RRF -> optional reranker | default control |
-| `qdrant_dense_sparse` | named dense + sparse vectors in Qdrant | experimental, capability-gated |
+| `qdrant_dense_sparse` | named dense + sparse -> Qdrant Prefetch/RRF -> optional reranker | Phase-2 candidate |
 
 The older `mode=vector|lexical|hybrid` API remains a compatibility alias for `dense|lexical|hybrid_rrf`.
 
-`qdrant_dense_sparse` is intentionally fail-fast until the active IndexVersion and vector backend expose a real named dense+sparse schema. Ragbot must not silently synthesize a sparse representation or replace the control plan without an evaluation gate.
+`hybrid_rrf` remains the production control. `qdrant_dense_sparse` is capability- and contract-gated: it requires an IndexVersion with an immutable sparse representation contract and never silently falls back to the control plan.
 
 ## Async execution
 
 `Retriever` owns one bounded, long-lived executor for synchronous PostgreSQL/Qdrant/reranker adapters. A request no longer creates a `ThreadPoolExecutor`.
 
-The normal hybrid path is:
+The normal control path is:
 
 ```text
 RetrievalRequest
@@ -40,58 +40,81 @@ RetrievalRequest
 RetrievalResponse + RetrievalTrace
 ```
 
+The Phase-2 candidate is:
+
+```text
+same dense embedding contract
+        +
+SparseEmbeddingSpec
+        |
+        v
+Qdrant named dense+sparse IndexVersion
+        |
+        v
+Prefetch(dense) + Prefetch(sparse)
+        |
+        v
+Qdrant native RRF
+        |
+optional existing reranker
+```
+
 API and Agent callers use `await Retriever.query()` / `await Retriever.aretrieve()`. The historical synchronous `retrieve()` facade exists for CLI/tests and refuses to block an already-running event loop.
+
+## Candidate IndexVersion before activation
+
+`RetrievalRequest.index_version_id` is an internal evaluation selector and is not exposed by `/v1/search`. It allows a validating dense+sparse physical collection to be queried before the active Qdrant alias changes.
+
+The candidate plan validates before I/O that:
+
+- the selected IndexVersion is `validating`, `ready` or `active`;
+- its dense embedding contract equals the runtime dense contract;
+- a sparse contract exists in `vector_schema`;
+- the configured sparse encoder has the exact same contract ID;
+- the Qdrant backend supports the native hybrid Query API.
+
+This makes Golden Dataset comparison possible without routing production search traffic to the candidate.
 
 ## Deadline and cancellation semantics
 
 `deadline_ms` is one end-to-end retrieval budget. Every candidate/rerank stage consumes the same monotonic budget; it is not reset per backend call.
 
-A deadline failure raises `RetrievalDeadlineExceeded` and records:
+A deadline failure raises `RetrievalDeadlineExceeded` and records plan, deadline, stage timings/candidate counts collected so far, `timed_out=true`, and `error_stage`.
 
-- plan;
-- deadline;
-- stage timings collected so far;
-- candidate counts collected so far;
-- `timed_out=true`;
-- `error_stage`.
-
-For HTTP `/search`, this becomes a `504` with the non-secret retrieval trace. If a parallel hybrid branch times out or the request is cancelled, outstanding asyncio tasks are cancelled. Blocking library calls already executing in a worker thread cannot be force-killed by Python; the backend clients therefore still need their own transport/database timeouts.
+For HTTP `/search`, this becomes a `504` with the non-secret retrieval trace. If a parallel hybrid branch times out or the request is cancelled, outstanding asyncio tasks are cancelled. Blocking library calls already executing in a worker thread cannot be force-killed by Python; backend clients therefore still need their own transport/database timeouts.
 
 ## Trace contract
 
 Each returned chunk records `_retrieval` metadata with the evidence required to diagnose ranking changes:
 
 - dense/vector rank and raw score when present;
-- lexical rank and raw score when present;
+- lexical or native dense+sparse rank and raw score when present;
 - fusion score and fusion policy;
 - rerank score when enabled;
 - final score and final rank;
 - embedding model;
 - request-level stage timings and candidate counts.
 
+Dense+sparse traces additionally record `index_version_id`, dense and sparse representation contract IDs, dense embedding latency, sparse embedding latency, and native Qdrant search latency. These fields feed the durable #61 quality plane.
+
 `vector` remains a compatibility alias of the new `dense` trace source for existing workbench/evaluation consumers.
 
 ## Quality promotion rule
 
-The current adaptive `hybrid_rrf` plan remains the control. Sparse/multi-vector work is not promoted because it is technically newer or returns more candidates.
+The adaptive `hybrid_rrf` plan remains the control. `benchmarks.retrieval_plan_promotion` evaluates both plans on the same Golden Dataset and persists:
 
-Before promoting another plan, run the repository retrieval-quality/evaluation gates on the same corpus and compare at minimum:
+```text
+hybrid_rrf -> EvaluationRun(baseline)
+qdrant_dense_sparse -> EvaluationRun(candidate)
+                         |
+                         v
+                  PromotionDecision
+```
 
-- Recall@K / Hit@K;
-- MRR/NDCG where labels support it;
-- exact, paraphrase and cross-lingual slices;
-- p50/p95 end-to-end retrieval latency;
-- candidate counts and reranker cost;
-- citation/ACL correctness.
+The gate compares Recall@10, MRR@10, nDCG@10, p95 latency and cost. Missing required evidence rejects promotion. The runner does not activate an IndexVersion automatically; an accepted candidate may optionally be marked `ready`, after which the existing explicit activate/rollback operations remain the deployment boundary.
 
-A candidate plan should be rejected if quality regresses outside the agreed tolerance or if the latency/cost increase is not justified by quality gain.
+See [`DENSE_SPARSE_PROMOTION.md`](DENSE_SPARSE_PROMOTION.md) for configuration, build, evaluation, promotion and rollback details.
 
-## Phase-2 boundary
+## Phase-2 scope boundary
 
-Phase 1 fixes the async/composable control plane and the explicit experimental port. Remaining Issue #57 work includes:
-
-1. define the sparse encoder contract and immutable IndexVersion schema for named dense+sparse vectors;
-2. implement Qdrant native hybrid/prefetch without changing active-index semantics;
-3. evaluate sparse + dense and multi-vector representations against `hybrid_rrf`;
-4. add semantic MMR/diversity only if corpus evidence shows value over the lightweight optional duplicate suppression stage;
-5. persist the most useful stage latency/fusion evidence into the durable evaluation/trace plane tracked by #61.
+This phase intentionally implements only the dense+sparse candidate. ColBERT/late interaction, multi-query expansion and semantic MMR remain future experiments. They should be introduced one at a time only after this evidence pipeline proves that a new representation can be compared and promoted without changing multiple ranking variables at once.
