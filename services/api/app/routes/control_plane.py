@@ -18,6 +18,7 @@ from ..auth.principal import (
     require_admin,
     require_capability,
 )
+from ..storage.query_support import ensure_query_repository
 
 
 def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRouter:
@@ -40,38 +41,40 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
         source_type: Optional[str] = None,
         q: Optional[str] = None,
         limit: int = Query(default=100, ge=1, le=500),
+        cursor: Optional[str] = Query(default=None),
         _key: Optional[str] = Depends(auth_dep),
     ):
         require_capability(_key, CAP_CATALOG_READ)
         services = get_services()
+        repo = ensure_query_repository(services.repo)
         tenant_scope = _resolve_tenant_scope(_key, tenant_id)
-        sources = _scoped_sources(services.repo, tenant_scope)
-        jobs = _scoped_jobs(services.repo, tenant_scope)
-        by_source: dict[str, list] = {}
-        for job in jobs:
-            by_source.setdefault(job.source_id, []).append(job)
-        for items in by_source.values():
-            items.sort(key=_job_sort_key, reverse=True)
-
-        needle = (q or "").strip().lower()
-        result = []
-        for source in sources:
-            if source.status == "deleted":
-                continue
-            if status and source.status != status:
-                continue
-            if source_type and source.source_type != source_type:
-                continue
-            if needle and needle not in " ".join(
-                [source.name, source.source_id, source.tenant_id, source.source_type, *source.tags]
-            ).lower():
-                continue
-            source_jobs = by_source.get(source.source_id, [])
-            latest = source_jobs[0] if source_jobs else None
-            result.append(_source_catalog_item(source, latest, source_jobs))
-
-        result.sort(key=lambda item: (item["tenant_id"], item["name"].lower(), item["source_id"]))
-        return {"total": len(result), "sources": result[:limit]}
+        try:
+            page = repo.page_sources(
+                tenant_ids=tenant_scope,
+                status=status,
+                source_type=source_type,
+                q=q,
+                cursor=cursor,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        summaries = repo.source_job_summaries(source.source_id for source in page.items)
+        items = []
+        for source in page.items:
+            summary = summaries.get(source.source_id) or {}
+            items.append(
+                _source_catalog_item(
+                    source,
+                    summary.get("latest"),
+                    summary.get("latest_completed"),
+                )
+            )
+        return {
+            "total": page.total,
+            "next_cursor": page.next_cursor,
+            "sources": items,
+        }
 
     @router.get("/catalog/jobs")
     async def job_catalog(
@@ -79,18 +82,84 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
         source_id: Optional[str] = None,
         status: Optional[str] = None,
         limit: int = Query(default=100, ge=1, le=500),
+        cursor: Optional[str] = Query(default=None),
         _key: Optional[str] = Depends(auth_dep),
     ):
         require_capability(_key, CAP_CATALOG_READ)
         services = get_services()
+        repo = ensure_query_repository(services.repo)
         tenant_scope = _resolve_tenant_scope(_key, tenant_id)
-        jobs = _scoped_jobs(services.repo, tenant_scope)
-        if source_id:
-            jobs = [job for job in jobs if job.source_id == source_id]
-        if status:
-            jobs = [job for job in jobs if job.status == status]
-        jobs.sort(key=_job_sort_key, reverse=True)
-        return {"total": len(jobs), "jobs": [_job_item(job) for job in jobs[:limit]]}
+        try:
+            page = repo.page_jobs(
+                tenant_ids=tenant_scope,
+                source_id=source_id,
+                status=status,
+                cursor=cursor,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "total": page.total,
+            "next_cursor": page.next_cursor,
+            "jobs": [_job_item(job) for job in page.items],
+        }
+
+    @router.get("/catalog/documents")
+    async def document_catalog(
+        tenant_id: Optional[str] = None,
+        source_id: Optional[str] = None,
+        limit: int = Query(default=100, ge=1, le=500),
+        cursor: Optional[str] = Query(default=None),
+        _key: Optional[str] = Depends(auth_dep),
+    ):
+        require_capability(_key, CAP_CATALOG_READ)
+        services = get_services()
+        repo = ensure_query_repository(services.repo)
+        tenant_scope = _resolve_tenant_scope(_key, tenant_id)
+        try:
+            page = repo.page_documents(
+                tenant_ids=tenant_scope,
+                source_id=source_id,
+                cursor=cursor,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "total": page.total,
+            "next_cursor": page.next_cursor,
+            "documents": [asdict(document) for document in page.items],
+        }
+
+    @router.get("/catalog/generations")
+    async def generation_catalog(
+        tenant_id: Optional[str] = None,
+        source_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = Query(default=100, ge=1, le=500),
+        cursor: Optional[str] = Query(default=None),
+        _key: Optional[str] = Depends(auth_dep),
+    ):
+        require_capability(_key, CAP_CATALOG_READ)
+        services = get_services()
+        repo = ensure_query_repository(services.repo)
+        tenant_scope = _resolve_tenant_scope(_key, tenant_id)
+        try:
+            page = repo.page_generations(
+                tenant_ids=tenant_scope,
+                source_id=source_id,
+                status=status,
+                cursor=cursor,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "total": page.total,
+            "next_cursor": page.next_cursor,
+            "generations": [asdict(generation) for generation in page.items],
+        }
 
     @router.get("/catalog/session")
     async def catalog_session(_key: Optional[str] = Depends(auth_dep)):
@@ -119,7 +188,6 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
             "admin": principal.admin,
             "roles": roles,
             "tenant_ids": sorted(principal.tenant_ids),
-            # Backward-compatible summary used by the current admin UI.
             "capabilities": {
                 "read": CAP_CATALOG_READ in effective,
                 "operate": operate,
@@ -145,14 +213,22 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
             "next_sync_at": overview["sources"]["next_sync_at"],
         }
 
+    @router.get("/admin/database/metrics")
+    async def admin_database_metrics(_key: Optional[str] = Depends(auth_dep)):
+        require_admin(_key)
+        metrics = getattr(get_services().repo, "database_runtime_metrics", None)
+        if not callable(metrics):
+            raise HTTPException(
+                status_code=501,
+                detail="Configured repository does not expose database runtime metrics",
+            )
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            **metrics(),
+        }
+
     @router.get("/admin/cache", deprecated=True)
     async def retired_cache_status(_key: Optional[str] = Depends(auth_dep)):
-        """Compatibility tombstone for the retired process-local runtime cache.
-
-        This endpoint intentionally exposes no cache state and cannot enable or
-        clear caching. It exists only so pre-P2 clients get an explicit retired
-        signal instead of mistaking a transient 404 for a deployment problem.
-        """
         require_admin(_key)
         return {
             "enabled": False,
@@ -186,77 +262,49 @@ def create_control_plane_router(get_services: Callable, auth_dep: Any) -> APIRou
 
 def build_overview(repo, tenant_scope: Optional[set[str] | frozenset[str]]) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
-    sources = [source for source in _scoped_sources(repo, tenant_scope) if source.status != "deleted"]
-    jobs = _scoped_jobs(repo, tenant_scope)
-
-    by_status: dict[str, int] = {}
-    for job in jobs:
-        by_status[job.status] = by_status.get(job.status, 0) + 1
-
-    pending = [job for job in jobs if job.status == "pending"]
-    running = [job for job in jobs if job.status == "running"]
-    failed = [job for job in jobs if job.status == "failed"]
-    dead_lettered = [job for job in jobs if job.status == "dead_lettered"]
-    completed = [job for job in jobs if job.status == "completed"]
-    scheduled = [source for source in sources if source.sync_enabled]
-
+    bounded = ensure_query_repository(repo)
+    raw = bounded.control_plane_overview(tenant_scope)
+    sources = raw.get("sources") or {}
+    queue = raw.get("queue") or {}
+    oldest_pending_at = queue.get("oldest_pending_at")
     oldest_pending_age = 0.0
-    if pending:
-        ages = [max(0.0, (now - _parse_time(job.created_at or job.available_at)).total_seconds()) for job in pending]
-        oldest_pending_age = max(ages)
-
-    stale_running = sum(
-        1 for job in running
-        if job.lease_expires_at and _parse_time(job.lease_expires_at) <= now
-    )
-
-    completed_24h = sum(
-        1 for job in completed
-        if job.completed_at and (now - _parse_time(job.completed_at)).total_seconds() <= 86400
-    )
-    failed_24h = sum(
-        1 for job in failed
-        if job.completed_at and (now - _parse_time(job.completed_at)).total_seconds() <= 86400
-    )
-    dead_lettered_24h = sum(
-        1 for job in dead_lettered
-        if job.dead_lettered_at and (now - _parse_time(job.dead_lettered_at)).total_seconds() <= 86400
-    )
-
-    latest_completed_by_source = {}
-    for job in sorted(completed, key=_job_sort_key, reverse=True):
-        latest_completed_by_source.setdefault(job.source_id, job)
-    indexed_docs = sum(int(job.doc_count or 0) for job in latest_completed_by_source.values())
-    indexed_chunks = sum(
-        int((job.stats or {}).get("chunks_total", job.chunk_count or 0))
-        for job in latest_completed_by_source.values()
-    )
-
-    next_syncs = [_parse_time(source.sync_next_at) for source in scheduled if source.sync_next_at]
-    failures = sorted([*failed, *dead_lettered], key=_job_sort_key, reverse=True)
+    if oldest_pending_at:
+        oldest_pending_age = max(
+            0.0,
+            (now - _parse_time(oldest_pending_at)).total_seconds(),
+        )
+    by_status = {
+        key: int(queue.get(key, 0) or 0)
+        for key in ("pending", "running", "completed", "failed", "dead_lettered")
+        if int(queue.get(key, 0) or 0) > 0
+    }
+    knowledge = raw.get("knowledge") or {}
     return {
         "generated_at": now.isoformat(),
         "sources": {
-            "total": len(sources),
-            "active": sum(1 for source in sources if source.status == "active"),
-            "paused": sum(1 for source in sources if source.status == "paused"),
-            "scheduled": len(scheduled),
-            "next_sync_at": min(next_syncs).isoformat() if next_syncs else None,
+            "total": int(sources.get("total", 0) or 0),
+            "active": int(sources.get("active", 0) or 0),
+            "paused": int(sources.get("paused", 0) or 0),
+            "scheduled": int(sources.get("scheduled", 0) or 0),
+            "next_sync_at": _iso(sources.get("next_sync_at")),
         },
         "queue": {
             "by_status": by_status,
-            "pending": len(pending),
-            "running": len(running),
-            "failed": len(failed),
-            "dead_lettered": len(dead_lettered),
+            "pending": int(queue.get("pending", 0) or 0),
+            "running": int(queue.get("running", 0) or 0),
+            "failed": int(queue.get("failed", 0) or 0),
+            "dead_lettered": int(queue.get("dead_lettered", 0) or 0),
             "oldest_pending_age_seconds": round(oldest_pending_age, 3),
-            "stale_running_leases": stale_running,
-            "completed_24h": completed_24h,
-            "failed_24h": failed_24h,
-            "dead_lettered_24h": dead_lettered_24h,
+            "stale_running_leases": int(queue.get("stale_running", 0) or 0),
+            "completed_24h": int(queue.get("completed_24h", 0) or 0),
+            "failed_24h": int(queue.get("failed_24h", 0) or 0),
+            "dead_lettered_24h": int(queue.get("dead_lettered_24h", 0) or 0),
         },
-        "knowledge": {"documents": indexed_docs, "chunks": indexed_chunks},
-        "recent_failures": [_job_item(job) for job in failures[:10]],
+        "knowledge": {
+            "documents": int(knowledge.get("documents", 0) or 0),
+            "chunks": int(knowledge.get("chunks", 0) or 0),
+        },
+        "recent_failures": [_job_item(job) for job in raw.get("recent_failures") or []],
     }
 
 
@@ -268,22 +316,7 @@ def _resolve_tenant_scope(api_key: Optional[str], tenant_id: Optional[str]):
     return set(scope) if scope is not None else None
 
 
-def _scoped_sources(repo, tenant_scope):
-    sources = repo.list_sources()
-    if tenant_scope is None:
-        return sources
-    return [source for source in sources if source.tenant_id in tenant_scope]
-
-
-def _scoped_jobs(repo, tenant_scope):
-    jobs = repo.list_jobs()
-    if tenant_scope is None:
-        return jobs
-    return [job for job in jobs if job.tenant_id in tenant_scope]
-
-
-def _source_catalog_item(source, latest, jobs) -> dict[str, Any]:
-    latest_completed = next((job for job in jobs if job.status == "completed"), None)
+def _source_catalog_item(source, latest, latest_completed) -> dict[str, Any]:
     return {
         "source_id": source.source_id,
         "tenant_id": source.tenant_id,
@@ -321,7 +354,6 @@ def _job_item(job) -> dict[str, Any]:
 
 
 def _safe_location(source) -> Optional[str]:
-    """Return a useful location without exposing connector credentials/config."""
     config = source.config or {}
     if source.source_type == "web":
         value = config.get("url")
@@ -343,17 +375,6 @@ def _safe_location(source) -> Optional[str]:
         return f"confluence://{host}/{space}" if host and space else None
     value = config.get("path")
     return str(value) if value else None
-
-
-def _job_sort_key(job):
-    return (_time_sort_value(job.created_at), job.job_id)
-
-
-def _time_sort_value(value) -> float:
-    try:
-        return _parse_time(value).timestamp()
-    except Exception:
-        return 0.0
 
 
 def _parse_time(value) -> datetime:
