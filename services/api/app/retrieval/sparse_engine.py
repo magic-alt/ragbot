@@ -173,8 +173,8 @@ class SparseAwareRetrievalEngine(AsyncRetrievalEngine):
     def _resolve_index(self, request: RetrievalRequest):
         if self._sparse_encoder is None:
             raise UnsupportedRetrievalPlan(
-                "qdrant_dense_sparse requires a configured sparse encoder; "
-                "set RAGBOT_SPARSE_ENABLED=true and build a sparse IndexVersion"
+                "qdrant_dense_sparse requires named dense+sparse index capability and a configured "
+                "sparse encoder; set RAGBOT_SPARSE_ENABLED=true and build a sparse IndexVersion"
             )
         alias = getattr(self._sparse_vector_store, "alias_name", None)
         getter = getattr(self._sparse_repo, "get_index_version", None)
