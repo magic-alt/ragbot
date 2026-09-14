@@ -8,10 +8,18 @@ from ..reliability import safe_tool_call
 
 async def retrieve_node(state: AgentState, services: Any) -> AgentState:
     filters = _build_filters(state)
-    args = {"query": state.query, "top_k": 30, "filters": filters}
+    args = {"query": state.query, "top_k": 30, "filters": filters, "plan": "hybrid_rrf"}
     start_ms = now_ms()
     try:
-        chunks = await safe_tool_call("retrieve", services.retriever.retrieve, state.query, filters, top_k=30)
+        chunks = await safe_tool_call(
+            "retrieve",
+            services.retriever.aretrieve,
+            state.query,
+            filters,
+            top_k=30,
+            plan="hybrid_rrf",
+            deadline_ms=9500,
+        )
         if chunks:
             citations = [_chunk_to_citation(chunk) for chunk in chunks[:12]]
             text = _format_chunks(chunks, limit=12)
@@ -89,4 +97,3 @@ def _format_chunks(chunks: List[Any], limit: int = 12) -> str:
             continue
         parts.append(f"[{idx}] {text}")
     return " ".join(parts)
-
