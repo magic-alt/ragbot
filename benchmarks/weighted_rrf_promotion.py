@@ -539,6 +539,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-ndcg-drop", type=float, default=0.0)
     parser.add_argument("--max-p95-latency-increase-ratio", type=float, default=0.15)
     parser.add_argument("--max-cost-increase-ratio", type=float, default=0.25)
+    parser.add_argument("--min-recall", type=float)
+    parser.add_argument("--min-mrr", type=float)
+    parser.add_argument("--min-ndcg", type=float)
+    parser.add_argument("--critical-case", action="append", default=[])
     return parser.parse_args(argv)
 
 
@@ -568,6 +572,10 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
                 max_ndcg_drop=args.max_ndcg_drop,
                 max_p95_latency_increase_ratio=args.max_p95_latency_increase_ratio,
                 max_cost_increase_ratio=args.max_cost_increase_ratio,
+                min_recall=args.min_recall,
+                min_mrr=args.min_mrr,
+                min_ndcg=args.min_ndcg,
+                critical_case_ids=tuple(args.critical_case),
             ),
         )
     finally:

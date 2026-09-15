@@ -185,14 +185,46 @@ class PromotionPolicy:
     max_ndcg_drop: float = 0.0
     max_p95_latency_increase_ratio: float = 0.15
     max_cost_increase_ratio: float = 0.25
+    # Optional release-readiness gates. They are disabled by default so the
+    # established relative baseline-vs-candidate policy remains compatible.
+    min_recall: Optional[float] = None
+    min_mrr: Optional[float] = None
+    min_ndcg: Optional[float] = None
+    critical_case_ids: tuple[str, ...] = field(default_factory=tuple)
 
-    def as_dict(self) -> dict[str, float]:
+    def __post_init__(self) -> None:
+        for name in ("min_recall", "min_mrr", "min_ndcg"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            numeric = float(value)
+            if not 0.0 <= numeric <= 1.0:
+                raise ValueError(f"{name} must be in [0,1]")
+            object.__setattr__(self, name, numeric)
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in self.critical_case_ids or ():
+            case_id = str(raw).strip()
+            if not case_id:
+                raise ValueError("critical_case_ids must not contain blank IDs")
+            if case_id in seen:
+                continue
+            seen.add(case_id)
+            normalized.append(case_id)
+        object.__setattr__(self, "critical_case_ids", tuple(normalized))
+
+    def as_dict(self) -> dict[str, Any]:
         return {
             "max_recall_drop": float(self.max_recall_drop),
             "max_mrr_drop": float(self.max_mrr_drop),
             "max_ndcg_drop": float(self.max_ndcg_drop),
             "max_p95_latency_increase_ratio": float(self.max_p95_latency_increase_ratio),
             "max_cost_increase_ratio": float(self.max_cost_increase_ratio),
+            "min_recall": self.min_recall,
+            "min_mrr": self.min_mrr,
+            "min_ndcg": self.min_ndcg,
+            "critical_case_ids": list(self.critical_case_ids),
         }
 
 

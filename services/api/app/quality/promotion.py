@@ -71,6 +71,9 @@ def evaluate_promotion(
         zero_baseline_is_missing=False,
     )
 
+    _absolute_quality_gates(candidate, policy, reasons=reasons, deltas=deltas)
+    _critical_case_gate(candidate, policy, reasons=reasons, deltas=deltas)
+
     return PromotionDecision(
         promotion_decision_id=decision_id or new_promotion_decision_id(),
         baseline_evaluation_id=baseline.evaluation_run_id,
@@ -81,6 +84,110 @@ def evaluate_promotion(
         reasons=reasons,
         created_at=datetime.now(timezone.utc).isoformat(),
     )
+
+
+def _absolute_quality_gates(
+    candidate: EvaluationRun,
+    policy: PromotionPolicy,
+    *,
+    reasons: list[str],
+    deltas: dict[str, Any],
+) -> None:
+    configured = {
+        "recall": policy.min_recall,
+        "mrr": policy.min_mrr,
+        "ndcg": policy.min_ndcg,
+    }
+    if not any(value is not None for value in configured.values()):
+        return
+
+    evidence: dict[str, Any] = {}
+    for key, minimum in configured.items():
+        if minimum is None:
+            continue
+        candidate_value = _number(candidate.metrics.get(key))
+        passed = (
+            candidate_value is not None
+            and 0.0 <= candidate_value <= 1.0
+            and candidate_value >= float(minimum)
+        )
+        evidence[key] = {
+            "candidate": candidate_value,
+            "minimum": float(minimum),
+            "passed": passed,
+        }
+        if candidate_value is None:
+            reasons.append(f"missing candidate absolute quality metric: {key}")
+        elif not 0.0 <= candidate_value <= 1.0:
+            reasons.append(
+                f"invalid candidate absolute quality metric: {key}={candidate_value}; expected [0,1]"
+            )
+        elif candidate_value < float(minimum):
+            reasons.append(
+                f"{key} absolute floor {candidate_value:.6f} is below required {float(minimum):.6f}"
+            )
+    deltas["absolute_quality"] = evidence
+
+
+def _critical_case_gate(
+    candidate: EvaluationRun,
+    policy: PromotionPolicy,
+    *,
+    reasons: list[str],
+    deltas: dict[str, Any],
+) -> None:
+    required = list(policy.critical_case_ids)
+    if not required:
+        return
+
+    raw_cases = candidate.artifacts.get("cases")
+    case_items = raw_cases if isinstance(raw_cases, list) else []
+    by_id: dict[str, Mapping[str, Any]] = {}
+    duplicate_ids: set[str] = set()
+    for item in case_items:
+        if not isinstance(item, Mapping):
+            continue
+        case_id = str(item.get("case_id") or "").strip()
+        if not case_id:
+            continue
+        if case_id in by_id:
+            duplicate_ids.add(case_id)
+            continue
+        by_id[case_id] = item
+
+    passed: list[str] = []
+    failed: list[dict[str, Any]] = []
+    missing: list[str] = []
+    ambiguous: list[str] = []
+    for case_id in required:
+        if case_id in duplicate_ids:
+            ambiguous.append(case_id)
+            reasons.append(f"critical case evidence ambiguous: {case_id}")
+            continue
+        item = by_id.get(case_id)
+        if item is None:
+            missing.append(case_id)
+            reasons.append(f"critical case evidence missing: {case_id}")
+            continue
+        if item.get("retrieval_pass") is True:
+            passed.append(case_id)
+            continue
+        failure = {
+            "case_id": case_id,
+            "first_relevant_rank": item.get("first_relevant_rank"),
+        }
+        failed.append(failure)
+        reasons.append(
+            f"critical case failed: {case_id} rank={item.get('first_relevant_rank')}"
+        )
+
+    deltas["critical_cases"] = {
+        "required": required,
+        "passed": passed,
+        "failed": failed,
+        "missing": missing,
+        "ambiguous": ambiguous,
+    }
 
 
 def _quality_gate(
