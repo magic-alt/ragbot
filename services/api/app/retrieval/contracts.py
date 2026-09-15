@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -41,6 +43,59 @@ def resolve_retrieval_plan(
 
 
 @dataclass(frozen=True)
+class QdrantRrfFusionSpec:
+    """Immutable Qdrant RRF query contract for controlled hybrid experiments.
+
+    Prefetch order is dense first, sparse second, so weights follow the same
+    order. The default Qdrant RRF constant is k=2. This object belongs to the
+    retrieval experiment contract, not IndexVersion: changing weights does not
+    change stored vector representations and therefore never requires reindexing.
+    """
+
+    dense_weight: float = 1.0
+    sparse_weight: float = 1.0
+    k: int = 2
+    provider_id: str = "qdrant"
+    method: str = "rrf"
+
+    def __post_init__(self) -> None:
+        if float(self.dense_weight) <= 0 or float(self.sparse_weight) <= 0:
+            raise ValueError("RRF dense/sparse weights must be > 0")
+        if int(self.k) <= 0:
+            raise ValueError("RRF k must be > 0")
+        if self.provider_id != "qdrant" or self.method != "rrf":
+            raise ValueError("QdrantRrfFusionSpec requires provider_id=qdrant and method=rrf")
+
+    @property
+    def weights(self) -> tuple[float, float]:
+        return (float(self.dense_weight), float(self.sparse_weight))
+
+    @property
+    def contract_id(self) -> str:
+        canonical = json.dumps(self.as_dict(include_contract=False), sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+        return f"fusion-{digest}"
+
+    @property
+    def weighted(self) -> bool:
+        return self.weights != (1.0, 1.0)
+
+    def as_dict(self, *, include_contract: bool = True) -> Dict[str, Any]:
+        value: Dict[str, Any] = {
+            "provider_id": self.provider_id,
+            "method": self.method,
+            "k": int(self.k),
+            "dense_weight": float(self.dense_weight),
+            "sparse_weight": float(self.sparse_weight),
+            "weights": [float(self.dense_weight), float(self.sparse_weight)],
+            "prefetch_order": ["dense", "sparse"],
+        }
+        if include_contract:
+            value["contract_id"] = self.contract_id
+        return value
+
+
+@dataclass(frozen=True)
 class RetrievalRequest:
     query: str
     filters: Dict[str, Any]
@@ -54,6 +109,9 @@ class RetrievalRequest:
     # expose this field; it exists so a validating IndexVersion can be measured
     # before its Qdrant alias is activated.
     index_version_id: Optional[str] = None
+    # Internal fusion experiment contract. Public online callers continue to
+    # use the deployed/default fusion policy until evidence promotes a contract.
+    fusion_spec: Optional[QdrantRrfFusionSpec] = None
 
     def __post_init__(self) -> None:
         if not str(self.query).strip():
@@ -66,6 +124,8 @@ class RetrievalRequest:
             raise ValueError("RetrievalRequest.deadline_ms must be > 0 when set")
         if self.index_version_id is not None and not str(self.index_version_id).strip():
             raise ValueError("RetrievalRequest.index_version_id must not be empty when set")
+        if self.fusion_spec is not None and self.plan is not RetrievalPlan.QDRANT_DENSE_SPARSE:
+            raise ValueError("fusion_spec is currently supported only by qdrant_dense_sparse")
 
 
 @dataclass
