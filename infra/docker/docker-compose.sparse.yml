@@ -1,0 +1,40 @@
+# Sparse retrieval overlay for infra/docker/docker-compose.yml.
+# Run from repository root:
+#   docker compose --env-file .env.sparse.example \
+#     -f infra/docker/docker-compose.yml \
+#     -f infra/docker/docker-compose.sparse.yml up -d --build
+services:
+  api:
+    build:
+      args:
+        RAGBOT_INSTALL_SPARSE: "true"
+    environment:
+      RAGBOT_SPARSE_ENABLED: ${RAGBOT_SPARSE_ENABLED:-true}
+      RAGBOT_SPARSE_PROVIDER: ${RAGBOT_SPARSE_PROVIDER:-fastembed}
+      RAGBOT_SPARSE_MODEL: ${RAGBOT_SPARSE_MODEL:-Qdrant/bm25}
+      RAGBOT_SPARSE_REVISION: ${RAGBOT_SPARSE_REVISION:-}
+      RAGBOT_SPARSE_VECTOR_NAME: ${RAGBOT_SPARSE_VECTOR_NAME:-sparse}
+      RAGBOT_SPARSE_MODIFIER: ${RAGBOT_SPARSE_MODIFIER:-idf}
+      RAGBOT_SPARSE_TOKENIZER: ${RAGBOT_SPARSE_TOKENIZER:-}
+      RAGBOT_SPARSE_LANGUAGE: ${RAGBOT_SPARSE_LANGUAGE:-}
+      RAGBOT_SPARSE_BATCH_SIZE: ${RAGBOT_SPARSE_BATCH_SIZE:-32}
+
+  worker:
+    build:
+      args:
+        RAGBOT_INSTALL_SPARSE: "true"
+    environment:
+      RAGBOT_SPARSE_ENABLED: ${RAGBOT_SPARSE_ENABLED:-true}
+      RAGBOT_SPARSE_PROVIDER: ${RAGBOT_SPARSE_PROVIDER:-fastembed}
+      RAGBOT_SPARSE_MODEL: ${RAGBOT_SPARSE_MODEL:-Qdrant/bm25}
+      RAGBOT_SPARSE_REVISION: ${RAGBOT_SPARSE_REVISION:-}
+      RAGBOT_SPARSE_VECTOR_NAME: ${RAGBOT_SPARSE_VECTOR_NAME:-sparse}
+      RAGBOT_SPARSE_MODIFIER: ${RAGBOT_SPARSE_MODIFIER:-idf}
+      RAGBOT_SPARSE_TOKENIZER: ${RAGBOT_SPARSE_TOKENIZER:-}
+      RAGBOT_SPARSE_LANGUAGE: ${RAGBOT_SPARSE_LANGUAGE:-}
+      RAGBOT_SPARSE_BATCH_SIZE: ${RAGBOT_SPARSE_BATCH_SIZE:-32}
+
+  migrate:
+    build:
+      args:
+        RAGBOT_INSTALL_SPARSE: "true"
