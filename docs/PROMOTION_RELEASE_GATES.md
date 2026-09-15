@@ -28,7 +28,7 @@ When enabled:
 - the candidate metric must exist, be normalized, and meet the configured minimum;
 - every critical case ID must exist in `EvaluationRun.artifacts.cases`;
 - every critical case must have `retrieval_pass == true`;
-- missing case evidence fails closed.
+- missing or duplicate critical-case evidence fails closed.
 
 The release gates supplement rather than replace the existing relative regression and latency/cost gates.
 
@@ -68,6 +68,8 @@ python -m benchmarks.retrieval_plan_promotion \
 ```
 
 `--critical-case` is repeatable.
+
+The same fields are available through the admin quality promotion API. API input trims and de-duplicates critical IDs and rejects blank IDs at request validation time before `PromotionPolicy` is constructed.
 
 ## Safety boundary
 
