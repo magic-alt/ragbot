@@ -1,5 +1,7 @@
 FROM python:3.12-slim AS base
 
+ARG RAGBOT_INSTALL_SPARSE=false
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
@@ -11,7 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && if [ "$RAGBOT_INSTALL_SPARSE" = "true" ]; then \
+         pip install --no-cache-dir "fastembed>=0.7"; \
+       fi
 
 COPY contracts/ contracts/
 COPY services/ services/
