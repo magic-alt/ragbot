@@ -111,6 +111,23 @@ class SparseAwareRetrievalEngine(AsyncRetrievalEngine):
                 "qdrant_dense_sparse requires a Qdrant backend exposing native_hybrid_search()"
             )
         fusion_spec = request.fusion_spec
+        native_kwargs = {
+            "collection_name": version.physical_collection,
+            "dense_name": dense_name,
+            "sparse_name": sparse_name,
+            "prefetch_limit": max(pool_size, pool_size * 4),
+        }
+        # Keep the Phase-2 backend seam byte-for-byte compatible when no
+        # explicit fusion experiment is selected. Third-party/fake backends
+        # written against the original native_hybrid_search signature therefore
+        # never receive new weighted-RRF keyword arguments unless requested.
+        if fusion_spec is not None:
+            native_kwargs.update(
+                {
+                    "rrf_weights": fusion_spec.weights,
+                    "rrf_k": fusion_spec.k,
+                }
+            )
         hits = await _await_stage(
             "qdrant_dense_sparse.search",
             _run_blocking(
@@ -120,12 +137,7 @@ class SparseAwareRetrievalEngine(AsyncRetrievalEngine):
                 sparse,
                 request.filters,
                 pool_size,
-                collection_name=version.physical_collection,
-                dense_name=dense_name,
-                sparse_name=sparse_name,
-                prefetch_limit=max(pool_size, pool_size * 4),
-                rrf_weights=(fusion_spec.weights if fusion_spec is not None else None),
-                rrf_k=(fusion_spec.k if fusion_spec is not None else None),
+                **native_kwargs,
             ),
             budget=budget,
             trace=trace,
