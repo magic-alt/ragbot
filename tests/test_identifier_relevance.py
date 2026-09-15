@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from benchmarks.identifier_relevance import canonicalize_identifier, identifier_matches
+from benchmarks.promotion_evidence import audit_promotion_relevance_scope
 from benchmarks.rag_native_compare import RetrievedHit, _match_relevance
 from scripts.rag_eval import _chunk_relevant
 
@@ -73,3 +74,23 @@ def test_any_terms_semantics_remain_literal_and_are_not_identifier_canonicalized
     }
     assert _match_relevance(hit, case) is False
     assert _chunk_relevant(chunk, case) is False
+
+
+def test_identifier_promotion_evidence_requires_single_document_scope() -> None:
+    case = {
+        "id": "identifier-deepseek-v3",
+        "query": "DeepSeek-V3",
+        "relevance": {"identifiers": ["DeepSeek-V3"]},
+    }
+    unscoped = audit_promotion_relevance_scope({"cases": [case]})
+    assert unscoped["promotion_eligible"] is False
+    assert unscoped["ambiguous_cases"] == ["identifier-deepseek-v3"]
+
+    scoped = audit_promotion_relevance_scope(
+        {
+            "defaults": {"filters": {"doc_ids": ["deepseek.pdf"]}},
+            "cases": [case],
+        }
+    )
+    assert scoped["promotion_eligible"] is True
+    assert scoped["single_document_heuristic_cases"] == 1
