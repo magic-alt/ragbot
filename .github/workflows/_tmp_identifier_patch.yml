@@ -17,98 +17,25 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: fix/issue-57-identifier-canonicalization
-      - name: Apply identifier relevance patch
+      - name: Preserve standalone rag_eval execution
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
 
-          path = Path('benchmarks/rag_native_compare.py')
-          text = path.read_text(encoding='utf-8')
-          text = text.replace(
-              'from services.api.app.retrieval.embedder import HashEmbedder, build_embedder\n',
-              'from benchmarks.identifier_relevance import any_identifier_matches\nfrom services.api.app.retrieval.embedder import HashEmbedder, build_embedder\n',
-              1,
-          )
-          text = text.replace(
-              '            "all_terms",\n            "any_terms",\n',
-              '            "all_terms",\n            "any_terms",\n            "identifiers",\n',
-              1,
-          )
-          anchor = '''    path_needles = [_norm(v) for v in _as_list(rel.get("path_contains")) if v]\n    if path_needles and not any(needle in _norm(hit.path) for needle in path_needles):\n        return False\n\n'''
-          addition = anchor + '''    identifiers = [v for v in _as_list(rel.get("identifiers")) if v]\n    if identifiers and not any_identifier_matches(hit.text, identifiers):\n        return False\n\n'''
-          if anchor not in text:
-              raise SystemExit('rag_native_compare path anchor not found')
-          text = text.replace(anchor, addition, 1)
-          text = text.replace(
-              '    return bool(expected_chunk_ids or doc_ids or pages or path_needles or all_terms or any_terms)\n',
-              '    return bool(expected_chunk_ids or doc_ids or pages or path_needles or identifiers or all_terms or any_terms)\n',
-              1,
-          )
-          text = text.replace(
-              '    if rel.get("all_terms") or rel.get("any_terms"):\n        return 1\n',
-              '    if rel.get("identifiers") or rel.get("all_terms") or rel.get("any_terms"):\n        return 1\n',
-              1,
-          )
-          path.write_text(text, encoding='utf-8')
-
           path = Path('scripts/rag_eval.py')
           text = path.read_text(encoding='utf-8')
-          text = text.replace(
-              'from typing import Any, Dict, Iterable, List, Optional, Sequence\n\n',
-              'from typing import Any, Dict, Iterable, List, Optional, Sequence\n\nfrom benchmarks.identifier_relevance import any_identifier_matches\n\n',
-              1,
-          )
-          text = text.replace(
-              '        rel.get("all_terms"),\n        rel.get("any_terms"),\n',
-              '        rel.get("all_terms"),\n        rel.get("any_terms"),\n        rel.get("identifiers"),\n',
-              1,
-          )
-          anchor = '''    path_needles = [_norm_text(v) for v in rel.get("path_contains") or []]\n    if path_needles:\n        path = _norm_text(metadata.get("path") or metadata.get("url"))\n        if not any(needle in path for needle in path_needles):\n            return False\n\n'''
-          addition = anchor + '''    identifiers = [v for v in rel.get("identifiers") or [] if v]\n    if identifiers and not any_identifier_matches(chunk.get("text"), identifiers):\n        return False\n\n'''
-          if anchor not in text:
-              raise SystemExit('rag_eval path anchor not found')
-          text = text.replace(anchor, addition, 1)
-          text = text.replace(
-              '    return bool(doc_ids or pages or path_needles or all_terms or any_terms)\n',
-              '    return bool(doc_ids or pages or path_needles or identifiers or all_terms or any_terms)\n',
-              1,
-          )
-          path.write_text(text, encoding='utf-8')
-
-          path = Path('benchmarks/promotion_evidence.py')
-          text = path.read_text(encoding='utf-8')
-          text = text.replace(
-              '            rel.get("pages")\n            or rel.get("path_contains")\n',
-              '            rel.get("pages")\n            or rel.get("identifiers")\n            or rel.get("path_contains")\n',
-              1,
-          )
-          text = text.replace(
-              '            + ". Term/path/page labels require defaults.filters.doc_ids or "\n',
-              '            + ". Identifier/term/path/page labels require defaults.filters.doc_ids or "\n',
-              1,
-          )
-          path.write_text(text, encoding='utf-8')
-
-          path = Path('eval/datasets/deepseek_in_action_retrieval_v2.json')
-          text = path.read_text(encoding='utf-8')
-          text = text.replace(
-              '"relevance": {"max_rank": 5, "any_terms": ["deepseek-v3"]}',
-              '"relevance": {"max_rank": 5, "identifiers": ["DeepSeek-V3"]}',
-              1,
-          )
-          text = text.replace(
-              '"relevance": {"max_rank": 5, "any_terms": ["fp8"]}',
-              '"relevance": {"max_rank": 5, "identifiers": ["FP8"]}',
-              1,
-          )
-          path.write_text(text, encoding='utf-8')
+          old = '''from benchmarks.identifier_relevance import any_identifier_matches\n\nROOT = Path(__file__).resolve().parents[1]\n'''
+          new = '''ROOT = Path(__file__).resolve().parents[1]\nif str(ROOT) not in sys.path:\n    sys.path.insert(0, str(ROOT))\n\nfrom benchmarks.identifier_relevance import any_identifier_matches\n'''
+          if old not in text:
+              raise SystemExit('rag_eval identifier import anchor not found')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
           PY
+          python scripts/rag_eval.py --help >/dev/null
           python -m pip install --quiet -e ".[dev]"
-          python -m compileall -q benchmarks scripts
           python -m pytest -q tests/test_identifier_relevance.py tests/test_rag_native_compare_benchmark.py
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add benchmarks/rag_native_compare.py scripts/rag_eval.py benchmarks/promotion_evidence.py eval/datasets/deepseek_in_action_retrieval_v2.json
-          git commit -m "fix: canonicalize explicit identifier relevance"
+          git add scripts/rag_eval.py
+          git commit -m "fix: preserve standalone rag eval imports"
           git push origin HEAD:fix/issue-57-identifier-canonicalization
