@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .qdrant import _build_qdrant_filter, _distance
 from .sparse import SparseEncoder, SparseVector
@@ -260,11 +260,29 @@ class QdrantHybridAdapter:
         dense_name: str = "dense",
         sparse_name: str = "sparse",
         prefetch_limit: Optional[int] = None,
+        rrf_weights: Optional[Sequence[float]] = None,
+        rrf_k: Optional[int] = None,
     ) -> List[Tuple[str, float, Dict[str, Any]]]:
         rest = self._delegate._rest
         target = collection_name or self.collection_name
         qfilter = _build_qdrant_filter(filters, rest)
         prefetch = max(int(top_k), int(prefetch_limit or max(top_k, top_k * 4)))
+        if rrf_weights is not None:
+            weights = [float(value) for value in rrf_weights]
+            if len(weights) != 2:
+                raise ValueError("Qdrant dense+sparse RRF requires exactly two weights")
+            if any(value <= 0 for value in weights):
+                raise ValueError("Qdrant RRF weights must be > 0")
+            query = rest.RrfQuery(
+                rrf=rest.Rrf(k=int(rrf_k or 2), weights=weights)
+            )
+        elif rrf_k is not None and int(rrf_k) != 2:
+            query = rest.RrfQuery(rrf=rest.Rrf(k=int(rrf_k)))
+        else:
+            # Preserve the Phase-2 equal/default RRF request shape when no
+            # explicit fusion experiment contract is selected.
+            query = rest.FusionQuery(fusion=rest.Fusion.RRF)
+
         # Put the eligibility filter on each prefetch branch. This guarantees
         # the dense and sparse candidate budgets are spent only on tenant/ACL-
         # eligible points before RRF fusion, rather than retrieving ineligible
@@ -288,7 +306,7 @@ class QdrantHybridAdapter:
                     limit=prefetch,
                 ),
             ],
-            query=rest.FusionQuery(fusion=rest.Fusion.RRF),
+            query=query,
             limit=int(top_k),
             with_payload=True,
             with_vectors=False,
