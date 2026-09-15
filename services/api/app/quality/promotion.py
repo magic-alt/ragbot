@@ -21,7 +21,9 @@ def evaluate_promotion(
     """Compare machine-readable evaluation evidence against regression limits.
 
     Missing metrics are treated as gate failures rather than silently promoted.
-    This keeps new retrieval/index plans opt-in until evidence is complete.
+    Quality metrics outside their normalized [0, 1] domain are also rejected:
+    they indicate invalid evaluation evidence (for example, an unbounded
+    relevance universe that produced nDCG > 1), not candidate quality.
     """
 
     reasons: list[str] = []
@@ -96,8 +98,19 @@ def _quality_gate(
         reasons.append(f"missing required quality metric: {key}")
         deltas[key] = {"baseline": base, "candidate": cand, "delta": None}
         return
+    if not 0.0 <= base <= 1.0 or not 0.0 <= cand <= 1.0:
+        reasons.append(
+            f"invalid quality metric range: {key} baseline={base} candidate={cand}; expected [0,1]"
+        )
+        deltas[key] = {
+            "baseline": base,
+            "candidate": cand,
+            "delta": None,
+            "valid": False,
+        }
+        return
     delta = cand - base
-    deltas[key] = {"baseline": base, "candidate": cand, "delta": delta}
+    deltas[key] = {"baseline": base, "candidate": cand, "delta": delta, "valid": True}
     if delta < -abs(float(max_drop)):
         reasons.append(
             f"{key} regression {delta:.6f} exceeds allowed drop {abs(float(max_drop)):.6f}"
