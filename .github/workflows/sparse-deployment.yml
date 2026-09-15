@@ -1,0 +1,104 @@
+name: Sparse Deployment Gate
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - "infra/docker/Dockerfile"
+      - "docker-compose.sparse.yml"
+      - "infra/docker/docker-compose.sparse.yml"
+      - ".env.sparse.example"
+      - ".github/workflows/sparse-deployment.yml"
+      - "services/api/app/retrieval/sparse.py"
+      - "pyproject.toml"
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "infra/docker/Dockerfile"
+      - "docker-compose.sparse.yml"
+      - "infra/docker/docker-compose.sparse.yml"
+      - ".env.sparse.example"
+      - ".github/workflows/sparse-deployment.yml"
+      - "services/api/app/retrieval/sparse.py"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  sparse-container-and-compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Render root sparse Compose
+        run: |
+          docker compose --env-file .env.sparse.example \
+            -f docker-compose.yml -f docker-compose.sparse.yml \
+            config --format json > /tmp/root-sparse.json
+
+      - name: Render infra sparse Compose
+        run: |
+          docker compose --env-file .env.sparse.example \
+            -f infra/docker/docker-compose.yml \
+            -f infra/docker/docker-compose.sparse.yml \
+            config --format json > /tmp/infra-sparse.json
+
+      - name: Verify API and worker share one sparse contract
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          keys = [
+              "RAGBOT_SPARSE_ENABLED",
+              "RAGBOT_SPARSE_PROVIDER",
+              "RAGBOT_SPARSE_MODEL",
+              "RAGBOT_SPARSE_REVISION",
+              "RAGBOT_SPARSE_VECTOR_NAME",
+              "RAGBOT_SPARSE_MODIFIER",
+              "RAGBOT_SPARSE_TOKENIZER",
+              "RAGBOT_SPARSE_LANGUAGE",
+              "RAGBOT_SPARSE_BATCH_SIZE",
+          ]
+          for filename in ("/tmp/root-sparse.json", "/tmp/infra-sparse.json"):
+              data = json.loads(Path(filename).read_text())
+              services = data["services"]
+              api = services["api"]["environment"]
+              worker = services["worker"]["environment"]
+              assert api["RAGBOT_SPARSE_ENABLED"] in ("true", True)
+              for key in keys:
+                  assert api.get(key) == worker.get(key), (filename, key, api.get(key), worker.get(key))
+              for service_name in ("api", "worker", "migrate"):
+                  args = services[service_name]["build"].get("args") or {}
+                  assert str(args.get("RAGBOT_INSTALL_SPARSE")).lower() == "true", (filename, service_name, args)
+          PY
+
+      - name: Build sparse production image
+        run: |
+          docker build --build-arg RAGBOT_INSTALL_SPARSE=true -t ragbot:sparse-ci .
+
+      - name: Verify FastEmbed and sparse contract inside image
+        run: |
+          docker run --rm \
+            -e RAGBOT_SPARSE_ENABLED=true \
+            -e RAGBOT_SPARSE_PROVIDER=fastembed \
+            -e RAGBOT_SPARSE_MODEL=Qdrant/bm25 \
+            -e RAGBOT_SPARSE_VECTOR_NAME=sparse \
+            -e RAGBOT_SPARSE_MODIFIER=idf \
+            --entrypoint python ragbot:sparse-ci - <<'PY'
+          import fastembed
+          from services.api.app.retrieval.sparse import build_sparse_encoder_from_env
+
+          encoder = build_sparse_encoder_from_env()
+          assert encoder is not None
+          assert encoder.model_name == "Qdrant/bm25"
+          assert encoder.spec.vector_name == "sparse"
+          assert encoder.spec.modifier == "idf"
+          assert encoder.contract_id.startswith("sparse-")
+          print("fastembed", getattr(fastembed, "__version__", "unknown"))
+          print("contract", encoder.contract_id)
+          PY
