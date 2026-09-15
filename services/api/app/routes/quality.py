@@ -34,6 +34,10 @@ class PromotionPolicyRequest(BaseModel):
     max_ndcg_drop: float = Field(default=0.0, ge=0.0)
     max_p95_latency_increase_ratio: float = Field(default=0.15, ge=0.0)
     max_cost_increase_ratio: float = Field(default=0.25, ge=0.0)
+    min_recall: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    min_mrr: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    min_ndcg: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    critical_case_ids: list[str] = Field(default_factory=list)
 
 
 class PromotionRequest(BaseModel):
