@@ -104,6 +104,7 @@ jobs:
           )
           path.write_text(text, encoding='utf-8')
           PY
+          python -m pip install --quiet -e ".[dev]"
           python -m compileall -q benchmarks scripts
           python -m pytest -q tests/test_identifier_relevance.py tests/test_rag_native_compare_benchmark.py
           git config user.name github-actions[bot]
