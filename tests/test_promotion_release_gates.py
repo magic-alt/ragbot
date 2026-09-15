@@ -116,6 +116,30 @@ def test_missing_critical_case_evidence_fails_closed() -> None:
     assert decision.deltas["critical_cases"]["missing"] == ["must-exist"]
 
 
+def test_duplicate_critical_case_evidence_fails_closed() -> None:
+    baseline, _ = _real_experiment_pair(identifier_pass=True)
+    duplicate = {
+        "case_id": "identifier-deepseek-v3",
+        "retrieval_pass": True,
+        "first_relevant_rank": 1,
+    }
+    candidate = _evaluation(
+        "candidate",
+        recall=0.95,
+        mrr=0.95,
+        ndcg=0.95,
+        cases=[duplicate, dict(duplicate)],
+    )
+    decision = evaluate_promotion(
+        baseline,
+        candidate,
+        PromotionPolicy(critical_case_ids=("identifier-deepseek-v3",)),
+    )
+    assert decision.decision == "reject"
+    assert "critical case evidence ambiguous: identifier-deepseek-v3" in decision.reasons
+    assert decision.deltas["critical_cases"]["ambiguous"] == ["identifier-deepseek-v3"]
+
+
 def test_release_gates_accept_when_absolute_and_critical_requirements_pass() -> None:
     baseline, candidate = _real_experiment_pair(identifier_pass=True)
     decision = evaluate_promotion(
