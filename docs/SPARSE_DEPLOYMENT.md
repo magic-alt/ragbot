@@ -58,4 +58,6 @@ sparse-capable image
   -> rollback if required
 ```
 
+Before `mark-ready`, the Golden Dataset must also pass the promotion evidence-integrity rules in `docs/PROMOTION_EVIDENCE_INTEGRITY.md`; an unscoped heuristic relevance report is diagnostic only and cannot authorize activation.
+
 The default `docker-compose.yml` continues to build without FastEmbed unless the sparse overlay/build argument is selected.
