@@ -30,9 +30,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from benchmarks.identifier_relevance import any_identifier_matches
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from benchmarks.identifier_relevance import any_identifier_matches
 STATE_FILE = ROOT / "tmp" / "ragbot-runtime.json"
 DEFAULT_SERVER = "http://127.0.0.1:8000"
 DEFAULT_REPORT_DIR = ROOT / "reports" / "rag-eval"
