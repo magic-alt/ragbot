@@ -1,0 +1,232 @@
+name: Temporary evaluation evidence patch
+
+on:
+  push:
+    branches:
+      - fix/issue-57-evaluation-evidence
+    paths:
+      - .github/workflows/_tmp_patch_evaluation.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/issue-57-evaluation-evidence
+      - name: Apply evaluation evidence correctness patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('benchmarks/rag_native_compare.py')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace('    ndcg_at_10: float\n', '    ndcg_at_10: Optional[float]\n', 1)
+
+          old = '''def _known_relevant_total(case: Mapping[str, Any]) -> Optional[int]:
+              rel = case.get("relevance") or {}
+              if not isinstance(rel, Mapping):
+                  return None
+              for key in ("expected_chunk_ids", "pages", "doc_ids", "path_contains"):
+                  values = [str(v) for v in _as_list(rel.get(key)) if v is not None and str(v)]
+                  if values:
+                      return len(set(values))
+              if rel.get("all_terms") or rel.get("any_terms"):
+                  return 1
+              return None
+          '''
+          old = old.replace('          ', '')
+          new = '''def _single_document_scope(filters: Optional[Mapping[str, Any]]) -> bool:
+              if not isinstance(filters, Mapping):
+                  return False
+              doc_ids = [str(v) for v in _as_list(filters.get("doc_ids")) if str(v)]
+              return len(set(doc_ids)) == 1
+
+
+def _known_relevant_total(
+    case: Mapping[str, Any],
+    *,
+    filters: Optional[Mapping[str, Any]] = None,
+) -> Optional[int]:
+    rel = case.get("relevance") or {}
+    if not isinstance(rel, Mapping):
+        return None
+    explicit_total = rel.get("relevant_total")
+    if explicit_total is not None:
+        value = int(explicit_total)
+        if value <= 0:
+            raise ValueError("relevance.relevant_total must be > 0")
+        return value
+    expected_chunk_ids = [str(v) for v in _as_list(rel.get("expected_chunk_ids")) if str(v)]
+    if expected_chunk_ids:
+        return len(set(expected_chunk_ids))
+    doc_ids = [str(v) for v in _as_list(rel.get("doc_ids")) if str(v)]
+    if doc_ids:
+        return len(set(doc_ids))
+    pages = [str(v) for v in _as_list(rel.get("pages")) if v is not None and str(v)]
+    if pages and _single_document_scope(filters):
+        return len(set(pages))
+    # Term/path labels identify matching evidence but do not define the complete
+    # relevance universe. They are only countable when the query is explicitly
+    # scoped to one document; otherwise Recall/nDCG must remain unavailable.
+    if (
+        rel.get("all_terms")
+        or rel.get("any_terms")
+        or rel.get("path_contains")
+    ) and _single_document_scope(filters):
+        return 1
+    return None
+'''
+          if old not in text:
+              raise SystemExit('known relevant total block not found')
+          text = text.replace(old, new, 1)
+
+          text = text.replace(
+              'def score_case(case: Mapping[str, Any], hits: Sequence[RetrievedHit]) -> CaseScore:\n',
+              'def score_case(\n    case: Mapping[str, Any],\n    hits: Sequence[RetrievedHit],\n    *,\n    filters: Optional[Mapping[str, Any]] = None,\n) -> CaseScore:\n',
+              1,
+          )
+          text = text.replace(
+              '    total = _known_relevant_total(case)\n    ideal_count = min(total or 1, 10)\n    idcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, ideal_count + 1))\n    recall = min(1.0, len(relevant_entities) / total) if total else None\n',
+              '    total = _known_relevant_total(case, filters=filters)\n    if total is not None:\n        ideal_count = min(total, 10)\n        idcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, ideal_count + 1))\n        ndcg = dcg / idcg if idcg else 0.0\n        if not 0.0 <= ndcg <= 1.0 + 1e-12:\n            raise ValueError(\n                f"Invalid nDCG relevance universe for case={case.get(\'id\')}: {ndcg}"\n            )\n        ndcg = min(1.0, ndcg)\n        recall = min(1.0, len(relevant_entities) / total)\n    else:\n        ndcg = None\n        recall = None\n',
+              1,
+          )
+          text = text.replace(
+              '        ndcg_at_10=(dcg / idcg if idcg else 0.0),\n',
+              '        ndcg_at_10=ndcg,\n',
+              1,
+          )
+          text = text.replace(
+              '    recalls = [score.recall_at_10 for score in scores if score.recall_at_10 is not None]\n',
+              '    recalls = [score.recall_at_10 for score in scores if score.recall_at_10 is not None]\n    ndcgs = [score.ndcg_at_10 for score in scores if score.ndcg_at_10 is not None]\n',
+              1,
+          )
+          text = text.replace(
+              '        categories[category] = {\n            "cases": len(items),\n            "hit_at_5": round(sum(1 for item in items if item.first_relevant_rank and item.first_relevant_rank <= 5) / len(items), 4),\n            "mrr_at_10": round(statistics.fmean(item.reciprocal_rank_at_10 for item in items), 4),\n            "ndcg_at_10": round(statistics.fmean(item.ndcg_at_10 for item in items), 4),\n        }\n',
+              '        category_ndcgs = [item.ndcg_at_10 for item in items if item.ndcg_at_10 is not None]\n        categories[category] = {\n            "cases": len(items),\n            "hit_at_5": round(sum(1 for item in items if item.first_relevant_rank and item.first_relevant_rank <= 5) / len(items), 4),\n            "mrr_at_10": round(statistics.fmean(item.reciprocal_rank_at_10 for item in items), 4),\n            "ndcg_at_10": round(statistics.fmean(category_ndcgs), 4) if category_ndcgs else None,\n        }\n',
+              1,
+          )
+          text = text.replace(
+              '        "ndcg_at_10": round(statistics.fmean(score.ndcg_at_10 for score in scores), 4),\n',
+              '        "ndcg_at_10": round(statistics.fmean(ndcgs), 4) if ndcgs else None,\n        "promotion_metric_coverage": {\n            "recall_cases": len(recalls),\n            "ndcg_cases": len(ndcgs),\n            "total_cases": len(scores),\n        },\n',
+              1,
+          )
+          path.write_text(text, encoding='utf-8')
+
+          path = Path('benchmarks/retrieval_plan_promotion.py')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace(
+              '    if not cases:\n        raise ValueError("Golden Dataset requires labeled cases")\n',
+              '    if not cases:\n        raise ValueError("Golden Dataset requires labeled cases")\n    scope_audit = _assert_promotion_relevance_scope(dataset, cases)\n',
+              1,
+          )
+          text = text.replace(
+              '        score = score_case(case, first_hits or [])\n',
+              '        score = score_case(case, first_hits or [], filters=filters)\n',
+              1,
+          )
+          text = text.replace(
+              '        "controlled_dense_embedding_contract_id": active.embedding_contract_id,\n',
+              '        "controlled_dense_embedding_contract_id": active.embedding_contract_id,\n        "promotion_relevance_scope": scope_audit,\n',
+              1,
+          )
+          anchor = '''def _filters(
+    dataset: Mapping[str, Any],
+    case: Mapping[str, Any],
+    tenant_id: str,
+) -> dict[str, Any]:
+'''
+          helper = '''def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _assert_promotion_relevance_scope(
+    dataset: Mapping[str, Any],
+    cases: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    ambiguous: list[str] = []
+    scoped_heuristic: list[str] = []
+    explicit: list[str] = []
+    for case in cases:
+        rel = case.get("relevance") or {}
+        if not isinstance(rel, Mapping):
+            ambiguous.append(str(case.get("id") or "<unknown>"))
+            continue
+        if rel.get("relevant_total") is not None:
+            if int(rel["relevant_total"]) <= 0:
+                raise ValueError("relevance.relevant_total must be > 0")
+            explicit.append(str(case.get("id") or "<unknown>"))
+            continue
+        if rel.get("expected_chunk_ids") or rel.get("doc_ids"):
+            explicit.append(str(case.get("id") or "<unknown>"))
+            continue
+        filters = _filters(dataset, case, "__promotion_scope__")
+        doc_ids = [str(v) for v in _as_list(filters.get("doc_ids")) if str(v)]
+        single_doc = len(set(doc_ids)) == 1
+        heuristic = bool(
+            rel.get("all_terms")
+            or rel.get("any_terms")
+            or rel.get("path_contains")
+            or rel.get("pages")
+        )
+        if heuristic and single_doc:
+            scoped_heuristic.append(str(case.get("id") or "<unknown>"))
+            continue
+        ambiguous.append(str(case.get("id") or "<unknown>"))
+    if ambiguous:
+        raise ValueError(
+            "Promotion-ineligible Golden Dataset: relevance universe is ambiguous for cases="
+            + ",".join(ambiguous)
+            + ". Term/path/page labels require defaults.filters.doc_ids or case.filters.doc_ids "
+            "scoped to exactly one document, or relevance.relevant_total / explicit doc_ids/chunk_ids."
+        )
+    return {
+        "promotion_eligible": True,
+        "explicit_cases": len(explicit),
+        "single_document_heuristic_cases": len(scoped_heuristic),
+        "ambiguous_cases": 0,
+    }
+
+
+'''
+          if anchor not in text:
+              raise SystemExit('filters anchor not found')
+          text = text.replace(anchor, helper + anchor, 1)
+          path.write_text(text, encoding='utf-8')
+
+          path = Path('services/api/app/quality/promotion.py')
+          text = path.read_text(encoding='utf-8')
+          needle = '''    if base is None or cand is None:
+        reasons.append(f"missing required quality metric: {key}")
+        deltas[key] = {"baseline": base, "candidate": cand, "delta": None}
+        return
+'''
+          replacement = '''    if base is None or cand is None:
+        reasons.append(f"missing required quality metric: {key}")
+        deltas[key] = {"baseline": base, "candidate": cand, "delta": None}
+        return
+    if not 0.0 <= base <= 1.0 or not 0.0 <= cand <= 1.0:
+        reasons.append(
+            f"invalid quality metric range: {key} baseline={base} candidate={cand}; expected [0,1]"
+        )
+        deltas[key] = {"baseline": base, "candidate": cand, "delta": None, "valid": False}
+        return
+'''
+          if needle not in text:
+              raise SystemExit('quality gate block not found')
+          text = text.replace(needle, replacement, 1)
+          path.write_text(text, encoding='utf-8')
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmarks/rag_native_compare.py benchmarks/retrieval_plan_promotion.py services/api/app/quality/promotion.py
+          git commit -m "fix: fail closed on ambiguous retrieval evidence"
+          git push origin HEAD:fix/issue-57-evaluation-evidence
