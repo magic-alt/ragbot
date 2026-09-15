@@ -26,12 +26,12 @@ from .sparse import SparseEncoder, sparse_contract_from_index
 
 
 class SparseAwareRetrievalEngine(AsyncRetrievalEngine):
-    """Phase-2 engine extension for one controlled Qdrant dense+sparse candidate.
+    """Phase-2 engine extension for controlled Qdrant dense+sparse candidates.
 
     All existing plans delegate to the Phase-1 engine unchanged. The native
     dense+sparse path may target a validating IndexVersion by ID so it can be
-    benchmarked before alias activation. The public search API does not expose
-    that selector.
+    benchmarked before alias activation. Weighted RRF is a query-time fusion
+    contract and therefore reuses the same physical IndexVersion.
     """
 
     def __init__(
@@ -110,6 +110,7 @@ class SparseAwareRetrievalEngine(AsyncRetrievalEngine):
             raise UnsupportedRetrievalPlan(
                 "qdrant_dense_sparse requires a Qdrant backend exposing native_hybrid_search()"
             )
+        fusion_spec = request.fusion_spec
         hits = await _await_stage(
             "qdrant_dense_sparse.search",
             _run_blocking(
@@ -123,6 +124,8 @@ class SparseAwareRetrievalEngine(AsyncRetrievalEngine):
                 dense_name=dense_name,
                 sparse_name=sparse_name,
                 prefetch_limit=max(pool_size, pool_size * 4),
+                rrf_weights=(fusion_spec.weights if fusion_spec is not None else None),
+                rrf_k=(fusion_spec.k if fusion_spec is not None else None),
             ),
             budget=budget,
             trace=trace,
@@ -144,6 +147,14 @@ class SparseAwareRetrievalEngine(AsyncRetrievalEngine):
         ranked, source_trace, payload_map, chunk_map = await self._fuse(
             request, candidates, [], trace=trace
         )
+        # `_fuse()` materializes the already fused Qdrant order and keeps the
+        # Phase-2 qdrant-native compatibility trace. An explicit fusion spec
+        # overrides only the trace contract, not ranking a second time.
+        if fusion_spec is not None:
+            trace.fusion_method = (
+                "qdrant-weighted-rrf" if fusion_spec.weighted else "qdrant-rrf"
+            )
+            trace.fusion_policy = fusion_spec.as_dict()
         ranked, rerank_scores = await self._rerank(
             request,
             ranked,
