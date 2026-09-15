@@ -4,7 +4,7 @@ from dataclasses import asdict
 from typing import Any, Callable, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ..auth.principal import require_admin
 from ..quality.contracts import EvaluationRun, PromotionPolicy
@@ -38,6 +38,21 @@ class PromotionPolicyRequest(BaseModel):
     min_mrr: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     min_ndcg: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     critical_case_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("critical_case_ids")
+    @classmethod
+    def normalize_critical_case_ids(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in values:
+            case_id = str(raw).strip()
+            if not case_id:
+                raise ValueError("critical_case_ids must not contain blank IDs")
+            if case_id in seen:
+                continue
+            seen.add(case_id)
+            normalized.append(case_id)
+        return normalized
 
 
 class PromotionRequest(BaseModel):
