@@ -1,0 +1,70 @@
+name: Identifier Relevance Gate
+
+on:
+  pull_request:
+    paths:
+      - "benchmarks/identifier_relevance.py"
+      - "benchmarks/rag_native_compare.py"
+      - "benchmarks/promotion_evidence.py"
+      - "scripts/rag_eval.py"
+      - "eval/datasets/deepseek_in_action_retrieval_v2.json"
+      - "tests/test_identifier_relevance.py"
+      - ".github/workflows/identifier-relevance.yml"
+  push:
+    branches: [main]
+    paths:
+      - "benchmarks/identifier_relevance.py"
+      - "benchmarks/rag_native_compare.py"
+      - "benchmarks/promotion_evidence.py"
+      - "scripts/rag_eval.py"
+      - "eval/datasets/deepseek_in_action_retrieval_v2.json"
+      - "tests/test_identifier_relevance.py"
+      - ".github/workflows/identifier-relevance.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  identifier-relevance:
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Run identifier and native evaluator regressions
+        run: |
+          python -m pytest -q \
+            tests/test_identifier_relevance.py \
+            tests/test_rag_native_compare_benchmark.py
+      - name: Verify standalone live evaluator entry point
+        run: python scripts/rag_eval.py --help >/dev/null
+      - name: Audit v2 identifier labels and promotion scope
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          from benchmarks.promotion_evidence import assert_promotion_relevance_scope
+          from benchmarks.rag_native_compare import load_golden_dataset
+          from benchmarks.weighted_rrf_promotion import _scoped_dataset
+
+          dataset = load_golden_dataset(Path("eval/datasets/deepseek_in_action_retrieval_v2.json"))
+          cases = {case["id"]: case for case in dataset["cases"]}
+          deepseek = cases["identifier-deepseek-v3"]["relevance"]
+          fp8 = cases["identifier-fp8"]["relevance"]
+          assert deepseek["identifiers"] == ["DeepSeek-V3"]
+          assert fp8["identifiers"] == ["FP8"]
+          assert "any_terms" not in deepseek
+          assert "any_terms" not in fp8
+          scoped = _scoped_dataset(dataset, "ci-deepseek-doc")
+          audit = assert_promotion_relevance_scope(scoped)
+          assert audit["promotion_eligible"] is True
+          PY

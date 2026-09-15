@@ -93,13 +93,13 @@
       "id": "identifier-deepseek-v3",
       "category": "identifier",
       "query": "DeepSeek-V3",
-      "relevance": {"max_rank": 5, "any_terms": ["deepseek-v3"]}
+      "relevance": {"max_rank": 5, "identifiers": ["DeepSeek-V3"]}
     },
     {
       "id": "identifier-fp8",
       "category": "identifier",
       "query": "FP8",
-      "relevance": {"max_rank": 5, "any_terms": ["fp8"]}
+      "relevance": {"max_rank": 5, "identifiers": ["FP8"]}
     },
 
     {

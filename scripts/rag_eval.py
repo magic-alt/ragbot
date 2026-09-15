@@ -31,6 +31,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from benchmarks.identifier_relevance import any_identifier_matches
 STATE_FILE = ROOT / "tmp" / "ragbot-runtime.json"
 DEFAULT_SERVER = "http://127.0.0.1:8000"
 DEFAULT_REPORT_DIR = ROOT / "reports" / "rag-eval"
@@ -178,6 +182,7 @@ def _is_labeled(case: Dict[str, Any]) -> bool:
         rel.get("path_contains"),
         rel.get("all_terms"),
         rel.get("any_terms"),
+        rel.get("identifiers"),
     )
     return any(bool(item) for item in selectors)
 
@@ -205,6 +210,10 @@ def _chunk_relevant(chunk: Dict[str, Any], case: Dict[str, Any]) -> bool:
         if not any(needle in path for needle in path_needles):
             return False
 
+    identifiers = [v for v in rel.get("identifiers") or [] if v]
+    if identifiers and not any_identifier_matches(chunk.get("text"), identifiers):
+        return False
+
     all_terms = [_norm_text(v) for v in rel.get("all_terms") or []]
     if all_terms and not all(term in text for term in all_terms):
         return False
@@ -213,7 +222,7 @@ def _chunk_relevant(chunk: Dict[str, Any], case: Dict[str, Any]) -> bool:
     if any_terms and not any(term in text for term in any_terms):
         return False
 
-    return bool(doc_ids or pages or path_needles or all_terms or any_terms)
+    return bool(doc_ids or pages or path_needles or identifiers or all_terms or any_terms)
 
 
 def _first_relevant_rank(chunks: Sequence[Dict[str, Any]], case: Dict[str, Any]) -> Optional[int]:
