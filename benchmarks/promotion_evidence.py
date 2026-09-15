@@ -70,6 +70,7 @@ def audit_promotion_relevance_scope(
 
         heuristic = bool(
             rel.get("pages")
+            or rel.get("identifiers")
             or rel.get("path_contains")
             or rel.get("all_terms")
             or rel.get("any_terms")
@@ -98,7 +99,7 @@ def assert_promotion_relevance_scope(
         raise ValueError(
             "Promotion-ineligible Golden Dataset: relevance universe is ambiguous for cases="
             + ",".join(audit["ambiguous_cases"])
-            + ". Term/path/page labels require defaults.filters.doc_ids or "
+            + ". Identifier/term/path/page labels require defaults.filters.doc_ids or "
             "case.filters.doc_ids scoped to exactly one document, or an explicit "
             "relevance.relevant_total / relevance.doc_ids / expected_chunk_ids contract."
         )

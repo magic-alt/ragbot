@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence
 
+from benchmarks.identifier_relevance import any_identifier_matches
 from services.api.app.retrieval.embedder import HashEmbedder, build_embedder
 
 SUPPORTED_SUFFIXES = {".txt", ".md", ".rst", ".pdf"}
@@ -138,6 +139,7 @@ def _is_labeled(case: Mapping[str, Any]) -> bool:
             "path_contains",
             "all_terms",
             "any_terms",
+            "identifiers",
         )
     )
 
@@ -265,6 +267,10 @@ def _match_relevance(hit: RetrievedHit, case: Mapping[str, Any]) -> bool:
     if path_needles and not any(needle in _norm(hit.path) for needle in path_needles):
         return False
 
+    identifiers = [v for v in _as_list(rel.get("identifiers")) if v]
+    if identifiers and not any_identifier_matches(hit.text, identifiers):
+        return False
+
     all_terms = [_norm(v) for v in _as_list(rel.get("all_terms")) if v]
     if all_terms and not all(term in _norm(hit.text) for term in all_terms):
         return False
@@ -273,7 +279,7 @@ def _match_relevance(hit: RetrievedHit, case: Mapping[str, Any]) -> bool:
     if any_terms and not any(term in _norm(hit.text) for term in any_terms):
         return False
 
-    return bool(expected_chunk_ids or doc_ids or pages or path_needles or all_terms or any_terms)
+    return bool(expected_chunk_ids or doc_ids or pages or path_needles or identifiers or all_terms or any_terms)
 
 
 def _relevance_entity(hit: RetrievedHit, case: Mapping[str, Any]) -> str:
@@ -293,7 +299,7 @@ def _known_relevant_total(case: Mapping[str, Any]) -> Optional[int]:
         values = [str(v) for v in _as_list(rel.get(key)) if v is not None and str(v)]
         if values:
             return len(set(values))
-    if rel.get("all_terms") or rel.get("any_terms"):
+    if rel.get("identifiers") or rel.get("all_terms") or rel.get("any_terms"):
         return 1
     return None
 
