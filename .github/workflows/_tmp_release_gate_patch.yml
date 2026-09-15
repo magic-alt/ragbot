@@ -1,0 +1,316 @@
+name: Temporary promotion release gate patch
+
+on:
+  push:
+    branches:
+      - feat/issue-57-promotion-release-gates
+    paths:
+      - .github/workflows/_tmp_release_gate_patch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feat/issue-57-promotion-release-gates
+      - name: Apply promotion release gate patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          # PromotionPolicy contract.
+          path = Path('services/api/app/quality/contracts.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''@dataclass(frozen=True)
+class PromotionPolicy:
+    max_recall_drop: float = 0.0
+    max_mrr_drop: float = 0.0
+    max_ndcg_drop: float = 0.0
+    max_p95_latency_increase_ratio: float = 0.15
+    max_cost_increase_ratio: float = 0.25
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            "max_recall_drop": float(self.max_recall_drop),
+            "max_mrr_drop": float(self.max_mrr_drop),
+            "max_ndcg_drop": float(self.max_ndcg_drop),
+            "max_p95_latency_increase_ratio": float(self.max_p95_latency_increase_ratio),
+            "max_cost_increase_ratio": float(self.max_cost_increase_ratio),
+        }
+'''
+          new = '''@dataclass(frozen=True)
+class PromotionPolicy:
+    max_recall_drop: float = 0.0
+    max_mrr_drop: float = 0.0
+    max_ndcg_drop: float = 0.0
+    max_p95_latency_increase_ratio: float = 0.15
+    max_cost_increase_ratio: float = 0.25
+    # Optional release-readiness gates. They are disabled by default so the
+    # established relative baseline-vs-candidate policy remains compatible.
+    min_recall: Optional[float] = None
+    min_mrr: Optional[float] = None
+    min_ndcg: Optional[float] = None
+    critical_case_ids: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        for name in ("min_recall", "min_mrr", "min_ndcg"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            numeric = float(value)
+            if not 0.0 <= numeric <= 1.0:
+                raise ValueError(f"{name} must be in [0,1]")
+            object.__setattr__(self, name, numeric)
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in self.critical_case_ids or ():
+            case_id = str(raw).strip()
+            if not case_id:
+                raise ValueError("critical_case_ids must not contain blank IDs")
+            if case_id in seen:
+                continue
+            seen.add(case_id)
+            normalized.append(case_id)
+        object.__setattr__(self, "critical_case_ids", tuple(normalized))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "max_recall_drop": float(self.max_recall_drop),
+            "max_mrr_drop": float(self.max_mrr_drop),
+            "max_ndcg_drop": float(self.max_ndcg_drop),
+            "max_p95_latency_increase_ratio": float(self.max_p95_latency_increase_ratio),
+            "max_cost_increase_ratio": float(self.max_cost_increase_ratio),
+            "min_recall": self.min_recall,
+            "min_mrr": self.min_mrr,
+            "min_ndcg": self.min_ndcg,
+            "critical_case_ids": list(self.critical_case_ids),
+        }
+'''
+          if old not in text:
+              raise SystemExit('PromotionPolicy block not found')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          # Promotion evaluation gates.
+          path = Path('services/api/app/quality/promotion.py')
+          text = path.read_text(encoding='utf-8')
+          anchor = '''    _ratio_gate(
+        "cost_usd",
+        baseline.cost,
+        candidate.cost,
+        max_increase_ratio=policy.max_cost_increase_ratio,
+        reasons=reasons,
+        deltas=deltas,
+        zero_baseline_is_missing=False,
+    )
+
+'''
+          addition = anchor + '''    _absolute_quality_gates(candidate, policy, reasons=reasons, deltas=deltas)
+    _critical_case_gate(candidate, policy, reasons=reasons, deltas=deltas)
+
+'''
+          if anchor not in text:
+              raise SystemExit('promotion cost gate anchor not found')
+          text = text.replace(anchor, addition, 1)
+          helper_anchor = '''def _quality_gate(
+'''
+          helpers = '''def _absolute_quality_gates(
+    candidate: EvaluationRun,
+    policy: PromotionPolicy,
+    *,
+    reasons: list[str],
+    deltas: dict[str, Any],
+) -> None:
+    configured = {
+        "recall": policy.min_recall,
+        "mrr": policy.min_mrr,
+        "ndcg": policy.min_ndcg,
+    }
+    if not any(value is not None for value in configured.values()):
+        return
+
+    evidence: dict[str, Any] = {}
+    for key, minimum in configured.items():
+        if minimum is None:
+            continue
+        candidate_value = _number(candidate.metrics.get(key))
+        passed = (
+            candidate_value is not None
+            and 0.0 <= candidate_value <= 1.0
+            and candidate_value >= float(minimum)
+        )
+        evidence[key] = {
+            "candidate": candidate_value,
+            "minimum": float(minimum),
+            "passed": passed,
+        }
+        if candidate_value is None:
+            reasons.append(f"missing candidate absolute quality metric: {key}")
+        elif not 0.0 <= candidate_value <= 1.0:
+            reasons.append(
+                f"invalid candidate absolute quality metric: {key}={candidate_value}; expected [0,1]"
+            )
+        elif candidate_value < float(minimum):
+            reasons.append(
+                f"{key} absolute floor {candidate_value:.6f} is below required {float(minimum):.6f}"
+            )
+    deltas["absolute_quality"] = evidence
+
+
+def _critical_case_gate(
+    candidate: EvaluationRun,
+    policy: PromotionPolicy,
+    *,
+    reasons: list[str],
+    deltas: dict[str, Any],
+) -> None:
+    required = list(policy.critical_case_ids)
+    if not required:
+        return
+
+    raw_cases = candidate.artifacts.get("cases")
+    case_items = raw_cases if isinstance(raw_cases, list) else []
+    by_id: dict[str, Mapping[str, Any]] = {}
+    duplicate_ids: set[str] = set()
+    for item in case_items:
+        if not isinstance(item, Mapping):
+            continue
+        case_id = str(item.get("case_id") or "").strip()
+        if not case_id:
+            continue
+        if case_id in by_id:
+            duplicate_ids.add(case_id)
+            continue
+        by_id[case_id] = item
+
+    passed: list[str] = []
+    failed: list[dict[str, Any]] = []
+    missing: list[str] = []
+    ambiguous: list[str] = []
+    for case_id in required:
+        if case_id in duplicate_ids:
+            ambiguous.append(case_id)
+            reasons.append(f"critical case evidence ambiguous: {case_id}")
+            continue
+        item = by_id.get(case_id)
+        if item is None:
+            missing.append(case_id)
+            reasons.append(f"critical case evidence missing: {case_id}")
+            continue
+        if item.get("retrieval_pass") is True:
+            passed.append(case_id)
+            continue
+        failure = {
+            "case_id": case_id,
+            "first_relevant_rank": item.get("first_relevant_rank"),
+        }
+        failed.append(failure)
+        reasons.append(
+            f"critical case failed: {case_id} rank={item.get('first_relevant_rank')}"
+        )
+
+    deltas["critical_cases"] = {
+        "required": required,
+        "passed": passed,
+        "failed": failed,
+        "missing": missing,
+        "ambiguous": ambiguous,
+    }
+
+
+'''
+          if helper_anchor not in text:
+              raise SystemExit('quality helper anchor not found')
+          text = text.replace(helper_anchor, helpers + helper_anchor, 1)
+          path.write_text(text, encoding='utf-8')
+
+          # Admin API policy surface.
+          path = Path('services/api/app/routes/quality.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''class PromotionPolicyRequest(BaseModel):
+    max_recall_drop: float = Field(default=0.0, ge=0.0)
+    max_mrr_drop: float = Field(default=0.0, ge=0.0)
+    max_ndcg_drop: float = Field(default=0.0, ge=0.0)
+    max_p95_latency_increase_ratio: float = Field(default=0.15, ge=0.0)
+    max_cost_increase_ratio: float = Field(default=0.25, ge=0.0)
+'''
+          new = '''class PromotionPolicyRequest(BaseModel):
+    max_recall_drop: float = Field(default=0.0, ge=0.0)
+    max_mrr_drop: float = Field(default=0.0, ge=0.0)
+    max_ndcg_drop: float = Field(default=0.0, ge=0.0)
+    max_p95_latency_increase_ratio: float = Field(default=0.15, ge=0.0)
+    max_cost_increase_ratio: float = Field(default=0.25, ge=0.0)
+    min_recall: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    min_mrr: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    min_ndcg: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    critical_case_ids: list[str] = Field(default_factory=list)
+'''
+          if old not in text:
+              raise SystemExit('PromotionPolicyRequest block not found')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          # Weighted-RRF CLI.
+          path = Path('benchmarks/weighted_rrf_promotion.py')
+          text = path.read_text(encoding='utf-8')
+          args_anchor = '''    parser.add_argument("--max-cost-increase-ratio", type=float, default=0.25)
+    return parser.parse_args(argv)
+'''
+          args_new = '''    parser.add_argument("--max-cost-increase-ratio", type=float, default=0.25)
+    parser.add_argument("--min-recall", type=float)
+    parser.add_argument("--min-mrr", type=float)
+    parser.add_argument("--min-ndcg", type=float)
+    parser.add_argument("--critical-case", action="append", default=[])
+    return parser.parse_args(argv)
+'''
+          if args_anchor not in text:
+              raise SystemExit('weighted CLI args anchor not found')
+          text = text.replace(args_anchor, args_new, 1)
+          policy_anchor = '''                max_p95_latency_increase_ratio=args.max_p95_latency_increase_ratio,
+                max_cost_increase_ratio=args.max_cost_increase_ratio,
+            ),
+'''
+          policy_new = '''                max_p95_latency_increase_ratio=args.max_p95_latency_increase_ratio,
+                max_cost_increase_ratio=args.max_cost_increase_ratio,
+                min_recall=args.min_recall,
+                min_mrr=args.min_mrr,
+                min_ndcg=args.min_ndcg,
+                critical_case_ids=tuple(args.critical_case),
+            ),
+'''
+          if policy_anchor not in text:
+              raise SystemExit('weighted policy anchor not found')
+          text = text.replace(policy_anchor, policy_new, 1)
+          path.write_text(text, encoding='utf-8')
+
+          # Dense+sparse legacy CLI used by the guarded facade and mark-ready path.
+          path = Path('benchmarks/retrieval_plan_promotion_legacy.py')
+          text = path.read_text(encoding='utf-8')
+          if args_anchor not in text:
+              raise SystemExit('legacy CLI args anchor not found')
+          text = text.replace(args_anchor, args_new, 1)
+          if policy_anchor not in text:
+              raise SystemExit('legacy policy anchor not found')
+          text = text.replace(policy_anchor, policy_new, 1)
+          path.write_text(text, encoding='utf-8')
+          PY
+          python -m pip install --quiet -e ".[dev]"
+          python -m compileall -q services benchmarks
+          python -m pytest -q \
+            tests/test_promotion_release_gates.py \
+            tests/test_quality_observability.py \
+            tests/test_promotion_evidence_integrity.py
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add \
+            services/api/app/quality/contracts.py \
+            services/api/app/quality/promotion.py \
+            services/api/app/routes/quality.py \
+            benchmarks/weighted_rrf_promotion.py \
+            benchmarks/retrieval_plan_promotion_legacy.py
+          git commit -m "feat: add absolute and critical promotion release gates"
+          git push origin HEAD:feat/issue-57-promotion-release-gates
