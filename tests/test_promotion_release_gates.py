@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from services.api.app.quality.contracts import EvaluationRun, PromotionPolicy
 from services.api.app.quality.promotion import evaluate_promotion
+from services.api.app.routes.quality import PromotionPolicyRequest
 
 
 def _evaluation(
@@ -164,3 +166,13 @@ def test_critical_case_ids_are_trimmed_deduplicated_and_serialized() -> None:
 def test_blank_critical_case_id_is_rejected() -> None:
     with pytest.raises(ValueError, match="critical_case_ids"):
         PromotionPolicy(critical_case_ids=(" ",))
+
+
+def test_admin_policy_request_normalizes_critical_ids_and_rejects_blanks() -> None:
+    payload = PromotionPolicyRequest(
+        min_recall=0.95,
+        critical_case_ids=[" identifier-deepseek-v3 ", "identifier-deepseek-v3", "fp8"],
+    )
+    assert payload.critical_case_ids == ["identifier-deepseek-v3", "fp8"]
+    with pytest.raises(ValidationError):
+        PromotionPolicyRequest(critical_case_ids=[" "])
