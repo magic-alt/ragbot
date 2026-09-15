@@ -1,0 +1,49 @@
+name: Promotion Evidence Gate
+
+on:
+  pull_request:
+    paths:
+      - "benchmarks/promotion_evidence.py"
+      - "benchmarks/retrieval_plan_promotion.py"
+      - "benchmarks/retrieval_plan_promotion_legacy.py"
+      - "services/api/app/quality/promotion.py"
+      - "tests/test_promotion_evidence_integrity.py"
+      - "tests/test_quality_observability.py"
+      - ".github/workflows/promotion-evidence.yml"
+  push:
+    branches: [main]
+    paths:
+      - "benchmarks/promotion_evidence.py"
+      - "benchmarks/retrieval_plan_promotion.py"
+      - "benchmarks/retrieval_plan_promotion_legacy.py"
+      - "services/api/app/quality/promotion.py"
+      - "tests/test_promotion_evidence_integrity.py"
+      - ".github/workflows/promotion-evidence.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  promotion-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Run evidence integrity and quality contracts
+        run: |
+          python -m pytest -q \
+            tests/test_promotion_evidence_integrity.py \
+            tests/test_quality_observability.py
