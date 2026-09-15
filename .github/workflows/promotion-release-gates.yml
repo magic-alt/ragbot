@@ -1,0 +1,75 @@
+name: Promotion Release Gates
+
+on:
+  pull_request:
+    paths:
+      - "services/api/app/quality/contracts.py"
+      - "services/api/app/quality/promotion.py"
+      - "services/api/app/routes/quality.py"
+      - "benchmarks/weighted_rrf_promotion.py"
+      - "benchmarks/retrieval_plan_promotion_legacy.py"
+      - "tests/test_promotion_release_gates.py"
+      - ".github/workflows/promotion-release-gates.yml"
+  push:
+    branches: [main]
+    paths:
+      - "services/api/app/quality/contracts.py"
+      - "services/api/app/quality/promotion.py"
+      - "services/api/app/routes/quality.py"
+      - "benchmarks/weighted_rrf_promotion.py"
+      - "benchmarks/retrieval_plan_promotion_legacy.py"
+      - "tests/test_promotion_release_gates.py"
+      - ".github/workflows/promotion-release-gates.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  release-gates:
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Run promotion release gate regressions
+        run: |
+          python -m pytest -q \
+            tests/test_promotion_release_gates.py \
+            tests/test_quality_observability.py \
+            tests/test_promotion_evidence_integrity.py
+      - name: Verify promotion CLI release-gate arguments
+        run: |
+          python - <<'PY'
+          from benchmarks.retrieval_plan_promotion import parse_args as parse_dense_sparse
+          from benchmarks.weighted_rrf_promotion import parse_args as parse_weighted
+
+          dense = parse_dense_sparse([
+              "--golden", "g.json",
+              "--candidate-index", "idx",
+              "--tenant", "tenant",
+              "--min-recall", "0.95",
+              "--critical-case", "id-a",
+              "--critical-case", "id-b",
+          ])
+          assert dense.min_recall == 0.95
+          assert dense.critical_case == ["id-a", "id-b"]
+
+          weighted = parse_weighted([
+              "--golden", "g.json",
+              "--candidate-index", "idx",
+              "--tenant", "tenant",
+              "--min-mrr", "0.9",
+              "--critical-case", "id-a",
+          ])
+          assert weighted.min_mrr == 0.9
+          assert weighted.critical_case == ["id-a"]
+          PY
