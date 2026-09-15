@@ -1,0 +1,144 @@
+{
+  "schema_version": 1,
+  "name": "DeepSeek in Action retrieval quality v2",
+  "description": "Promotion-oriented retrieval suite expanded with identifier, mixed Chinese/English, weak-lexical and strong-lexical slices. Term-based relevance deliberately remains resilient to re-chunking; production promotion MUST supply a single-document scope (for example weighted_rrf_promotion --scope-doc-id).",
+  "promotion": {
+    "requires_single_document_scope": true
+  },
+  "defaults": {
+    "top_k": 10
+  },
+  "thresholds": {
+    "semantic_embedding_required": true,
+    "hit_at_10_min": 0.75,
+    "mrr_at_10_min": 0.35
+  },
+  "cases": [
+    {
+      "id": "fp8-exact",
+      "category": "exact",
+      "query": "mixed precision FP8 reduce GPU memory usage",
+      "relevance": {"max_rank": 5, "any_terms": ["mixed precision", "mixed-precision", "fp8"]}
+    },
+    {
+      "id": "cache-exact",
+      "category": "exact",
+      "query": "cache hits cache misses token management",
+      "relevance": {"max_rank": 5, "any_terms": ["cache hit", "cache miss", "caching mechanism"]}
+    },
+    {
+      "id": "context-exact",
+      "category": "exact",
+      "query": "DeepSeek-V3 optimization for context window",
+      "relevance": {"max_rank": 5, "any_terms": ["context window", "long context", "long sequences"]}
+    },
+    {
+      "id": "parallelism-exact",
+      "category": "exact",
+      "query": "model parallelism distribute model parameters across GPUs",
+      "relevance": {"max_rank": 5, "any_terms": ["model parallelism", "model parameters", "distributed training"]}
+    },
+
+    {
+      "id": "fp8-paraphrase",
+      "category": "paraphrase",
+      "query": "What techniques lower VRAM consumption when running large language models?",
+      "relevance": {"max_rank": 10, "any_terms": ["mixed precision", "mixed-precision", "fp8", "graphics memory"]}
+    },
+    {
+      "id": "cache-paraphrase",
+      "category": "paraphrase",
+      "query": "How does caching reduce repeated computation during model inference?",
+      "relevance": {"max_rank": 10, "any_terms": ["cache hit", "cache miss", "caching mechanism", "repeated computations"]}
+    },
+    {
+      "id": "context-paraphrase",
+      "category": "paraphrase",
+      "query": "How does DeepSeek-V3 handle long prompts and long sequences efficiently?",
+      "relevance": {"max_rank": 10, "any_terms": ["context window", "long context", "long sequences"]}
+    },
+    {
+      "id": "parallelism-paraphrase",
+      "category": "paraphrase",
+      "query": "How can a model that is too large for one GPU be split across multiple devices?",
+      "relevance": {"max_rank": 10, "any_terms": ["model parallelism", "model parameters", "distributed training"]}
+    },
+
+    {
+      "id": "fp8-cross-lingual",
+      "category": "cross-lingual",
+      "query": "运行大语言模型时有哪些降低 GPU 显存占用的方法？",
+      "relevance": {"max_rank": 10, "any_terms": ["mixed precision", "mixed-precision", "fp8", "graphics memory"]}
+    },
+    {
+      "id": "cache-cross-lingual",
+      "category": "cross-lingual",
+      "query": "缓存机制如何减少大模型推理中的重复计算？",
+      "relevance": {"max_rank": 10, "any_terms": ["cache hit", "cache miss", "caching mechanism", "repeated computations"]}
+    },
+    {
+      "id": "context-cross-lingual",
+      "category": "cross-lingual",
+      "query": "DeepSeek-V3 如何高效处理长上下文和长序列？",
+      "relevance": {"max_rank": 10, "any_terms": ["context window", "long context", "long sequences"]}
+    },
+    {
+      "id": "parallelism-cross-lingual",
+      "category": "cross-lingual",
+      "query": "当模型无法放入单张 GPU 时，如何把参数分布到多张 GPU 上？",
+      "relevance": {"max_rank": 10, "any_terms": ["model parallelism", "model parameters", "distributed training"]}
+    },
+
+    {
+      "id": "identifier-deepseek-v3",
+      "category": "identifier",
+      "query": "DeepSeek-V3",
+      "relevance": {"max_rank": 5, "any_terms": ["deepseek-v3"]}
+    },
+    {
+      "id": "identifier-fp8",
+      "category": "identifier",
+      "query": "FP8",
+      "relevance": {"max_rank": 5, "any_terms": ["fp8"]}
+    },
+
+    {
+      "id": "mixed-cn-en-context",
+      "category": "mixed-cn-en",
+      "query": "DeepSeek-V3 的 context window 是怎么处理 long sequences 的？",
+      "relevance": {"max_rank": 10, "any_terms": ["context window", "long context", "long sequences"]}
+    },
+    {
+      "id": "mixed-cn-en-fp8",
+      "category": "mixed-cn-en",
+      "query": "FP8 mixed precision 如何降低 GPU memory usage？",
+      "relevance": {"max_rank": 10, "any_terms": ["mixed precision", "mixed-precision", "fp8", "graphics memory"]}
+    },
+
+    {
+      "id": "weak-lexical-cache",
+      "category": "weak-lexical",
+      "query": "How can inference avoid doing the same expensive work again and again?",
+      "relevance": {"max_rank": 10, "any_terms": ["cache hit", "cache miss", "caching mechanism", "repeated computations"]}
+    },
+    {
+      "id": "weak-lexical-parallelism",
+      "category": "weak-lexical",
+      "query": "What lets a neural network that will not fit on one accelerator live across several devices?",
+      "relevance": {"max_rank": 10, "any_terms": ["model parallelism", "model parameters", "distributed training"]}
+    },
+
+    {
+      "id": "strong-lexical-cache",
+      "category": "strong-lexical",
+      "query": "cache hit cache miss caching mechanism",
+      "relevance": {"max_rank": 5, "any_terms": ["cache hit", "cache miss", "caching mechanism"]}
+    },
+    {
+      "id": "strong-lexical-parallelism",
+      "category": "strong-lexical",
+      "query": "model parallelism model parameters distributed training",
+      "relevance": {"max_rank": 5, "any_terms": ["model parallelism", "model parameters", "distributed training"]}
+    }
+  ]
+}
