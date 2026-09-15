@@ -20,7 +20,11 @@ def test_sparse_compose_overlays_keep_api_worker_contract_in_sync() -> None:
     for content in (root, infra):
         assert content.count("RAGBOT_INSTALL_SPARSE") == 3
         for key in keys:
-            assert content.count(key) == 2, (key, content.count(key))
+            # Each API/worker mapping contains both the YAML key and the
+            # `${KEY:-default}` interpolation, so two services yield four text
+            # occurrences. The deployment gate separately parses rendered
+            # Compose JSON and verifies the values are actually equal.
+            assert content.count(key) == 4, (key, content.count(key))
 
 
 def test_sparse_build_arg_is_opt_in_in_both_dockerfiles() -> None:
